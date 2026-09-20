@@ -9,7 +9,7 @@ description = "Experimental bucket-based parameter sharding for PyTorch"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "BSD-3-Clause"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "src/flex_shard/dist_muon/LICENSE.torchtitan"]
 dependencies = [
     "torch>=2.14,<2.15",
     "typing-extensions>=4.10",
@@ -37,6 +37,9 @@ where = ["src"]
 include = ["flex_shard", "flex_shard.*"]
 namespaces = false
 
+[tool.setuptools.package-data]
+"flex_shard.dist_muon" = ["LICENSE.torchtitan", "UPSTREAM.md"]
+
 [tool.ruff]
 line-length = 88
 target-version = "py310"
@@ -50,3 +53,4 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["src/flex_shard/tests"]
+markers = ["multi_gpu: requires multiple CUDA devices"]
