@@ -5,16 +5,18 @@ possible. Please follow our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Our development process
 
-FlexShard is developed in Meta's internal source repository and synchronized
-to GitHub. Submit contributions as GitHub pull requests against `main`.
-Maintainers review pull requests, import them into the internal repository,
-and land them there. The resulting changes then synchronize back to GitHub.
+Submit contributions as GitHub pull requests against `main`. Maintainers review
+pull requests and verify the relevant tests and required checks before merging.
 External contributors do not need access to Meta's internal tools.
 
-Maintainers should use this import-and-land workflow instead of merging
-directly into the synchronized GitHub branch. Keep public code, documentation,
-and configuration changes in the internal source of truth so that later
-synchronization preserves them.
+When GitHub merges are enabled, maintainers squash-merge approved pull requests.
+Merged changes are synchronized into Meta's internal repository for internal
+validation and landing. Until GitHub merges are enabled, maintainers import
+pull requests and land them internally; synchronization then closes the linked
+pull request.
+
+Use ordinary GitHub pull requests; ghstack is not supported. Keep public code,
+documentation, and configuration synchronized between the two repositories.
 
 ## Pull requests
 
@@ -45,8 +47,9 @@ useful for applicable unit tests, but does not validate the training runtime.
 Maintainers can help arrange GPU validation before landing a contribution.
 
 Follow the surrounding Python style, use four spaces for indentation, and
-preserve copyright and license headers. Maintainers also run the internal
-formatting, lint, and test checks before landing imported changes.
+preserve copyright and license headers. Maintainers preserve GitHub formatting
+when importing changes and run the applicable internal build and test checks
+before landing them.
 
 ## Contributor License Agreement (CLA)
 
