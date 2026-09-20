@@ -31,6 +31,14 @@ Test destinations below are relative to `src/flex_shard/`.
 
 - Rename `dist_muon.py` to `optimizer.py` and update imports to the FlexShard
   package. The three redistribution helper modules retain their upstream source.
+- Extract the upstream numerical kernels into `_muon_math.py` for both execution
+  paths; retain their behavior and re-export the previous private helper names
+  from `optimizer.py` for compatibility with the imported tests.
+- Extend `optimizer.py` with native FlexShard parameter dispatch and optional
+  compute configuration. Implement native layout validation, local execution,
+  and checkpoint handling in `_native.py`, retaining the DTensor redistribution
+  path. Native execution uses real local parameters and does not construct
+  adapter DTensors or optimizer process groups.
 - Export `DistMuon` and `build_dist_muon` from `flex_shard.dist_muon`; preserve
   the existing explicit-factory adapter and its exports.
 - Port the upstream CPU tests and two-/four-GPU tests with local import paths.

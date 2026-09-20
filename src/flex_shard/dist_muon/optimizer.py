@@ -21,6 +21,13 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.placement_types import _StridedShard
 from torch.optim import Optimizer
 
+from ._muon_math import (
+    _adjust_muon_learning_rate as _adjust_muon_learning_rate,
+    _apply_muon_update,
+    _compute_muon_direction,
+    _prepare_muon_input,
+    _zeropower_via_newtonschulz as _zeropower_via_newtonschulz,
+)
 from ._optimizer_reshard_runtime import _BucketedRedistributionRuntime
 
 from ._optimizer_reshard_schedule import (
@@ -52,6 +59,7 @@ from .optimizer_reshard import (
 
 __all__ = [
     "build_dist_muon",
+    "DistMuon",
 ]
 
 
@@ -232,7 +240,7 @@ def _initialize_dist_muon(
         compute_layouts,
         get_fqn=lambda layout: layout.fqn,
         get_storage_dtensor=lambda layout: layout.param,
-        requires_redistribution=lambda layout: (not layout.storage_is_compute_ready),
+        requires_redistribution=lambda layout: not layout.storage_is_compute_ready,
         get_redistribution_storage_mesh_axis=lambda layout: (
             layout.redistribution_storage_mesh_axis
         ),
@@ -250,9 +258,15 @@ def _initialize_dist_muon(
 
 
 class DistMuon(Optimizer):
-    """Muon optimizer constructed by ``build_dist_muon``.
+    """Muon on real FlexShard parameters, or explicitly configured DTensors.
 
-    Parameter groups, FQNs, storage layouts, compute layouts, and bucket plans
+    Construct this optimizer after ``flex_shard`` and materialization. Native
+    BlockShard/Owned parameters already contain complete logical matrices, so
+    their ordinary gradients and momentum need no proxy tensors or collectives.
+    Native empty local shards remain in the group and require no gradient.
+
+    For the DTensor redistribution path, parameter groups, FQNs, storage
+    layouts, compute layouts, and bucket plans
     are frozen after resharding is applied. Every configured parameter must
     have a layout-compatible DTensor gradient before each rank enters
     ``step()``.
@@ -270,10 +284,10 @@ class DistMuon(Optimizer):
 
     def __init__(
         self,
-        params: Iterable[dict[str, Any]],
+        params: Iterable[Tensor] | Iterable[dict[str, Any]],
         *,
-        compute_sharding_by_fqn: Mapping[str, ComputeLayout],
-        bucket_configs: Sequence[BucketConfig],
+        compute_sharding_by_fqn: Mapping[str, ComputeLayout] | None = None,
+        bucket_configs: Sequence[BucketConfig] = (),
         lr: float = 1e-3,
         weight_decay: float = 0.1,
         momentum: float = 0.95,
@@ -295,22 +309,37 @@ class DistMuon(Optimizer):
         }
         self._first_step_validated = False
         self._param_groups_frozen = False
+        self._native_engine = None
         super().__init__(params, defaults)
         self._validate_groups()
         self._param_groups_frozen = True
-        _initialize_dist_muon(
-            self,
-            compute_sharding_by_fqn=compute_sharding_by_fqn,
-            bucket_configs=bucket_configs,
-        )
+        all_params = [param for group in self.param_groups for param in group["params"]]
+        dtensors = [isinstance(param, DTensor) for param in all_params]
+        if any(dtensors) and not all(dtensors):
+            raise TypeError("DistMuon cannot mix native parameters and DTensors")
+        if not any(dtensors):
+            if compute_sharding_by_fqn or bucket_configs:
+                raise ValueError(
+                    "native DistMuon uses FlexShard storage metadata; explicit "
+                    "redistribution configuration is only supported for DTensors"
+                )
+            from ._native import _NativeMuon
+
+            self._native_engine = _NativeMuon(self)
+        else:
+            if compute_sharding_by_fqn is None:
+                raise ValueError("DTensor DistMuon requires compute_sharding_by_fqn")
+            _initialize_dist_muon(
+                self,
+                compute_sharding_by_fqn=compute_sharding_by_fqn,
+                bucket_configs=bucket_configs,
+            )
 
     @overload
-    def step(self, closure: None = None) -> None:
-        ...
+    def step(self, closure: None = None) -> None: ...
 
     @overload
-    def step(self, closure: Callable[[], float]) -> float:
-        ...
+    def step(self, closure: Callable[[], float]) -> float: ...
 
     @torch.no_grad()
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
@@ -319,6 +348,9 @@ class DistMuon(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        if self._native_engine is not None:
+            self._native_engine.step()
+            return loss
         self._preflight_step()
         self._redistribution_runtime.run(
             self._bucket_plans,
@@ -329,15 +361,32 @@ class DistMuon(Optimizer):
         )
         return loss
 
+    def state_dict(self) -> dict[str, Any]:
+        result = super().state_dict()
+        if self._native_engine is not None:
+            return self._native_engine.state_dict(result)
+        return result
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        if self._native_engine is not None:
+            state_dict = self._native_engine.prepare_load(state_dict)
+        super().load_state_dict(state_dict)
+        if self._native_engine is not None:
+            self._native_engine.rebuild()
+
     def add_param_group(self, param_group: dict[str, Any]) -> None:
         if self._param_groups_frozen:
             raise RuntimeError("DistMuon parameter groups are frozen")
         super().add_param_group(param_group)
 
     def _validate_groups(self) -> None:
-        if len(self.param_groups) != 1:
+        self._validate_group_values(self.param_groups)
+
+    @staticmethod
+    def _validate_group_values(param_groups: Sequence[dict[str, Any]]) -> None:
+        if len(param_groups) != 1:
             raise ValueError("DistMuon requires exactly one parameter group")
-        for group_index, group in enumerate(self.param_groups):
+        for group_index, group in enumerate(param_groups):
             ns_steps = group["ns_steps"]
             coefficients = group["ns_coefficients"]
             if (
@@ -428,7 +477,7 @@ class DistMuon(Optimizer):
             self._specs,
             get_fqn=lambda item: item.fqn,
             get_storage_dtensor=lambda item: item.param,
-            requires_redistribution=lambda item: (not item.storage_is_compute_ready),
+            requires_redistribution=lambda item: not item.storage_is_compute_ready,
             resolve_redistribution_plans=partial(
                 _resolve_muon_redistribution_plans,
                 ns_steps_by_group=ns_steps_by_group,
@@ -1517,9 +1566,9 @@ def _resolve_storage_to_compute_transition(
             ndim=param.ndim,
             mesh_axis_size=param.device_mesh.size(storage_mesh_axis),
         )
-        normalized_target_sharding_by_storage_mesh_axis[
-            storage_mesh_axis
-        ] = target_sharding
+        normalized_target_sharding_by_storage_mesh_axis[storage_mesh_axis] = (
+            target_sharding
+        )
 
     _validate_shard_order_compute_targets(
         fqn,
@@ -1819,119 +1868,6 @@ def _normalize_dim(dim: int, ndim: int) -> int:
     if normalized < 0 or normalized >= ndim:
         raise ValueError(f"dimension {dim} is invalid for a rank-{ndim} tensor")
     return normalized
-
-
-def _adjust_muon_learning_rate(
-    lr: float,
-    adjust_lr_fn: str | None,
-    compute_matrix_shape: torch.Size | tuple[int, ...],
-) -> float:
-    """Adjust Muon's learning rate for the matrix aspect ratio."""
-    rows, columns = compute_matrix_shape[-2:]
-    if adjust_lr_fn is None or adjust_lr_fn == "original":
-        ratio = math.sqrt(max(1.0, rows / columns))
-    elif adjust_lr_fn == "match_rms_adamw":
-        ratio = 0.2 * math.sqrt(max(rows, columns))
-    elif adjust_lr_fn == "spectral_unclamped":
-        ratio = math.sqrt(rows / columns)
-    else:
-        raise ValueError(f"unsupported adjust_lr_fn {adjust_lr_fn!r}")
-    return lr * ratio
-
-
-def _prepare_muon_input(
-    gradient: Tensor,
-    momentum_buffer: Tensor,
-    *,
-    momentum: float,
-    nesterov: bool,
-    out: Tensor,
-) -> Tensor:
-    """Update momentum and prepare the Tensor passed to Muon computation."""
-    momentum_buffer.lerp_(gradient, 1 - momentum)
-    if nesterov:
-        torch.lerp(
-            gradient,
-            momentum_buffer,
-            momentum,
-            out=out,
-        )
-    else:
-        out.copy_(momentum_buffer)
-    return out
-
-
-def _compute_muon_direction(
-    prepared: Tensor,
-    *,
-    ns_coefficients: tuple[float, float, float],
-    ns_steps: int,
-    eps: float,
-    out: Tensor,
-) -> Tensor:
-    """Compute Muon's approximate orthogonal update direction."""
-    direction = _zeropower_via_newtonschulz(
-        prepared,
-        ns_coefficients=ns_coefficients,
-        ns_steps=ns_steps,
-        eps=eps,
-    )
-    out.copy_(direction)
-    return out
-
-
-def _apply_muon_update(
-    parameter: Tensor,
-    direction: Tensor,
-    *,
-    lr: float,
-    weight_decay: float,
-    adjust_lr_fn: str | None,
-    compute_matrix_shape: torch.Size | tuple[int, ...],
-) -> Tensor:
-    """Apply decoupled weight decay and a computed Muon direction."""
-    adjusted_lr = _adjust_muon_learning_rate(
-        lr,
-        adjust_lr_fn,
-        compute_matrix_shape,
-    )
-    parameter.mul_(1 - lr * weight_decay)
-    parameter.add_(direction, alpha=-adjusted_lr)
-    return parameter
-
-
-def _zeropower_via_newtonschulz(
-    update: Tensor,
-    *,
-    ns_coefficients: tuple[float, float, float],
-    ns_steps: int,
-    eps: float,
-) -> Tensor:
-    """Compute Muon's approximate polar factor without optimizer state."""
-    a, b, c = ns_coefficients
-    result = update.to(dtype=torch.bfloat16, copy=True)
-    transposed = result.shape[-2] > result.shape[-1]
-    if transposed:
-        result = result.transpose(-2, -1)
-    result.div_(result.norm(dim=(-2, -1), keepdim=True).clamp_min(eps))
-
-    if result.ndim == 2:
-        for _ in range(ns_steps):
-            gram = result @ result.T
-            gram_update = torch.addmm(gram, gram, gram, beta=b, alpha=c)
-            result = torch.addmm(result, gram_update, result, beta=a)
-    else:
-        original_shape = result.shape
-        matrices = result.reshape(-1, *original_shape[-2:])
-        # Batched kernels and independent matrix calls can use different BF16
-        # reduction orders.
-        for _ in range(ns_steps):
-            gram = matrices @ matrices.transpose(-2, -1)
-            gram_update = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
-            matrices = torch.baddbmm(matrices, gram_update, matrices, beta=a)
-        result = matrices.reshape(original_shape)
-
-    return result.transpose(-2, -1) if transposed else result
 
 
 def _after_load_state_dict(optimizer: Optimizer) -> None:
