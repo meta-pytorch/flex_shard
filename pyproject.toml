@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flex-shard"
+version = "0.1.0.dev0"
+description = "Experimental bucket-based parameter sharding for PyTorch"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+dependencies = [
+    "torch>=2.14,<2.15",
+    "typing-extensions>=4.10",
+    "triton~=3.8.0; platform_system == 'Linux'",
+]
+
+[project.optional-dependencies]
+test = [
+    "expecttest",
+    "hypothesis",
+    "numpy",
+    "pytest",
+]
+
+[project.urls]
+Repository = "https://github.com/meta-pytorch/flex_shard"
+Issues = "https://github.com/meta-pytorch/flex_shard/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["flex_shard", "flex_shard.*"]
+namespaces = false
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+extend-exclude = ["fb"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["src/flex_shard/tests"]
