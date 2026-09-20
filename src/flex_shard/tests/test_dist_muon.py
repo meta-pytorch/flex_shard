@@ -13,7 +13,8 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.distributed.checkpoint.protocol import CheckpointableTensor
 from torch.distributed.tensor import DTensor
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.testing._internal.common_utils import parametrize, run_tests, TestCase
 
 from ..custom_placements.block_shard import BlockShard, BucketedBlockShard
 from ..custom_placements.owned import BucketedOwned, BucketedOwnedSegmentSpec
@@ -28,7 +29,7 @@ from ..dist_muon.storage_layout import (
 )
 from ..flex_shard.bucket_storage import BucketLayout, BucketParamLayout, ParamInfo
 from ..flex_shard.sharded_param import set_sharding_info
-from .common import single_rank_cpu_mesh
+from .common import single_rank_cpu_mesh, single_rank_cuda_mesh
 
 
 def _sgd_binding(mesh, parameters=None):
@@ -277,6 +278,68 @@ class TestDistMuonBinding(TestCase):
                         "momentum_buffer"
                     ],
                 )
+
+
+class TestDistMuonZeroGrad(TestCase):
+    @parametrize("set_to_none", [True, False])
+    @parametrize("step_before_zero", [True, False])
+    def test_zero_grad(self, device, set_to_none, step_before_zero):
+        mesh_context = (
+            single_rank_cpu_mesh if self.device_type == "cpu" else single_rank_cuda_mesh
+        )
+        with mesh_context() as mesh:
+            parameters = {
+                "weight": nn.Parameter(torch.randn(2, 3, device=device)),
+                "experts": nn.Parameter(torch.randn(2, 2, 3, device=device)),
+            }
+            parameters, bindings, binding = _sgd_binding(mesh, parameters)
+            reference = copy.deepcopy(parameters)
+            reference_optimizer = torch.optim.SGD(
+                reference.values(), lr=0.125, momentum=0.9, foreach=False
+            )
+
+            binding.zero_grad(set_to_none=set_to_none)
+            for parameter_binding in bindings:
+                self.assertIsNone(parameter_binding.real_param.grad)
+                self.assertIsNone(parameter_binding.proxy_param.grad)
+
+            sum(parameter.square().sum() for parameter in parameters.values()).backward()
+            sum(parameter.square().sum() for parameter in reference.values()).backward()
+            if step_before_zero:
+                binding.step()
+                reference_optimizer.step()
+
+            gradients = [parameter.grad for parameter in parameters.values()]
+            binding.zero_grad(set_to_none=set_to_none)
+            reference_optimizer.zero_grad(set_to_none=set_to_none)
+            for parameter_binding, gradient in zip(bindings, gradients, strict=True):
+                parameter = parameter_binding.real_param
+                proxy = parameter_binding.proxy_param
+                if set_to_none:
+                    self.assertIsNone(parameter.grad)
+                else:
+                    self.assertIs(parameter.grad, gradient)
+                    self.assertEqual(parameter.grad, torch.zeros_like(parameter))
+                if set_to_none or not step_before_zero:
+                    self.assertIsNone(proxy.grad)
+                else:
+                    self.assertEqual(proxy.grad.to_local(), torch.zeros_like(parameter))
+
+            sum(
+                2 * parameter.square().sum() for parameter in parameters.values()
+            ).backward()
+            sum(
+                2 * parameter.square().sum() for parameter in reference.values()
+            ).backward()
+            for name, parameter in parameters.items():
+                self.assertEqual(parameter.grad, reference[name].grad)
+            binding.step()
+            reference_optimizer.step()
+            for name, parameter in parameters.items():
+                self.assertEqual(parameter, reference[name])
+
+
+instantiate_device_type_tests(TestDistMuonZeroGrad, globals(), only_for=("cpu", "cuda"))
 
 
 if __name__ == "__main__":

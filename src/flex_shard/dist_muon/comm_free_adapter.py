@@ -65,6 +65,18 @@ class LocalDistMuonBinding:
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         self.optimizer.zero_grad(set_to_none=set_to_none)
+        for binding in self._parameter_bindings:
+            param = binding.real_param
+            if param.grad is None:
+                continue
+            if set_to_none:
+                param.grad = None
+            else:
+                if param.grad.grad_fn is not None:
+                    param.grad.detach_()
+                else:
+                    param.grad.requires_grad_(False)
+                param.grad.zero_()
 
     def _state_dict_post_hook(
         self, _optimizer: Optimizer, state_dict: dict[str, Any]
