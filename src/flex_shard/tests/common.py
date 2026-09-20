@@ -10,7 +10,7 @@ import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import timedelta
-from tempfile import NamedTemporaryFile
+from tempfile import TemporaryDirectory
 
 import torch
 import torch.distributed as dist
@@ -29,11 +29,13 @@ from ..custom_placements.shard import per_param_placements
 def single_rank_cpu_mesh() -> Iterator:
     """Create a single-rank CPU mesh for normal pytest unit tests."""
     created_pg = False
-    with NamedTemporaryFile() as store:
+    # FileStore may delete the rendezvous file while destroying the process
+    # group. Own its directory so cleanup also succeeds when that file is gone.
+    with TemporaryDirectory() as store_dir:
         if not dist.is_initialized():
             dist.init_process_group(
                 "gloo",
-                init_method=f"file://{store.name}",
+                init_method=f"file://{store_dir}/rendezvous",
                 rank=0,
                 world_size=1,
                 timeout=timedelta(seconds=20),
@@ -53,11 +55,11 @@ def single_rank_cuda_mesh() -> Iterator:
         raise unittest.SkipTest("CUDA is required for FlexShard runtime tests.")
     torch.cuda.set_device(0)
     created_pg = False
-    with NamedTemporaryFile() as store:
+    with TemporaryDirectory() as store_dir:
         if not dist.is_initialized():
             dist.init_process_group(
                 "nccl",
-                init_method=f"file://{store.name}",
+                init_method=f"file://{store_dir}/rendezvous",
                 rank=0,
                 world_size=1,
                 timeout=timedelta(seconds=20),
