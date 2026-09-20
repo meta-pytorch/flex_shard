@@ -38,13 +38,15 @@ Muon operates on matrices: splitting a matrix arbitrarily across ranks can
 require communication to compute its update. FlexShard can instead place
 complete logical matrices on their owner ranks, together with their reduced
 gradients. This example combines `BlockShard` and whole-parameter Owned storage
-with [TorchTitan's DistMuon](https://github.com/pytorch/torchtitan/tree/610bb6f6b99d16f2314f9ddf520ab3cd2423ebc0/torchtitan/distributed/flex_shard).
+with FlexShard's native `DistMuon` optimizer. Its implementation is derived
+from TorchTitan; see [source provenance](src/flex_shard/dist_muon/UPSTREAM.md).
 
 Here, **communication-free means no inter-rank communication during the Muon
 optimizer step**. FlexShard still gathers parameters for forward and reduces
-gradients during backward. Constructing the optimizer also creates process
-groups. This is a placement and optimizer recipe for training with Muon; it does
-not remove communication from the training step as a whole.
+gradients during backward. FlexShard setup creates its process groups.
+Native DistMuon uses the existing layout metadata and
+creates no optimizer process groups. Forward/backward communication remains
+part of the training step.
 
 ### Shared Transformer
 
@@ -119,30 +121,23 @@ Every parameter belongs to exactly one bucket and optimizer.
 
 ### Bind DistMuon and train
 
-FlexShard provides the local-storage adapter, not the DistMuon implementation.
-This example uses TorchTitan revision
-`610bb6f6b99d16f2314f9ddf520ab3cd2423ebc0` and requires Python 3.11 or later for
-that optional dependency. After installing FlexShard, install the pinned
-TorchTitan package:
+`DistMuon` is included in FlexShard and updates the actual local parameters
+produced by `flex_shard`. Parameters, gradients, and momentum are ordinary
+PyTorch tensors; this path needs no DTensor proxies, adapter, or additional
+package installation.
 
-```bash
-python -m pip install tyro==1.0.15
-python -m pip install --no-deps \
-  'https://github.com/pytorch/torchtitan/archive/610bb6f6b99d16f2314f9ddf520ab3cd2423ebc0.zip'
-```
+Record optimizer roles before sharding, then reacquire the replacement
+parameters afterward. FlexShard automatically records their matrix layout and
+canonical checkpoint coordinates. `DistMuon` infers complete Owned matrices,
+packed row blocks, and native matrix batches from that metadata. Its momentum
+keeps the parameter's storage shape while temporary views expose individual
+matrices for Newton–Schulz computation.
 
-The pinned package reports TorchTitan version `0.2.2`. Use this revision for
-the compute-layout API shown below. This optimizer import needs PyTorch and `tyro`;
-`--no-deps` avoids installing TorchTitan's full training application stack.
-The per-parameter migration example in the next chapter does not use TorchTitan.
-
-Capture canonical matrix shapes before applying `flex_shard`, then reacquire
-parameters by name afterward because sharding replaces them. The factory
-translates FlexShard's `row_blocks` and `owned` layout metadata into DistMuon
-compute layouts, preserving the adapter's single ordered parameter group.
-`build_local_dist_muon` supplies replicated DTensor views on a singleton mesh;
-the views share storage with the local FlexShard parameters. A rank with no
-local Muon parameters receives `None` and still participates in training.
+Every rank constructs a normal optimizer, including ranks whose selected
+parameters are all empty local shards. Empty shards require no gradients and
+create no momentum state. The native path rejects partial-matrix placements
+that need redistribution; independently applying Muon to those fragments
+would change the update.
 
 Save the following as `train_muon.py` beside `tiny_transformer.py`:
 
@@ -157,17 +152,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from flex_shard import BucketSpec, flex_shard
 from flex_shard.custom_placements.mixed_bucket import MixedBucketPlacement
 from flex_shard.custom_placements.owned import make_bucketed_owned_full_param_segments
-from flex_shard.dist_muon import (
-    build_local_dist_muon,
-    capture_flex_shard_muon_canonical_shards,
-)
-from torchtitan.distributed.flex_shard import (
-    BlockShard as MuonBlockShard,
-    BucketConfig,
-    ComputeLayout,
-    Owned as MuonOwned,
-    build_dist_muon,
-)
+from flex_shard.dist_muon import DistMuon
 from tiny_transformer import TinyTransformer
 
 
@@ -178,33 +163,6 @@ MUON_KWARGS = dict(
 )
 ADAMW_KWARGS = dict(lr=1e-3, eps=1e-6, weight_decay=0.01, foreach=False)
 LARGE_ADAMW = {"tok_embeddings.weight", "pos_embeddings.weight", "output.weight"}
-
-
-def make_muon(param_groups, layouts):
-    # Keep one ordered group and storage-shaped momentum for the binding.
-    assert len(param_groups) == 1
-    group = param_groups[0]
-    compute_layouts = {}
-    for name, parameter in zip(group["param_names"], group["params"], strict=True):
-        assert parameter.device_mesh.mesh_dim_names == ("local",)
-        assert parameter.device_mesh.size() == 1
-        layout = layouts[name]
-        if layout.kind == "row_blocks":
-            # Each complete Q/K/V matrix is orthogonalized independently.
-            compute = MuonBlockShard(dim=0, block_size=layout.block_size)
-        elif layout.kind == "owned":
-            compute = MuonOwned()
-        else:
-            raise ValueError(f"Unexpected Muon layout for {name}: {layout.kind}")
-        compute_layouts[name] = ComputeLayout(
-            shardings_by_mesh_axis={"local": compute}
-        )
-    return build_dist_muon(
-        param_groups,
-        compute_sharding_by_fqn=compute_layouts,
-        bucket_configs=(BucketConfig(patterns=("*",), name="local_muon"),),
-        **MUON_KWARGS,
-    )
 
 
 def transformer_placements(named_params, mesh):
@@ -236,7 +194,6 @@ def configure_muon(model, mesh):
         if name.startswith("layers.") and parameter.ndim == 2
     }
     adamw_names = {name for name, _ in model.named_parameters()} - muon_names
-    capture_flex_shard_muon_canonical_shards(model)
     patterns = [
         "tok_embeddings.*", "pos_embeddings.*",
         *[f"layers.{i}.*" for i in range(len(model.layers))],
@@ -250,9 +207,8 @@ def configure_muon(model, mesh):
         for pattern in patterns
     ])
     named_params = list(model.named_parameters())
-    muon = build_local_dist_muon(
-        model, [(name, p) for name, p in named_params if name in muon_names],
-        optimizer_factory=make_muon,
+    muon = DistMuon(
+        [p for name, p in named_params if name in muon_names], **MUON_KWARGS,
     )
     adamw = torch.optim.AdamW(
         [p for name, p in named_params if name in adamw_names], **ADAMW_KWARGS,
@@ -274,14 +230,12 @@ def main():
         rng = torch.Generator(device=device).manual_seed(1234 + rank)
         for step in range(3):
             tokens = torch.randint(32, (2, 9), generator=rng, device=device)
-            if muon is not None:
-                muon.zero_grad(set_to_none=True)
+            muon.zero_grad(set_to_none=True)
             adamw.zero_grad(set_to_none=True)
             logits = model(tokens[:, :-1])
             loss = F.cross_entropy(logits.flatten(0, 1), tokens[:, 1:].flatten())
             loss.backward()
-            if muon is not None:
-                muon.step()
+            muon.step()
             adamw.step()
             if rank == 0:
                 print(f"step={step} rank0_loss={loss.item():.4f}")
@@ -308,37 +262,27 @@ losses are rank 0's local batch losses, not a global average.
 Muon uses learning rate `0.01`, weight decay `0.01`, momentum `0.95`,
 Nesterov momentum, and five Newton–Schulz iterations with coefficients
 `(3.4445, -4.7750, 2.0315)`, epsilon `1e-7`, and the `original` learning-rate
-adjustment. TorchTitan runs the Newton–Schulz computation in BF16. AdamW uses
+adjustment. DistMuon runs the Newton–Schulz computation in BF16. AdamW uses
 learning rate `1e-3`, epsilon `1e-6`, and weight decay `0.01`.
 
 ### Validation
 
-Three updates matched an unsharded reference using public `torch.optim.Muon`
-on separate Q, K, and V matrices and the same AdamW groups. The reference
-averaged gradients across ranks. Losses, gradients, parameters, Muon momentum,
-and AdamW first and second moments all had maximum absolute error zero on
-both ranks. Validation also checked matrix boundaries, exclusive optimizer
-membership, gradient clearing, and the adapter's `None` result in a separate
-case where one rank owns no Muon parameters.
+The extracted script was run for three steps on two NVIDIA B200 GPUs with
+Python 3.10.18, PyTorch 2.14.0+cu130, CUDA 13.0, and NCCL 2.30.7, using an
+installed FlexShard wheel with neither TorchTitan nor `tyro` installed.
+Rank 0's losses were `3.5078`, `3.5276`, and `3.3849`.
 
-A CPU/CUDA profiler recorded forward/backward and a steady-state Muon step in
-separate regions, with CUDA synchronized at the boundaries:
+An unsharded reference used separate Q/K/V `torch.optim.Muon` parameters and
+the same averaged gradients. On both ranks, the measured maximum absolute
+differences were zero for losses, gradients, parameters, Muon momentum, and
+AdamW moments. These results describe this small example and environment;
+different shapes and kernels may have floating-point differences.
 
-| Profiled region | Inter-rank collectives per rank |
-| --- | --- |
-| Forward and backward | 6 all-gathers + 6 reduce-scatters, with 12 corresponding NCCL GPU kernels |
-| `muon.step()` after backward | 0 c10d collectives and 0 NCCL GPU kernels |
-
-Optimizer initialization and AdamW's step are outside the Muon-step region.
-The zero-collective result applies to this measured Muon step with the shown
-layouts, not to forward/backward or the entire training iteration.
-
-The run used two NVIDIA B200 GPUs, Python 3.12.12, PyTorch
-`2.15.0a0+git1807a24`, CUDA 13.0, NCCL 2.30.7, and the pinned TorchTitan `0.2.2`
-revision above. This was a source-checkout validation on a PyTorch build
-outside FlexShard's declared dependency range. The installation commands
-above describe the declared package requirements, not a reproduction of this
-development environment.
+After synchronizing backward, a CPU/CUDA profile of the third Muon step
+recorded zero communication events. A separate forward/backward profile
+recorded six all-gathers and six reduce-scatters per rank. Tests also cover
+empty owners, native checkpoint resume, migration from adapter checkpoints,
+and execution with DTensor and optimizer process-group creation disabled.
 
 ## Migrating from FSDP2 with per-parameter sharding
 
@@ -472,23 +416,12 @@ the same.
 
 ### Validation
 
-Both complete training scripts were extracted from this README and run with
-`torchrun --standalone --nproc-per-node=2`. Each completed all three steps.
-Rank 0 printed losses `3.5078`, `3.5276`, `3.3849` for the Muon example and
-`3.5078`, `3.5287`, `3.3812` for the per-parameter example.
-
-The six-bucket FlexShard configuration, FSDP2 configuration, and unsharded
-reference were compared over three training steps with identical initial
-weights, rank-specific token sequences, and the AdamW settings shown above.
-The reference explicitly averaged gradients across ranks. Losses, gradients,
-parameters, and AdamW first and second moments matched exactly on both ranks;
-all reported maximum absolute differences were zero. Gradient clearing and
-actual parameter updates were also checked.
-
-The run used two NVIDIA B200 GPUs, Python 3.12.12, PyTorch
-`2.15.0a0+gitd307e02`, and CUDA 13.0. This validates the example against that
-source-checkout environment; the PyTorch build is outside the package's
-declared dependency range. The package requirements above are unchanged.
+The extracted script was run in the same installed-wheel environment above.
+Rank 0's losses were `3.5078`, `3.5287`, and `3.3812`. Over three steps, both
+ranks matched FSDP2 and an unsharded reference with averaged gradients: the
+measured maximum absolute differences in losses, gradients, parameters, and
+AdamW moments were all zero. This validates the example's update behavior;
+checkpoint formats and collective grouping remain separate considerations.
 
 ## Limitations
 
