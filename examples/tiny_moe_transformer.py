@@ -8,8 +8,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tiny_transformer import TinyTransformer
-
 
 class Experts(nn.Module):
     def __init__(self, d_model, hidden_dim, num_experts):
@@ -51,9 +49,32 @@ class MoEBlock(nn.Module):
         return x + mixed
 
 
-class TinyMoETransformer(TinyTransformer):
-    def __init__(self, d_model=16, n_heads=4, n_layers=2, num_experts=4):
-        super().__init__(d_model=d_model, n_heads=n_heads, n_layers=n_layers)
+class TinyMoETransformer(nn.Module):
+    def __init__(
+        self,
+        d_model=16,
+        n_heads=4,
+        n_layers=2,
+        num_experts=4,
+        vocab_size=32,
+        seq_len=8,
+    ):
+        super().__init__()
+        self.tok_embeddings = nn.Embedding(vocab_size, d_model)
+        self.pos_embeddings = nn.Embedding(seq_len, d_model)
         self.layers = nn.ModuleList(
             [MoEBlock(d_model, n_heads, num_experts) for _ in range(n_layers)]
         )
+        self.norm = nn.LayerNorm(d_model)
+        self.output = nn.Linear(d_model, vocab_size, bias=False)
+
+    def forward(self, tokens):
+        seq_len = tokens.size(1)
+        positions = torch.arange(seq_len, device=tokens.device)
+        hidden = self.tok_embeddings(tokens) + self.pos_embeddings(positions)
+        causal_mask = torch.ones(
+            seq_len, seq_len, dtype=torch.bool, device=tokens.device
+        ).triu(1)
+        for layer in self.layers:
+            hidden = layer(hidden, src_mask=causal_mask, is_causal=True)
+        return self.output(self.norm(hidden))
