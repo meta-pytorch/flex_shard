@@ -27,7 +27,11 @@ from .bucket_storage import (
     ShardedBucketStorage,
 )
 from .reshard_after_forward import _apply_reshard_after_forward
-from .sharded_param import is_flex_shard_param
+from .sharded_param import (
+    _CanonicalShard,
+    _capture_canonical_shard,
+    is_flex_shard_param,
+)
 from .unsharded_param_getters import _install_unsharded_param_getters
 from .utils import (
     _get_device_from_mesh,
@@ -318,6 +322,7 @@ class PreparedFlexShardInputs:
     device: torch.device
     param_placements: dict[str, tuple[Placement, ...]]
     bucket_assignments: BucketParamFQNsByIndex
+    canonical_shards: dict[str, _CanonicalShard] | None = None
 
 
 def _materialize_bucket_storages(
@@ -348,6 +353,7 @@ def _materialize_bucket_storages(
                 bucket_spec.mesh,
                 inputs.device,
                 bucket_spec,
+                canonical_shards=inputs.canonical_shards,
             )
         )
 
@@ -384,6 +390,10 @@ def _prepare_flex_shard_inputs(
 ) -> PreparedFlexShardInputs:
     """Validate inputs and derive setup state for flex_shard()."""
     _check_not_already_flex_sharded(module)
+    canonical_shards = {
+        fqn: _capture_canonical_shard(parameter)
+        for fqn, parameter in module.named_parameters(remove_duplicate=False)
+    }
     _unwrap_dtensor_params_to_local(module)
 
     if not buckets:
@@ -451,6 +461,7 @@ def _prepare_flex_shard_inputs(
         device=device,
         param_placements=param_placements,
         bucket_assignments=bucket_assignments,
+        canonical_shards=canonical_shards,
     )
 
 

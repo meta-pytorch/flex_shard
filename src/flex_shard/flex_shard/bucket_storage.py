@@ -16,7 +16,13 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch._prims_common import make_contiguous_strides_for
 
-from .sharded_param import set_sharding_info
+from .sharded_param import (
+    _build_shard_metadata,
+    _CanonicalShard,
+    _capture_canonical_shard,
+    set_sharding_info,
+    ShardMetadata,
+)
 from .utils import _get_single_placement, _set_param_on_module
 
 if TYPE_CHECKING:
@@ -166,6 +172,8 @@ class ParamInfo:
     storage_nbytes: int = 0  # bytes reserved for this param's local storage
     global_numel: int = 0  # total elements in unsharded param
     bucket_layout: BucketLayout | None = None
+    canonical_shard: _CanonicalShard | None = None
+    shard_metadata: ShardMetadata | None = None
 
     @property
     def placement(self) -> Placement:
@@ -230,6 +238,7 @@ class ShardedBucketStorage:
         mesh: DeviceMesh,
         device: torch.device,
         bucket_spec: BucketSpec,
+        canonical_shards: dict[str, _CanonicalShard] | None = None,
     ) -> ShardedBucketStorage:
         """Create storage metadata for one bucket and install sharded params."""
         param_infos, total_bytes = cls.create_param_infos(
@@ -239,6 +248,9 @@ class ShardedBucketStorage:
             bucket_spec.mp_policy,
             bucket_spec.gradient_reduce_op,
         )
+        if canonical_shards is not None:
+            for fqn, info in param_infos.items():
+                info.canonical_shard = canonical_shards[fqn]
 
         if bucket_spec.offload_policy is not None:
             byte_storage = torch.empty(
@@ -490,6 +502,7 @@ class ShardedBucketStorage:
             storage_nbytes=storage_nbytes,
             global_numel=param.numel(),
             bucket_layout=bucket_layout,
+            canonical_shard=_capture_canonical_shard(param),
         )
 
     def copy_params_from(
@@ -526,12 +539,15 @@ class ShardedBucketStorage:
                     f"Expected sharded parameter {fqn!r} on "
                     f"{expected_device}, but got {new_param.device}"
                 )
+            if info.shard_metadata is None:
+                info.shard_metadata = _build_shard_metadata(info, self._mesh)
             set_sharding_info(
                 new_param,
                 placements=info.placements,
                 global_shape=info.global_shape,
                 global_stride=info.global_stride,
                 mesh=self._mesh,
+                metadata=info.shard_metadata,
             )
             _set_param_on_module(self._module, fqn, new_param)
 
