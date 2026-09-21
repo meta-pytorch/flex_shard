@@ -17,6 +17,7 @@ from .bucket_planner import (
     WholeMatrixSpec,
 )
 from .comm_free_adapter import build_local_dist_muon, LocalDistMuonBinding
+from .optimizer import build_dist_muon, DistMuon
 from .placement import BlockShardPlan
 from .storage_layout import (
     capture_flex_shard_muon_canonical_shards,
@@ -29,9 +30,11 @@ __all__ = [
     "assign_matrices",
     "AssignmentGroup",
     "BlockShardPlan",
+    "build_dist_muon",
     "build_local_dist_muon",
     "capture_flex_shard_muon_canonical_shards",
     "get_flex_shard_muon_compute_layouts",
+    "DistMuon",
     "LocalDistMuonBinding",
     "LocalMuonComputeLayout",
     "LocalMuonStateShard",
