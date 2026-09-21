@@ -303,7 +303,9 @@ class TestDistMuonZeroGrad(TestCase):
                 self.assertIsNone(parameter_binding.real_param.grad)
                 self.assertIsNone(parameter_binding.proxy_param.grad)
 
-            sum(parameter.square().sum() for parameter in parameters.values()).backward()
+            sum(
+                parameter.square().sum() for parameter in parameters.values()
+            ).backward()
             sum(parameter.square().sum() for parameter in reference.values()).backward()
             if step_before_zero:
                 binding.step()
