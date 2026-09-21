@@ -27,7 +27,6 @@ def build_buckets(model, dp_mesh, efsdp_mesh):
             patterns,
             mesh=mesh,
             placement_fn=per_param_placements,
-            gradient_reduce_op=dist.ReduceOp.AVG,
             reshard_after_forward=False,
         )
 
