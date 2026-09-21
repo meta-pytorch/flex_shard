@@ -48,7 +48,7 @@ each parameter's mesh, and updates local shards with AdamW.
 | --- | --- |
 | Apply `fully_shard` to child modules, then the root | Call `flex_shard` once with explicit buckets |
 | Shard parameters along dimension 0 | Use `per_param_placements`, which assigns each parameter `Shard(0)` |
-| Give expert modules their own FSDP mesh | Give expert buckets their own `efsdp` mesh |
+| `fully_shard(layer.experts, mesh=efsdp_mesh)` | Expert `BucketSpec(..., mesh=efsdp_mesh)` |
 | Construct AdamW after sharding | Construct AdamW after sharding |
 | AdamW manages DTensor parameters | AdamW manages ordinary local parameter shards |
 
@@ -79,7 +79,6 @@ constructs AdamW after sharding:
 
 ```python
 import torch
-import torch.distributed as dist
 from flex_shard import BucketSpec, flex_shard
 from flex_shard.custom_placements.shard import per_param_placements
 
@@ -87,7 +86,7 @@ from flex_shard.custom_placements.shard import per_param_placements
 def bucket(patterns, mesh):
     return BucketSpec(
         patterns, mesh=mesh, placement_fn=per_param_placements,
-        gradient_reduce_op=dist.ReduceOp.AVG, reshard_after_forward=False,
+        reshard_after_forward=False,
     )
 
 
@@ -216,8 +215,10 @@ memory use, or equivalence to GraphTrainer's scheduling and optimization passes.
 
 ## Parameter retention and checkpoints
 
-These examples use `reshard_after_forward=False`: gathered parameters remain
-available through backward, trading memory for fewer all-gathers. With
+`BucketSpec` defaults to `gradient_reduce_op=dist.ReduceOp.AVG`, so the examples
+omit that argument. Its `reshard_after_forward` default is `True`; the examples
+explicitly set it to `False` so gathered parameters remain available through
+backward, trading memory for fewer all-gathers. With
 `reshard_after_forward=True`, FlexShard's saved-tensor hooks replay parameter
 unshards in backward. That does not itself recompute the whole Transformer
 block; existing activation checkpointing can compose with that policy.
