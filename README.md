@@ -4,9 +4,9 @@ FlexShard is an experimental parameter-sharding library for PyTorch. Explicit
 `BucketSpec`s choose which parameters communicate together, which device mesh
 they use, and how they are sharded. Optimizers work on ordinary local tensors.
 
-Start with AdamW and per-parameter `Shard(0)` to reproduce FSDP2-style training.
-The same dense and MoE examples can then expose their bucket collectives in a
-full model trace, following the approach in
+Train `TinyMoETransformer` with AdamW, sharding dense parameters over `dp` and
+expert parameters over `efsdp` to reproduce FSDP2-style training. Then expose
+the same model's bucket collectives in a full model trace, following
 [`test_torch_compile_traces_per_bucket_collectives`](src/flex_shard/tests/test_flex_shard_runtime.py).
 
 ## Requirements and installation
@@ -28,16 +28,21 @@ cd flex_shard
 python -m pip install -e .
 ```
 
-The distribution is named `flex-shard`; import it as `flex_shard`. The dense
-example needs two GPUs and the MoE example needs four. FlexShard uses the CUDA
-runtime supported by your PyTorch build rather than pinning a separate toolkit.
+The distribution is named `flex-shard`; import it as `flex_shard`. The AdamW
+example needs four GPUs and uses the CUDA runtime supported by your PyTorch
+build.
 
 ## FSDP2-style training with AdamW
 
-Both examples use small causal Transformers built from public PyTorch modules:
-two blocks, hidden size 16, four attention heads, no dropout, and untied output
-weights. They predict the next token for three steps, average gradients over
-each parameter's mesh, and update local shards with AdamW.
+[`TinyMoETransformer`](examples/tiny_moe_transformer.py) is a small causal model
+built from public PyTorch modules: two blocks, hidden size 16, four attention
+heads, no dropout, and untied output weights. Each block has a softmax router
+and four expert MLPs. The model evaluates all experts and combines their outputs
+by router weight; it demonstrates expert-FSDP storage without sparse token
+dispatch or expert parallelism.
+
+The example predicts the next token for three steps, averages gradients over
+each parameter's mesh, and updates local shards with AdamW.
 
 | FSDP2 | FlexShard |
 | --- | --- |
@@ -47,71 +52,7 @@ each parameter's mesh, and update local shards with AdamW.
 | Construct AdamW after sharding | Construct AdamW after sharding |
 | AdamW manages DTensor parameters | AdamW manages ordinary local parameter shards |
 
-### Dense parameters: per-parameter Shard(0)
-
-[`TinyTransformer`](examples/tiny_transformer.py) has six communication buckets:
-token embeddings, position embeddings, one per Transformer block, final
-normalization, and the output projection. Every parameter belongs to exactly
-one bucket and is sharded independently along dimension 0 over the full `dp`
-mesh.
-
-The setup in [`examples/train_adamw.py`](examples/train_adamw.py) is equivalent
-to the following configuration, after creating a model and a one-dimensional
-CUDA mesh:
-
-```python
-import torch
-import torch.distributed as dist
-from flex_shard import BucketSpec, flex_shard
-from flex_shard.custom_placements.shard import per_param_placements
-
-patterns = [
-    "tok_embeddings.*", "pos_embeddings.*",
-    *[f"layers.{i}.*" for i in range(len(model.layers))],
-    "norm.*", "output.*",
-]
-flex_shard(model, buckets=[
-    BucketSpec(
-        [pattern], mesh=dp_mesh, placement_fn=per_param_placements,
-        gradient_reduce_op=dist.ReduceOp.AVG, reshard_after_forward=False,
-    )
-    for pattern in patterns
-])
-optimizer = torch.optim.AdamW(
-    model.parameters(), lr=1e-3, eps=1e-6, weight_decay=0.01, foreach=False,
-)
-```
-
-Run the complete example from the repository root:
-
-```bash
-torchrun --standalone --nproc-per-node=2 examples/train_adamw.py
-```
-
-The corresponding FSDP2 setup on a fresh copy of the model is:
-
-```python
-from torch.distributed.fsdp import fully_shard
-
-for layer in model.layers:
-    fully_shard(layer, mesh=dp_mesh, reshard_after_forward=False)
-fully_shard(model, mesh=dp_mesh, reshard_after_forward=False)
-optimizer = torch.optim.AdamW(
-    model.parameters(), lr=1e-3, eps=1e-6, weight_decay=0.01, foreach=False,
-)
-```
-
-FSDP2 groups the remaining parameters at the root; this FlexShard example puts
-them in four explicit buckets. The parameter split and averaged-gradient
-update agree even though the collective grouping differs.
-
-### MoE: dense parameters on dp, expert parameters on efsdp
-
-[`TinyMoETransformer`](examples/tiny_moe_transformer.py) replaces each block's
-feed-forward network with a softmax router and four expert MLPs. It evaluates
-all experts and combines their outputs by router weight. This small example
-demonstrates expert-FSDP parameter storage; it does not implement sparse token
-dispatch or expert parallelism.
+### Dense parameters on dp, expert parameters on efsdp
 
 The four ranks form an `efsdp × replica` grid:
 
@@ -133,22 +74,60 @@ The expert bucket for block `i` selects `layers.{i}.experts.*` and uses
 bucket on `dp_mesh`. Along with the four root buckets, this gives eight
 buckets. After all-gather, each expert-FSDP group can evaluate all four experts.
 
+[`examples/train_adamw.py`](examples/train_adamw.py) builds these buckets and
+constructs AdamW after sharding:
+
+```python
+import torch
+import torch.distributed as dist
+from flex_shard import BucketSpec, flex_shard
+from flex_shard.custom_placements.shard import per_param_placements
+
+
+def bucket(patterns, mesh):
+    return BucketSpec(
+        patterns, mesh=mesh, placement_fn=per_param_placements,
+        gradient_reduce_op=dist.ReduceOp.AVG, reshard_after_forward=False,
+    )
+
+
+buckets = [
+    bucket([pattern], dp_mesh)
+    for pattern in ("tok_embeddings.*", "pos_embeddings.*", "norm.*", "output.*")
+]
+for i in range(len(model.layers)):
+    buckets.extend([
+        bucket(
+            [f"layers.{i}.{part}.*" for part in
+             ("self_attn", "norm1", "norm2", "router")],
+            dp_mesh,
+        ),
+        bucket([f"layers.{i}.experts.*"], efsdp_mesh),
+    ])
+flex_shard(model, buckets=buckets)
+optimizer = torch.optim.AdamW(
+    model.parameters(), lr=1e-3, eps=1e-6, weight_decay=0.01, foreach=False,
+)
+```
+
 The two expert replicas receive paired batches: ranks 0 and 1 share one batch,
 and ranks 2 and 3 share another. Batches differ along `efsdp`, while corresponding
 expert replicas see the same averaged gradients and remain synchronized.
 Arbitrary independent batches across replicas would require additional replica
 gradient synchronization.
 
-Run the same AdamW training loop with the MoE model and meshes:
+Run the complete example from the repository root:
 
 ```bash
-torchrun --standalone --nproc-per-node=4 examples/train_adamw.py --moe
+torchrun --standalone --nproc-per-node=4 examples/train_adamw.py
 ```
 
 On a fresh, unsharded `TinyMoETransformer`, the FSDP2 reference uses the same
-mesh assignment:
+mesh assignment and AdamW settings:
 
 ```python
+from torch.distributed.fsdp import fully_shard
+
 for layer in model.layers:
     fully_shard(layer.experts, mesh=efsdp_mesh, reshard_after_forward=False)
     fully_shard(layer, mesh=dp_mesh, reshard_after_forward=False)
@@ -160,18 +139,13 @@ optimizer = torch.optim.AdamW(
 
 ### Numerical comparison
 
-Both layouts were compared with FSDP2 and unsharded references over three
+The example was compared with FSDP2 and an unsharded reference over three
 AdamW steps, checking losses, gradients, parameters, and both optimizer
-moments. Validation used Python 3.10.18, PyTorch 2.14.0+cu130, CUDA 13.0,
-NCCL 2.30.7, and NVIDIA B200 GPUs.
+moments. Validation used four NVIDIA B200 GPUs, Python 3.10.18,
+PyTorch 2.14.0+cu130, CUDA 13.0, and NCCL 2.30.7.
 
-| Example | GPUs | Rank-0 losses | Largest absolute parameter difference |
-| --- | --- | --- | --- |
-| Dense | 2 | `3.5078`, `3.5287`, `3.3812` | `0` |
-| MoE | 4 | `3.4172`, `3.5311`, `3.2894` | `3.55e-7` |
-
-Losses agreed exactly in both cases. Dense gradients and AdamW moments also
-agreed exactly; MoE differences were at most `1.49e-8` for gradients,
+Rank-0 losses were `3.9559`, `3.6024`, and `3.7062`. Maximum absolute differences
+were `2.39e-7` for losses, `1.50e-8` for gradients, `4.26e-7` for parameters,
 `1.87e-9` for first moments, and `3.64e-12` for second moments.
 
 ## Full model tracing with visible collectives
@@ -219,26 +193,19 @@ executes the graph directly; loss calculation and AdamW remain outside the
 captured model. This is a model-tracing example, not a single flat graph of the
 entire training loop.
 
-Run and inspect both layouts:
+Run and inspect the same `TinyMoETransformer`:
 
 ```bash
-torchrun --standalone --nproc-per-node=2 examples/train_adamw.py \
-    --trace --graph-dir /tmp/flex_shard_dense_trace
 torchrun --standalone --nproc-per-node=4 examples/train_adamw.py \
-    --moe --trace --graph-dir /tmp/flex_shard_moe_trace
+    --trace --graph-dir /tmp/flex_shard_moe_trace
 ```
 
-Each run performs three AdamW steps, checks that exactly one Dynamo graph was
+The run performs three AdamW steps, checks that exactly one Dynamo graph was
 captured, verifies the per-bucket collectives, and writes the graph code and
 `summary.json` under `rank0/`, `rank1/`, and so on.
 
-The traced examples retained the numerical agreement above. Each rank's
-captured graphs contained:
-
-| Example | Dynamo graphs | Bucket autograd operations | All-gathers | Reduce-scatters | Waits |
-| --- | --- | --- | --- | --- | --- |
-| Dense | 1 | 6 | 6 | 6 | 12 |
-| MoE | 1 | 8 | 8 | 8 | 16 |
+Each rank's captured graphs contain one Dynamo graph, eight bucket autograd
+operations, eight all-gathers, eight reduce-scatters, and sixteen waits.
 
 These are graph-node counts, not profiler measurements. The MoE trace includes
 communication over both the four-rank `dp` and two-rank `efsdp` meshes.
