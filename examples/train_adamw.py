@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Train dense or MoE Transformers with AdamW, optionally inspecting the trace."""
+"""Train TinyMoETransformer with AdamW, optionally inspecting the trace."""
 
 import argparse
 import json
@@ -19,10 +19,9 @@ from torch.distributed.device_mesh import init_device_mesh
 from flex_shard import BucketSpec, flex_shard
 from flex_shard.custom_placements.shard import per_param_placements
 from tiny_moe_transformer import TinyMoETransformer
-from tiny_transformer import TinyTransformer
 
 
-def build_buckets(model, dp_mesh, efsdp_mesh=None):
+def build_buckets(model, dp_mesh, efsdp_mesh):
     def bucket(patterns, mesh):
         return BucketSpec(
             patterns,
@@ -37,21 +36,18 @@ def build_buckets(model, dp_mesh, efsdp_mesh=None):
         for pattern in ("tok_embeddings.*", "pos_embeddings.*", "norm.*", "output.*")
     ]
     for index in range(len(model.layers)):
-        if efsdp_mesh is None:
-            buckets.append(bucket([f"layers.{index}.*"], dp_mesh))
-        else:
-            buckets.extend(
-                [
-                    bucket(
-                        [
-                            f"layers.{index}.{part}.*"
-                            for part in ("self_attn", "norm1", "norm2", "router")
-                        ],
-                        dp_mesh,
-                    ),
-                    bucket([f"layers.{index}.experts.*"], efsdp_mesh),
-                ]
-            )
+        buckets.extend(
+            [
+                bucket(
+                    [
+                        f"layers.{index}.{part}.*"
+                        for part in ("self_attn", "norm1", "norm2", "router")
+                    ],
+                    dp_mesh,
+                ),
+                bucket([f"layers.{index}.experts.*"], efsdp_mesh),
+            ]
+        )
     return buckets
 
 
@@ -90,9 +86,6 @@ def inspect_trace(graphs, bucket_count, output_dir, rank):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--moe", action="store_true", help="Use expert-FSDP on four GPUs"
-    )
-    parser.add_argument(
         "--trace", action="store_true", help="Capture and inspect the graph"
     )
     parser.add_argument("--graph-dir", default="trace_output")
@@ -103,22 +96,15 @@ def main():
     dist.init_process_group("nccl")
     try:
         rank, world_size = dist.get_rank(), dist.get_world_size()
-        expected_world_size = 4 if args.moe else 2
-        if world_size != expected_world_size:
-            raise ValueError(
-                f"Run this example with {expected_world_size} GPU processes"
-            )
+        if world_size != 4:
+            raise ValueError("Run this example with four GPU processes")
         device = torch.device("cuda", local_rank)
         dp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
-        efsdp_mesh = None
-        if args.moe:
-            grid = init_device_mesh("cuda", (2, 2), mesh_dim_names=("efsdp", "replica"))
-            efsdp_mesh = grid["efsdp"]
+        grid = init_device_mesh("cuda", (2, 2), mesh_dim_names=("efsdp", "replica"))
+        efsdp_mesh = grid["efsdp"]
 
         torch.manual_seed(42)
-        model = (
-            (TinyMoETransformer() if args.moe else TinyTransformer()).to(device).train()
-        )
+        model = TinyMoETransformer().to(device).train()
         buckets = build_buckets(model, dp_mesh, efsdp_mesh)
         flex_shard(model, buckets=buckets)
         optimizer = torch.optim.AdamW(
@@ -137,7 +123,7 @@ def main():
             else model
         )
         # MoE replicas share a batch; the two efsdp coordinates get different batches.
-        data_rank = rank if efsdp_mesh is None else efsdp_mesh.get_local_rank()
+        data_rank = efsdp_mesh.get_local_rank()
         rng = torch.Generator(device=device).manual_seed(1234 + data_rank)
         for step in range(3):
             tokens = torch.randint(32, (2, 9), generator=rng, device=device)
