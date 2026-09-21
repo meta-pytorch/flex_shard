@@ -77,7 +77,6 @@ def configure_muon(model, mesh):
                 [pattern],
                 mesh=mesh,
                 placement_fn=transformer_placements,
-                gradient_reduce_op=dist.ReduceOp.AVG,
                 reshard_after_forward=False,
             )
             for pattern in patterns
