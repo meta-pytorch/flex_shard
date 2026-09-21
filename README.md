@@ -86,7 +86,6 @@ from flex_shard.custom_placements.shard import per_param_placements
 def bucket(patterns, mesh):
     return BucketSpec(
         patterns, mesh=mesh, placement_fn=per_param_placements,
-        reshard_after_forward=False,
     )
 
 
@@ -109,6 +108,10 @@ optimizer = torch.optim.AdamW(
 )
 ```
 
+This eager example uses the `BucketSpec` defaults: averaged gradients and
+`reshard_after_forward=True`. Gathered parameters are released after forward
+and reconstructed as needed during backward.
+
 The two expert replicas receive paired batches: ranks 0 and 1 share one batch,
 and ranks 2 and 3 share another. Batches differ along `efsdp`, while corresponding
 expert replicas see the same averaged gradients and remain synchronized.
@@ -128,13 +131,16 @@ mesh assignment and AdamW settings:
 from torch.distributed.fsdp import fully_shard
 
 for layer in model.layers:
-    fully_shard(layer.experts, mesh=efsdp_mesh, reshard_after_forward=False)
-    fully_shard(layer, mesh=dp_mesh, reshard_after_forward=False)
-fully_shard(model, mesh=dp_mesh, reshard_after_forward=False)
+    fully_shard(layer.experts, mesh=efsdp_mesh)
+    fully_shard(layer, mesh=dp_mesh)
+fully_shard(model, mesh=dp_mesh, reshard_after_forward=True)
 optimizer = torch.optim.AdamW(
     model.parameters(), lr=1e-3, eps=1e-6, weight_decay=0.01, foreach=False,
 )
 ```
+
+FSDP2 defaults to resharding child modules. The root explicitly uses `True`
+to match the eager FlexShard example's policy.
 
 ### Numerical comparison
 
@@ -155,9 +161,25 @@ FlexShard exposes this capability through its explicit buckets: the model's
 forward graph contains per-bucket autograd operations whose forward and
 backward subgraphs contain functional collectives.
 
-Following the unit test, capture the same sharded model with:
+The tracing path uses the same model and mesh assignment with
+`reshard_after_forward=False`: FlexShard's saved-tensor hooks for resharding
+currently require eager execution. Following the unit test, configure a fresh
+model for tracing, then capture it:
 
 ```python
+from dataclasses import replace
+
+from examples.tiny_moe_transformer import TinyMoETransformer
+
+model = TinyMoETransformer().to(device).train()
+trace_buckets = [
+    replace(spec, reshard_after_forward=False) for spec in buckets
+]
+flex_shard(model, buckets=trace_buckets)
+optimizer = torch.optim.AdamW(
+    model.parameters(), lr=1e-3, eps=1e-6, weight_decay=0.01, foreach=False,
+)
+
 graphs = []
 
 def capture_backend(graph_module, example_inputs):
@@ -288,12 +310,16 @@ and execution with DTensor and optimizer process-group creation disabled.
 ## Parameter retention and checkpoints
 
 `BucketSpec` defaults to `gradient_reduce_op=dist.ReduceOp.AVG`, so the examples
-omit that argument. Its `reshard_after_forward` default is `True`; the examples
-explicitly set it to `False` so gathered parameters remain available through
-backward, trading memory for fewer all-gathers. With
-`reshard_after_forward=True`, FlexShard's saved-tensor hooks replay parameter
-unshards in backward. That does not itself recompute the whole Transformer
-block; existing activation checkpointing can compose with that policy.
+omit that argument. Its `reshard_after_forward` default is `True`, which the
+eager AdamW example uses. FlexShard's saved-tensor hooks replay parameter
+unshards as needed in backward. That does not itself recompute the whole
+Transformer block; existing activation checkpointing can compose with that
+policy.
+
+Setting `reshard_after_forward=False` keeps gathered parameters available
+through backward, trading memory for fewer all-gathers. The tracing example
+uses this setting because the resharding hooks currently require eager
+execution.
 
 A regular FlexShard `state_dict()` contains rank-local shards. It is not a
 gathered model checkpoint. Existing FSDP2 checkpoint code needs an explicit

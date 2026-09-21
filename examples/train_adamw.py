@@ -9,6 +9,7 @@
 import argparse
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -27,7 +28,6 @@ def build_buckets(model, dp_mesh, efsdp_mesh):
             patterns,
             mesh=mesh,
             placement_fn=per_param_placements,
-            reshard_after_forward=False,
         )
 
     buckets = [
@@ -105,6 +105,9 @@ def main():
         torch.manual_seed(42)
         model = TinyMoETransformer().to(device).train()
         buckets = build_buckets(model, dp_mesh, efsdp_mesh)
+        if args.trace:
+            # RAF saved-tensor hooks currently require eager execution.
+            buckets = [replace(spec, reshard_after_forward=False) for spec in buckets]
         flex_shard(model, buckets=buckets)
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=1e-3, eps=1e-6, weight_decay=0.01, foreach=False
