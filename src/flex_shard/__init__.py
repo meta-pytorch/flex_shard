@@ -11,12 +11,15 @@ from .flex_shard import (
     flex_shard,
     get_global_shape,
     get_placements,
+    get_shard_metadata,
     is_flex_shard_param,
     LocalStorageLayout,
     MixedPrecisionPolicy,
     OffloadPolicy,
     Placement,
     PlacementFn,
+    ShardMetadata,
+    ShardRegion,
 )
 
 
@@ -27,10 +30,13 @@ __all__ = [
     "flex_shard",
     "get_global_shape",
     "get_placements",
+    "get_shard_metadata",
     "is_flex_shard_param",
     "LocalStorageLayout",
     "MixedPrecisionPolicy",
     "OffloadPolicy",
     "Placement",
     "PlacementFn",
+    "ShardMetadata",
+    "ShardRegion",
 ]
