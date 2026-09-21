@@ -1,28 +1,26 @@
 # FlexShard
 
-FlexShard is an experimental parameter-sharding library for PyTorch. It groups
-model parameters into buckets and lets placement implementations control how
-each bucket stores shards, gathers parameters, and reduces gradients.
+FlexShard is an experimental parameter-sharding library for PyTorch. Explicit
+`BucketSpec`s choose which parameters communicate together, which device mesh
+they use, and how they are sharded. Optimizers work on ordinary local tensors.
 
-## Requirements
+Train `TinyMoETransformer` with AdamW, sharding dense parameters over `dp` and
+expert parameters over `efsdp` to reproduce FSDP2-style training. Then expose
+the same model's bucket collectives in a full model trace, following
+[`test_torch_compile_traces_per_bucket_collectives`](src/flex_shard/tests/test_flex_shard_runtime.py).
+
+## Requirements and installation
 
 | Component | Requirement |
 | --- | --- |
 | Python | 3.10 or later |
 | PyTorch | `>=2.14,<2.15` |
-| Platform | Linux with NVIDIA GPUs for training |
+| Platform | Linux with NVIDIA GPUs |
 | CUDA and NCCL | A CUDA-enabled PyTorch build with NCCL and a compatible NVIDIA driver |
 | Triton | `~=3.8.0` on Linux |
 
-FlexShard does not pin a separate CUDA toolkit version. Use the CUDA runtime
-supported by your PyTorch build and a compatible driver. The example below uses
-two GPUs; some tests require four. CPU-only tests cover a subset of the library,
-not the CUDA training runtime.
-
-## Installation
-
-Install a CUDA-enabled PyTorch build satisfying the version range above, then
-install FlexShard from this repository:
+Install a CUDA-enabled PyTorch build satisfying this range, then install
+FlexShard from the repository:
 
 ```bash
 git clone https://github.com/meta-pytorch/flex_shard.git
@@ -30,104 +28,255 @@ cd flex_shard
 python -m pip install -e .
 ```
 
-The distribution is named `flex-shard`; the Python import is `flex_shard`.
+The distribution is named `flex-shard`; import it as `flex_shard`. The AdamW
+example needs four GPUs and uses the CUDA runtime supported by your PyTorch
+build.
 
-## Example
+## FSDP2-style training with AdamW
 
-Save this as `train.py`. It shards each parameter along dimension 0 and runs
-three training steps. Initialize the same model on every rank and create the
-optimizer after applying `flex_shard`.
+[`TinyMoETransformer`](examples/tiny_moe_transformer.py) is a small causal model
+built from public PyTorch modules: two blocks, hidden size 16, four attention
+heads, no dropout, and untied output weights. Each block has a softmax router
+and four expert MLPs. The model evaluates all experts and combines their outputs
+by router weight; it demonstrates expert-FSDP storage without sparse token
+dispatch or expert parallelism.
+
+The example predicts the next token for three steps, averages gradients over
+each parameter's mesh, and updates local shards with AdamW.
+
+| FSDP2 | FlexShard |
+| --- | --- |
+| Apply `fully_shard` to child modules, then the root | Call `flex_shard` once with explicit buckets |
+| Shard parameters along dimension 0 | Use `per_param_placements`, which assigns each parameter `Shard(0)` |
+| `fully_shard(layer.experts, mesh=efsdp_mesh)` | Expert `BucketSpec(..., mesh=efsdp_mesh)` |
+| Construct AdamW after sharding | Construct AdamW after sharding |
+| AdamW manages DTensor parameters | AdamW manages ordinary local parameter shards |
+
+### Dense parameters on dp, expert parameters on efsdp
+
+The four ranks form an `efsdp × replica` grid:
+
+| Parameters | Mesh | Storage |
+| --- | --- | --- |
+| Embeddings, attention, router, norms, output | `dp = [0, 1, 2, 3]` | Per-parameter `Shard(0)` across four ranks |
+| Expert matrices `[experts, rows, columns]` | `efsdp = [0, 2]` or `[1, 3]` | Per-parameter `Shard(0)` across two ranks |
 
 ```python
-import os
-
-import torch
-import torch.distributed as dist
-from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 
+dp_mesh = init_device_mesh("cuda", (4,), mesh_dim_names=("dp",))
+grid = init_device_mesh("cuda", (2, 2), mesh_dim_names=("efsdp", "replica"))
+efsdp_mesh = grid["efsdp"]
+```
+
+The expert bucket for block `i` selects `layers.{i}.experts.*` and uses
+`mesh=efsdp_mesh`. The block's attention, router, and norms form a separate
+bucket on `dp_mesh`. Along with the four root buckets, this gives eight
+buckets. After all-gather, each expert-FSDP group can evaluate all four experts.
+
+[`examples/train_adamw.py`](examples/train_adamw.py) builds these buckets and
+constructs AdamW after sharding:
+
+```python
+import torch
 from flex_shard import BucketSpec, flex_shard
 from flex_shard.custom_placements.shard import per_param_placements
 
 
-def main():
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    dist.init_process_group("nccl")
-    try:
-        mesh = init_device_mesh("cuda", (dist.get_world_size(),))
-        torch.manual_seed(0)
-        # Initialize on the GPU to avoid copying parameters from the CPU.
-        model = nn.Sequential(
-            nn.Linear(8, 16, device="cuda"),
-            nn.ReLU(),
-            nn.Linear(16, 4, device="cuda"),
-        )
-        flex_shard(
-            model,
-            buckets=[
-                BucketSpec(
-                    ["*"],
-                    placement_fn=per_param_placements,
-                    mesh=mesh,
-                    reshard_after_forward=False,
-                )
-            ],
-        )
-        # Batch optimizer updates to reduce kernel-launch overhead.
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=True)
-        torch.manual_seed(1 + dist.get_rank())
-        for _ in range(3):
-            optimizer.zero_grad(set_to_none=True)
-            loss = model(torch.randn(4, 8, device="cuda")).square().mean()
-            loss.backward()
-            optimizer.step()
-        if dist.get_rank() == 0:
-            print(f"Final loss: {loss.item():.4f}")
-    finally:
-        dist.destroy_process_group()
+def bucket(patterns, mesh):
+    return BucketSpec(
+        patterns, mesh=mesh, placement_fn=per_param_placements,
+    )
 
 
-if __name__ == "__main__":
-    main()
+buckets = [
+    bucket([pattern], dp_mesh)
+    for pattern in ("tok_embeddings.*", "pos_embeddings.*", "norm.*", "output.*")
+]
+for i in range(len(model.layers)):
+    buckets.extend([
+        bucket(
+            [f"layers.{i}.{part}.*" for part in
+             ("self_attn", "norm1", "norm2", "router")],
+            dp_mesh,
+        ),
+        bucket([f"layers.{i}.experts.*"], efsdp_mesh),
+    ])
+flex_shard(model, buckets=buckets)
+optimizer = torch.optim.AdamW(
+    model.parameters(), lr=1e-3, eps=1e-6, weight_decay=0.01, foreach=False,
+)
 ```
 
-Run one process per GPU:
+This eager example uses the `BucketSpec` defaults: averaged gradients and
+`reshard_after_forward=True`. Gathered parameters are released after forward
+and reconstructed as needed during backward.
+
+The two expert replicas receive paired batches: ranks 0 and 1 share one batch,
+and ranks 2 and 3 share another. Batches differ along `efsdp`, while corresponding
+expert replicas see the same averaged gradients and remain synchronized.
+Arbitrary independent batches across replicas would require additional replica
+gradient synchronization.
+
+Run the complete example from the repository root:
 
 ```bash
-torchrun --standalone --nproc-per-node=2 train.py
+torchrun --standalone --nproc-per-node=4 examples/train_adamw.py
 ```
 
-The example keeps full parameters after forward with
-`reshard_after_forward=False`. Enabling resharding uses activation recomputation
-and requires a compatible model execution pattern.
+On a fresh, unsharded `TinyMoETransformer`, the FSDP2 reference uses the same
+mesh assignment and AdamW settings:
+
+```python
+from torch.distributed.fsdp import fully_shard
+
+for layer in model.layers:
+    fully_shard(layer.experts, mesh=efsdp_mesh)
+    fully_shard(layer, mesh=dp_mesh)
+fully_shard(model, mesh=dp_mesh, reshard_after_forward=True)
+optimizer = torch.optim.AdamW(
+    model.parameters(), lr=1e-3, eps=1e-6, weight_decay=0.01, foreach=False,
+)
+```
+
+FSDP2 defaults to resharding child modules. The root explicitly uses `True`
+to match the eager FlexShard example's policy.
+
+### Numerical comparison
+
+The example was compared with FSDP2 and an unsharded reference over three
+AdamW steps, checking losses, gradients, parameters, and both optimizer
+moments. Validation used four NVIDIA B200 GPUs, Python 3.10.18,
+PyTorch 2.14.0+cu130, CUDA 13.0, and NCCL 2.30.7.
+
+Rank-0 losses were `3.9559`, `3.6024`, and `3.7062`. Maximum absolute differences
+were `2.39e-7` for losses, `1.50e-8` for gradients, `4.26e-7` for parameters,
+`1.87e-9` for first moments, and `3.64e-12` for second moments.
+
+## Full model tracing with visible collectives
+
+[SimpleFSDP](https://github.com/pytorch/torchtitan/blob/610bb6f6b99d16f2314f9ddf520ab3cd2423ebc0/torchtitan/experiments/graph_trainer/simple_fsdp.py)
+expresses parameter reconstruction through traceable DTensor operations.
+FlexShard exposes this capability through its explicit buckets: the model's
+forward graph contains per-bucket autograd operations whose forward and
+backward subgraphs contain functional collectives.
+
+The tracing path uses the same model and mesh assignment with
+`reshard_after_forward=False`: FlexShard's saved-tensor hooks for resharding
+currently require eager execution. Following the unit test, configure a fresh
+model for tracing, then capture it:
+
+```python
+from dataclasses import replace
+
+from examples.tiny_moe_transformer import TinyMoETransformer
+
+model = TinyMoETransformer().to(device).train()
+trace_buckets = [
+    replace(spec, reshard_after_forward=False) for spec in buckets
+]
+flex_shard(model, buckets=trace_buckets)
+optimizer = torch.optim.AdamW(
+    model.parameters(), lr=1e-3, eps=1e-6, weight_decay=0.01, foreach=False,
+)
+
+graphs = []
+
+def capture_backend(graph_module, example_inputs):
+    graphs.append(graph_module)
+    return graph_module.forward
+
+run_model = torch.compile(model, backend=capture_backend, fullgraph=True)
+optimizer.zero_grad(set_to_none=True)
+logits = run_model(tokens[:, :-1])
+loss = torch.nn.functional.cross_entropy(
+    logits.flatten(0, 1), tokens[:, 1:].flatten(),
+)
+loss.backward()
+optimizer.step()
+
+assert len(graphs) == 1
+targets = {
+    str(node.target)
+    for submodule in graphs[0].modules()
+    if isinstance(submodule, torch.fx.GraphModule)
+    for node in submodule.graph.nodes
+}
+assert "_c10d_functional.all_gather_into_tensor" in targets
+assert "_c10d_functional.reduce_scatter_tensor" in targets
+assert "_c10d_functional.wait_tensor" in targets
+```
+
+`fullgraph=True` requires the entire model forward to capture without graph
+breaks. Inspect the nested forward/backward graphs as well as the root:
+looking only at root-level nodes misses the collectives. The capture backend
+executes the graph directly; loss calculation and AdamW remain outside the
+captured model. This is a model-tracing example, not a single flat graph of the
+entire training loop.
+
+Run and inspect the same `TinyMoETransformer`:
+
+```bash
+torchrun --standalone --nproc-per-node=4 examples/train_adamw.py \
+    --trace --graph-dir /tmp/flex_shard_moe_trace
+```
+
+The run performs three AdamW steps, checks that exactly one Dynamo graph was
+captured, verifies the per-bucket collectives, and writes the graph code and
+`summary.json` under `rank0/`, `rank1/`, and so on.
+
+Each rank's captured graphs contain one Dynamo graph, eight bucket autograd
+operations, eight all-gathers, eight reduce-scatters, and sixteen waits.
+
+These are graph-node counts, not profiler measurements. The MoE trace includes
+communication over both the four-rank `dp` and two-rank `efsdp` meshes.
+
+This demonstrates the shared ability to expose communication to graph
+inspection and transformations. It does not establish equal throughput,
+memory use, or equivalence to GraphTrainer's scheduling and optimization passes.
+
+## Parameter retention and checkpoints
+
+`BucketSpec` defaults to `gradient_reduce_op=dist.ReduceOp.AVG`, so the examples
+omit that argument. Its `reshard_after_forward` default is `True`, which the
+eager AdamW example uses. FlexShard's saved-tensor hooks replay parameter
+unshards as needed in backward. That does not itself recompute the whole
+Transformer block; existing activation checkpointing can compose with that
+policy.
+
+Setting `reshard_after_forward=False` keeps gathered parameters available
+through backward, trading memory for fewer all-gathers. The tracing example
+uses this setting because the resharding hooks currently require eager
+execution.
+
+A regular FlexShard `state_dict()` contains rank-local shards. It is not a
+gathered model checkpoint. Existing FSDP2 checkpoint code needs an explicit
+compatibility check or conversion, even when the parameter split agrees.
 
 ## Limitations
 
-- The API is experimental and may change. It uses private PyTorch APIs, so the
-  declared PyTorch version range matters.
-- Training currently requires a one-dimensional CUDA device mesh. CPU offload
-  is not supported.
-- Every parameter must match exactly one bucket. The example's dimension-0
-  sharding placement does not support scalar parameters.
-- A regular `state_dict()` contains rank-local shards. Do not treat it as a
-  complete, gathered model checkpoint.
+- The API is experimental and uses private PyTorch APIs; the declared version
+  range matters.
+- Each bucket requires a one-dimensional CUDA mesh. Different buckets may use
+  different submeshes, as in the MoE example. CPU offload is not supported.
+- Every parameter must match exactly one bucket. The examples' `Shard(0)`
+  placement does not support scalar parameters.
+- Numerical and graph comparisons here concern the small examples and the
+  stated configuration; they are not general FSDP2 or SimpleFSDP benchmarks.
 
 ## Development and testing
-
-From the repository root:
 
 ```bash
 python -m pip install -e '.[test]'
 python -m pytest
 ```
 
-GPU tests skip when the required hardware is unavailable; a run with skipped
-GPU tests does not validate distributed training. Use a host with at least four
-GPUs for the full suite.
+Use at least four GPUs for the full suite. Tests skip when required hardware
+is unavailable; CPU-only checks do not validate distributed training.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development and pull-request
-workflow and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
 
 ## License
 
-FlexShard is BSD-3-Clause licensed, as found in the [LICENSE](LICENSE) file.
+FlexShard is BSD-3-Clause licensed; see [LICENSE](LICENSE).
