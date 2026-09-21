@@ -235,6 +235,78 @@ This demonstrates the shared ability to expose communication to graph
 inspection and transformations. It does not establish equal throughput,
 memory use, or equivalence to GraphTrainer's scheduling and optimization passes.
 
+## Communication-free Muon with BlockShard + Owned
+
+The AdamW example establishes per-parameter sharding and tracing. The next
+step is to choose storage around an optimizer's computation. Muon operates
+on matrices, so assigning complete logical matrices to ranks lets each rank
+compute its Muon updates locally after gradient reduction.
+
+[`examples/train_muon.py`](examples/train_muon.py) is a separate dense-model
+example using FlexShard's native `DistMuon` plus AdamW:
+
+| Parameters | Storage | Optimizer |
+| --- | --- | --- |
+| Each fused attention Q/K/V weight | `BlockShard(blocks_per_rank=(2, 1), dim=0)` | DistMuon on separate Q, K, and V matrices |
+| Attention output and feed-forward weight matrices | Whole-matrix Owned | DistMuon on the owner |
+| Token/position embeddings and output weight | `BlockShard(blocks_per_rank=(1, 1), dim=0)` | AdamW on balanced row shards |
+| Biases and normalization parameters | Whole-parameter Owned | AdamW on the owner |
+
+For a fused `[3 * d_model, d_model]` Q/K/V weight, rank 0 owns the complete
+Q and K matrices and rank 1 owns V. Updating these three matrices separately
+defines this Muon recipe. It differs from orthogonalizing the fused tensor as
+one matrix. Owned assignments use the same deterministic balancing helper as
+the placement tests; each bucket combines its layouts with
+`MixedBucketPlacement`.
+
+Optimizer roles are selected by parameter name before sharding. After
+`flex_shard`, construct `DistMuon` with the actual replacement parameters:
+
+```python
+from flex_shard.dist_muon import DistMuon
+
+# muon_names records the selected names before sharding.
+# The full script supplies the BlockShard + Owned bucket configuration.
+muon = DistMuon(
+    [p for name, p in model.named_parameters() if name in muon_names],
+    lr=0.01, weight_decay=0.01, momentum=0.95, nesterov=True,
+    ns_coefficients=(3.4445, -4.7750, 2.0315), ns_steps=5, eps=1e-7,
+    adjust_lr_fn="original",
+)
+```
+
+Parameters, gradients, and momentum are ordinary local tensors. FlexShard
+records the matrix layout and canonical checkpoint coordinates automatically;
+no DTensor adapter, manual capture call, or optimizer process group is needed.
+Empty owners still construct a valid no-op optimizer and create no momentum
+for empty shards. Native DistMuon rejects partial-matrix placements requiring
+redistribution.
+
+Run the complete two-optimizer example:
+
+```bash
+torchrun --standalone --nproc-per-node=2 examples/train_muon.py
+```
+
+Here, **communication-free refers to the Muon optimizer step**. Forward still
+gathers parameters and backward still reduces gradients. DistMuon computes
+Newton–Schulz iterations in BF16 and keeps momentum in the parameter's storage
+shape. AdamW uses the same settings as the preceding examples.
+
+The three-step example was validated on Python 3.10.18, PyTorch 2.14.0+cu130,
+and two B200 GPUs without TorchTitan or tyro installed. Rank-0 losses were
+`3.5078`, `3.5276`, and `3.3849`. Losses, gradients, parameters, Muon momentum,
+and AdamW moments matched an unsharded reference with separate Q/K/V updates
+exactly. A steady-state CPU/CUDA profile recorded zero Muon communication
+events; forward/backward recorded six all-gathers and six reduce-scatters
+per rank.
+
+DistMuon is maintained within FlexShard; see its
+[source provenance](src/flex_shard/dist_muon/UPSTREAM.md). Tests cover native
+checkpoint resume, migration from legacy adapter checkpoints, empty owners,
+and execution with DTensor and optimizer process-group creation disabled.
+
+
 ## Parameter retention and checkpoints
 
 `BucketSpec` defaults to `gradient_reduce_op=dist.ReduceOp.AVG`, so the examples
