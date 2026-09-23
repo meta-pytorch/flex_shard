@@ -669,7 +669,9 @@ class BucketRuntime:
             param_owner = bucket_param.param_owner
             unsharded_param_slot = bucket_param.unsharded_param_slot
             param = param_owner.module._parameters[param_owner.param_name]
-            local_shard = param if use_autograd else param.data
+            # detach() shares the parameter version counter, which versioned
+            # placement caches need for optimizer-update invalidation.
+            local_shard = param if use_autograd else param.detach()
             if (
                 unsharded_param_slot.compute_device is not None
                 and local_shard.device != unsharded_param_slot.compute_device
