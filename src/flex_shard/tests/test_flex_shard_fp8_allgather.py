@@ -10,10 +10,13 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.testing._internal.common_fsdp import get_devtype
+from torch.distributed.device_mesh import init_device_mesh
+from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
+from torch.testing._internal.common_fsdp import FSDPTest, get_devtype
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torchao.utils import is_sm_at_least_90
 
+from .. import BucketSpec, flex_shard
 from ..custom_placements import (
     fp8_bucketed_block_shard as fp8_bucketed_block_shard_module,
 )
@@ -21,6 +24,7 @@ from ..custom_placements.fp8_bucketed_block_shard import (
     _VEC_ALIGN_BYTES,
     Fp8BucketedBlockShard,
 )
+from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..flex_shard.bucket_storage import ParamInfo
 
 
@@ -730,6 +734,116 @@ class TestFp8BlockwiseWeightQuantization(TestCase):
                     )
                 )
                 self.assertTrue(torch.equal(result_scale, reference_scale))
+
+
+class TestFp8AllGather(FSDPTest):
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    def _mesh(self):
+        return init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+
+    def _skip_unless_blockwise_fp8_supported(self) -> None:
+        if not is_sm_at_least_90():
+            self.skipTest("Blockwise FP8 kernels require CUDA SM90+")
+
+    @skip_if_lt_x_gpu(2)
+    def test_mixed_fp8_bucket_uses_one_collective_and_matches_reference(self) -> None:
+        self._skip_unless_blockwise_fp8_supported()
+        block = 4
+        mesh = self._mesh()
+
+        class MixedFp8Module(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.norm = nn.Parameter(torch.randn(8))
+                self.weight = nn.Parameter(torch.randn(16, 8))
+
+        torch.manual_seed(0)
+        model = MixedFp8Module().to(device=device_type, dtype=torch.bfloat16)
+        originals = {
+            fqn: param.detach().clone() for fqn, param in model.named_parameters()
+        }
+        weight_factory = _RecordingWeightFactory()
+        raw_placement = Fp8BucketedBlockShard(
+            world_size=self.world_size,
+            weight_factory=weight_factory,
+            block_size=block,
+        )
+        mixed = MixedBucketPlacement({})
+        weight_placement = mixed.fp8_bucketed_block_shard(raw_placement)
+        placements = {
+            "norm": (mixed.shard0,),
+            "weight": (weight_placement,),
+        }
+        flex_shard(
+            model,
+            buckets=[
+                BucketSpec(
+                    ["*"],
+                    placement_fn=lambda named_params, mesh: placements,
+                    mesh=mesh,
+                    reshard_after_forward=False,
+                )
+            ],
+        )
+        storage = model.sharded_bucket_storages[0]
+        infos = [storage.param_infos[fqn] for fqn in placements]
+        local_params = [storage.get_local_view(info.fqn) for info in infos]
+
+        prepared = mixed.prepare_unshard_bucket(
+            local_params,
+            infos,
+            mesh,
+            None,
+        )
+        self.assertEqual(prepared.buffers[0].dtype, torch.uint8)
+        with patch.object(
+            dist,
+            "all_gather_into_tensor",
+            wraps=dist.all_gather_into_tensor,
+        ) as all_gather:
+            mixed.run_prepared_unshard(prepared)
+        self.assertEqual(all_gather.call_count, 1)
+
+        norm, weight = mixed.finish_prepared_unshard(prepared).full_params
+        self.assertEqual(norm, originals["norm"])
+        (factory_call,) = weight_factory.calls
+        self.assertIs(weight, factory_call.fp8_data)
+        self.assertEqual(factory_call.orig_dtype, torch.bfloat16)
+        self.assertTrue(factory_call.requires_grad)
+        reference_fp8, reference_scale = _reference_blockwise_quant_weight(
+            originals["weight"],
+            block,
+        )
+        self.assertTrue(
+            torch.equal(
+                factory_call.fp8_data.view(torch.uint8),
+                reference_fp8.view(torch.uint8),
+            )
+        )
+        self.assertTrue(torch.equal(factory_call.recip_scale, reference_scale))
+
+        prepared_reduce = mixed.prepare_reduce_grad(
+            [originals[info.fqn] for info in infos],
+            infos,
+            mesh,
+            None,
+        )
+        with patch.object(
+            dist,
+            "reduce_scatter_tensor",
+            wraps=dist.reduce_scatter_tensor,
+        ) as reduce_scatter:
+            reduced = mixed.reduce_prepared_grad(prepared_reduce)
+        self.assertEqual(reduce_scatter.call_count, 1)
+        for grad, info in zip(reduced.sharded_grads, infos, strict=True):
+            self.assertEqual(grad, storage.get_local_view(info.fqn))
 
 
 if __name__ == "__main__":

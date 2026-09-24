@@ -29,6 +29,7 @@ from ..flex_shard.utils import (
     _record_function_if_eager,
 )
 from .block_shard import BlockShard
+from .fp8_bucketed_block_shard import _align_up, _VEC_ALIGN_BYTES, Fp8BucketedBlockShard
 from .owned import BucketedOwned
 from .shard import Shard
 
@@ -47,9 +48,25 @@ class _PlacementGroup:
 
 
 @dataclass(frozen=True)
+class _MixedUnshardGroupLayout:
+    offset: int
+    numel: int
+    owner_rank: int | None
+
+
+@dataclass(frozen=True)
+class _MixedUnshardLayout:
+    groups: tuple[_MixedUnshardGroupLayout, ...]
+    dtype: torch.dtype
+    requires_dtype_reinterpretation: bool
+    row_numel: int
+    padding_ranges: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
 class _MixedUnshardGroupState:
     prepared: PlacementPreparedUnshard
-    indices: list[int]
+    indices: tuple[int, ...]
     offset: int
     numel: int
 
@@ -59,6 +76,7 @@ class _MixedUnshardState:
     groups: list[_MixedUnshardGroupState]
     world_size: int
     row_numel: int
+    requires_dtype_reinterpretation: bool
     pg: Any
     debug_fqn: str | None
 
@@ -204,8 +222,33 @@ class _MixedBucketedOwned(_MixedBucketMember, BucketedOwned):
         self._collective_placement = mixed_bucket._bucketed_owned
 
 
+class _MixedFp8BucketedBlockShard(
+    _MixedBucketMember,
+    Fp8BucketedBlockShard,
+):
+    """Optimizer-visible blockwise FP8 member of one mixed bucket placement."""
+
+    __eq__ = _MixedBucketMember.__eq__
+    __hash__ = _MixedBucketMember.__hash__
+
+    def __init__(
+        self,
+        mixed_bucket: MixedBucketPlacement,
+        placement: Fp8BucketedBlockShard,
+    ) -> None:
+        Fp8BucketedBlockShard.__init__(
+            self,
+            world_size=placement.world_size,
+            weight_factory=placement.weight_factory,
+            block_size=placement.block_size,
+            fp8_dtype=placement.fp8_dtype,
+        )
+        self._mixed_bucket = mixed_bucket
+        self._collective_placement = placement
+
+
 class MixedBucketPlacement(Placement):
-    """One bucket collective for Shard, BlockShard, and BucketedOwned groups."""
+    """One collective for the built-in mixed-bucket placement groups."""
 
     def __init__(self, segments_by_fqn: dict[str, list[Any]]) -> None:
         self._shard = Shard(0)
@@ -221,6 +264,7 @@ class MixedBucketPlacement(Placement):
         self._block_shard_members_by_config: dict[
             tuple[int, tuple[int, ...]], _MixedBlockShard
         ] = {}
+        self._fp8_bucketed_block_member: _MixedFp8BucketedBlockShard | None = None
 
     def block_shard(
         self,
@@ -233,6 +277,20 @@ class MixedBucketPlacement(Placement):
         if member is None:
             member = _MixedBlockShard(self, blocks_per_rank, dim)
             self._block_shard_members_by_config[key] = member
+        return member
+
+    def fp8_bucketed_block_shard(
+        self,
+        placement: Fp8BucketedBlockShard,
+    ) -> Fp8BucketedBlockShard:
+        member = self._fp8_bucketed_block_member
+        if member is None:
+            member = _MixedFp8BucketedBlockShard(self, placement)
+            self._fp8_bucketed_block_member = member
+        elif member._collective_placement is not placement:
+            raise NotImplementedError(
+                "A mixed bucket supports one FP8 bucketed block placement instance."
+            )
         return member
 
     def __eq__(self, other: object) -> bool:
@@ -345,13 +403,15 @@ class MixedBucketPlacement(Placement):
         world_size = mesh.size()
         groups = _group_tensors_by_placement(tensors, infos, world_size)
         _validate_mixed_groups(groups)
-        prepared_groups: list[tuple[PlacementPreparedUnshard, list[int]]] = []
+
+        prepared_groups: list[tuple[PlacementPreparedUnshard, tuple[int, ...]]] = []
         group_buffers: list[torch.Tensor] = []
         device: torch.device | None = None
 
         with _record_copy_in_if_eager():
             for group in groups:
-                prepared = group.placement.prepare_unshard_bucket(
+                prepared = _prepare_mixed_unshard_group(
+                    group.placement,
                     group.tensors,
                     group.infos,
                     mesh,
@@ -365,65 +425,46 @@ class MixedBucketPlacement(Placement):
                         "Mixed FlexShard unshard requires one device per bucket, "
                         f"but got {device} and {send.device}."
                     )
-                prepared_groups.append((prepared, group.indices))
+                prepared_groups.append((prepared, tuple(group.indices)))
                 group_buffers.extend(prepared.buffers)
 
             if device is None:
                 raise AssertionError("Expected at least one mixed bucket group.")
-            dtypes = {
-                group_prepared.buffers[0].dtype for group_prepared, _ in prepared_groups
-            }
-            uses_byte_transport = len(dtypes) > 1
-            dtype = torch.uint8 if uses_byte_transport else next(iter(dtypes))
-            group_numels = [
-                (
-                    group_prepared.buffers[0].numel()
-                    * group_prepared.buffers[0].element_size()
-                    if uses_byte_transport
-                    else group_prepared.buffers[0].numel()
-                )
-                for group_prepared, _ in prepared_groups
-            ]
-            offsets, owner_ranks, row_numel, max_exclusive_payload_numel = (
-                _plan_group_offsets(
-                    [group_prepared.placement for group_prepared, _ in prepared_groups],
-                    group_numels,
-                    world_size,
-                )
-            )
+            layout = _build_mixed_unshard_layout(prepared_groups, world_size)
             group_states = [
                 _MixedUnshardGroupState(
                     prepared=group_prepared,
                     indices=indices,
-                    offset=offset,
-                    numel=numel,
+                    offset=group_layout.offset,
+                    numel=group_layout.numel,
                 )
-                for (group_prepared, indices), offset, numel in zip(
+                for (group_prepared, indices), group_layout in zip(
                     prepared_groups,
-                    offsets,
-                    group_numels,
+                    layout.groups,
                     strict=True,
                 )
             ]
-            send = torch.empty(row_numel, dtype=dtype, device=device)
-            if max_exclusive_payload_numel:
-                send.narrow(0, 0, max_exclusive_payload_numel).zero_()
-            for group_state, owner_rank in zip(
+            send = torch.empty(layout.row_numel, dtype=layout.dtype, device=device)
+            _zero_padding(send, layout.padding_ranges)
+            for group_state, group_layout in zip(
                 group_states,
-                owner_ranks,
+                layout.groups,
                 strict=True,
             ):
-                if owner_rank is not None and owner_rank != rank:
+                if (
+                    group_layout.owner_rank is not None
+                    and group_layout.owner_rank != rank
+                ):
                     continue
                 group_send = group_state.prepared.buffers[0]
                 send.narrow(0, group_state.offset, group_state.numel).copy_(
                     group_send.contiguous().view(torch.uint8).reshape(-1)
-                    if uses_byte_transport
+                    if layout.requires_dtype_reinterpretation
                     else group_send
                 )
             gathered = torch.empty(
-                world_size * row_numel,
-                dtype=dtype,
+                world_size * layout.row_numel,
+                dtype=layout.dtype,
                 device=device,
             )
 
@@ -433,7 +474,10 @@ class MixedBucketPlacement(Placement):
             placement_state=_MixedUnshardState(
                 groups=group_states,
                 world_size=world_size,
-                row_numel=row_numel,
+                row_numel=layout.row_numel,
+                requires_dtype_reinterpretation=(
+                    layout.requires_dtype_reinterpretation
+                ),
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
             ),
@@ -469,10 +513,6 @@ class MixedBucketPlacement(Placement):
             state.world_size,
             state.row_numel,
         )
-        uses_byte_transport = any(
-            group.prepared.buffers[0].dtype != prepared.buffers[0].dtype
-            for group in state.groups
-        )
         full_params: list[torch.Tensor | None] = [None] * sum(
             len(group.indices) for group in state.groups
         )
@@ -483,26 +523,32 @@ class MixedBucketPlacement(Placement):
                 group_gathered_by_rank = gathered_by_rank[
                     :, group.offset : group.offset + group.numel
                 ]
-                if uses_byte_transport:
-                    gathered = group.prepared.buffers[1]
-                    gathered.view(torch.uint8).view_as(group_gathered_by_rank).copy_(
-                        group_gathered_by_rank
+                placement = group.prepared.placement
+                if isinstance(placement, Fp8BucketedBlockShard):
+                    gathered = group_gathered_by_rank
+                    result = placement._finish_unshard_from_rank_rows(
+                        group.prepared,
+                        gathered,
                     )
                 else:
-                    gathered = group_gathered_by_rank.contiguous().view(-1)
-                group_prepared = PlacementPreparedUnshard(
-                    placement=group.prepared.placement,
-                    buffers=[
-                        group.prepared.buffers[0],
-                        gathered,
-                        *group.prepared.buffers[2:],
-                    ],
-                    placement_state=group.prepared.placement_state,
-                )
+                    if state.requires_dtype_reinterpretation:
+                        gathered = group.prepared.buffers[1]
+                        gathered.view(torch.uint8).view_as(
+                            group_gathered_by_rank
+                        ).copy_(group_gathered_by_rank)
+                    else:
+                        gathered = group_gathered_by_rank.contiguous().view(-1)
+                    group_prepared = PlacementPreparedUnshard(
+                        placement=placement,
+                        buffers=[
+                            group.prepared.buffers[0],
+                            gathered,
+                            *group.prepared.buffers[2:],
+                        ],
+                        placement_state=group.prepared.placement_state,
+                    )
+                    result = placement.finish_prepared_unshard(group_prepared)
                 finish_buffers.append(gathered)
-                result = group.prepared.placement.finish_prepared_unshard(
-                    group_prepared
-                )
                 for index, full_param in zip(
                     group.indices,
                     result.full_params,
@@ -572,12 +618,15 @@ class MixedBucketPlacement(Placement):
 
             if dtype is None or device is None:
                 raise AssertionError("Expected at least one mixed bucket group.")
-            offsets, owner_ranks, row_numel, max_exclusive_payload_numel = (
-                _plan_group_offsets(
-                    [prepared.placement for prepared, _, _ in prepared_groups],
-                    [numel for _, _, numel in prepared_groups],
-                    world_size,
-                )
+            (
+                offsets,
+                owner_ranks,
+                row_numel,
+                max_exclusive_payload_numel,
+            ) = _plan_group_offsets(
+                [prepared.placement for prepared, _, _ in prepared_groups],
+                [numel for _, _, numel in prepared_groups],
+                world_size,
             )
             group_states = [
                 _MixedReduceGradGroupState(
@@ -688,6 +737,110 @@ class MixedBucketPlacement(Placement):
         return PlacementReduceGradResult(ordered_sharded_grads, [recv])
 
 
+def _prepare_mixed_unshard_group(
+    placement: Placement,
+    tensors: list[torch.Tensor],
+    infos: list[ParamInfo],
+    mesh: DeviceMesh,
+    debug_fqn: str | None,
+) -> PlacementPreparedUnshard:
+    if isinstance(placement, Fp8BucketedBlockShard):
+        return placement._prepare_local_unshard_payload(
+            tensors,
+            infos,
+            mesh,
+            debug_fqn,
+        )
+    return placement.prepare_unshard_bucket(
+        tensors,
+        infos,
+        mesh,
+        debug_fqn,
+    )
+
+
+def _zero_padding(
+    tensor: torch.Tensor,
+    ranges: tuple[tuple[int, int], ...],
+) -> None:
+    slices = [tensor.narrow(0, offset, numel) for offset, numel in ranges]
+    if torch.compiler.is_compiling():
+        for slice_ in slices:
+            slice_.zero_()
+    elif slices:
+        torch._foreach_zero_(slices)
+
+
+def _build_mixed_unshard_layout(
+    prepared_groups: list[tuple[PlacementPreparedUnshard, tuple[int, ...]]],
+    world_size: int,
+) -> _MixedUnshardLayout:
+    dtypes = {group_prepared.buffers[0].dtype for group_prepared, _ in prepared_groups}
+    requires_dtype_reinterpretation = len(dtypes) > 1
+    dtype = torch.uint8 if requires_dtype_reinterpretation else next(iter(dtypes))
+    group_numels = [
+        (
+            group_prepared.buffers[0].numel() * group_prepared.buffers[0].element_size()
+            if requires_dtype_reinterpretation
+            else group_prepared.buffers[0].numel()
+        )
+        for group_prepared, _ in prepared_groups
+    ]
+    group_placements = [prepared.placement for prepared, _ in prepared_groups]
+    fp8_transport_groups = [
+        isinstance(prepared.placement, Fp8BucketedBlockShard)
+        and prepared.buffers[0].dtype == torch.uint8
+        for prepared, _ in prepared_groups
+    ]
+    align_fp8_transport = any(fp8_transport_groups)
+    group_alignments = [
+        _VEC_ALIGN_BYTES if is_fp8_transport else 1
+        for is_fp8_transport in fp8_transport_groups
+    ]
+    row_alignment = _VEC_ALIGN_BYTES if align_fp8_transport else 1
+    offsets, owner_ranks, row_numel, max_exclusive_payload_numel = _plan_group_offsets(
+        group_placements,
+        group_numels,
+        world_size,
+        group_alignments=group_alignments,
+        row_alignment=row_alignment,
+    )
+    groups = tuple(
+        _MixedUnshardGroupLayout(
+            offset=offset,
+            numel=numel,
+            owner_rank=owner_rank,
+        )
+        for offset, numel, owner_rank in zip(
+            offsets,
+            group_numels,
+            owner_ranks,
+            strict=True,
+        )
+    )
+    padding_ranges: list[tuple[int, int]] = []
+    if max_exclusive_payload_numel:
+        padding_ranges.append((0, max_exclusive_payload_numel))
+    next_padding_start = max_exclusive_payload_numel
+    for group in groups:
+        if group.owner_rank is not None:
+            continue
+        if next_padding_start < group.offset:
+            padding_ranges.append(
+                (next_padding_start, group.offset - next_padding_start)
+            )
+        next_padding_start = group.offset + group.numel
+    if next_padding_start < row_numel:
+        padding_ranges.append((next_padding_start, row_numel - next_padding_start))
+    return _MixedUnshardLayout(
+        groups=groups,
+        dtype=dtype,
+        requires_dtype_reinterpretation=requires_dtype_reinterpretation,
+        row_numel=row_numel,
+        padding_ranges=tuple(padding_ranges),
+    )
+
+
 def _group_tensors_by_placement(
     tensors: list[torch.Tensor],
     infos: list[ParamInfo],
@@ -770,35 +923,56 @@ def _plan_group_offsets(
     placements: list[Placement],
     group_numels: list[int],
     world_size: int,
+    *,
+    group_alignments: list[int] | None = None,
+    row_alignment: int = 1,
 ) -> tuple[list[int], list[int | None], int, int]:
+    if group_alignments is None:
+        group_alignments = [1] * len(placements)
+    if len(group_alignments) != len(placements):
+        raise AssertionError(
+            "Expected one mixed-bucket alignment per placement, got "
+            f"{len(group_alignments)} for {len(placements)} placements."
+        )
     owner_numels = [0] * world_size
     offsets = []
     owner_ranks = []
     regular_numel = 0
-    for placement, group_numel in zip(
+    regular_alignment = 1
+    for placement, group_numel, alignment in zip(
         placements,
         group_numels,
+        group_alignments,
         strict=True,
     ):
         owner_rank = _one_hot_block_owner(placement, world_size)
         owner_ranks.append(owner_rank)
         if owner_rank is None:
+            regular_numel = _align_up(regular_numel, alignment)
             offsets.append(regular_numel)
             regular_numel += group_numel
+            regular_alignment = max(regular_alignment, alignment)
         else:
+            owner_numels[owner_rank] = _align_up(
+                owner_numels[owner_rank],
+                alignment,
+            )
             offsets.append(owner_numels[owner_rank])
             owner_numels[owner_rank] += group_numel
 
-    max_exclusive_payload_numel = max(owner_numels, default=0)
+    regular_base = _align_up(
+        max(owner_numels, default=0),
+        regular_alignment,
+    )
     offsets = [
-        offset + max_exclusive_payload_numel if owner_rank is None else offset
+        offset + regular_base if owner_rank is None else offset
         for offset, owner_rank in zip(offsets, owner_ranks, strict=True)
     ]
     return (
         offsets,
         owner_ranks,
-        max_exclusive_payload_numel + regular_numel,
-        max_exclusive_payload_numel,
+        _align_up(regular_base + regular_numel, row_alignment),
+        regular_base,
     )
 
 
@@ -811,10 +985,11 @@ def _validate_mixed_groups(groups: list[_PlacementGroup]) -> None:
             isinstance(placement, BlockShard)
             or isinstance(placement, Shard)
             and placement.dim == 0
+            or isinstance(placement, Fp8BucketedBlockShard)
         ):
             raise ValueError(
                 "Mixed FlexShard bucket collectives currently support only "
-                "Shard(0) and BlockShard subgroups."
+                "Shard(0), BlockShard, and Fp8BucketedBlockShard subgroups."
             )
 
 
@@ -840,7 +1015,20 @@ def _finish_mixed_reduce_group(
         )
     if isinstance(placement, BlockShard):
         return placement._unpack_reduce_scatter_grad(recv, state)
+    if isinstance(placement, Fp8BucketedBlockShard):
+        bucket_layout = placement._bucket_layout(state.infos[0])
+        rank_offset = bucket_layout.rank_offsets[state.rank]
+        return [
+            recv[
+                placement._param_layout(info).local_global_offset
+                - rank_offset : placement._param_layout(info).local_global_offset
+                - rank_offset
+                + info.local_numel
+            ].view(info.local_shape)
+            for info in state.infos
+        ]
     raise TypeError(
-        "Mixed FlexShard reduce-grad supports only Shard(0) and BlockShard, "
+        "Mixed FlexShard reduce-grad supports only Shard(0), BlockShard, "
+        "and Fp8BucketedBlockShard, "
         f"but got {type(placement).__name__}."
     )
