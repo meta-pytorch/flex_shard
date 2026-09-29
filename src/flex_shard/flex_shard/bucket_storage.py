@@ -16,13 +16,19 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch._prims_common import make_contiguous_strides_for
 
+from .placement_contract import get_global_layout
 from .sharded_param import set_sharding_info
 from .utils import _get_single_placement, _set_param_on_module
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
-    from .placement_contract import BucketStorageLayout, LocalStorageLayout, Placement
+    from .placement_contract import (
+        BucketStorageLayout,
+        GlobalLayout,
+        LocalStorageLayout,
+        Placement,
+    )
     from .reshard_after_forward import _ReshardAfterForwardRecomputeState
 
 
@@ -166,6 +172,9 @@ class ParamInfo:
     storage_nbytes: int = 0  # bytes reserved for this param's local storage
     global_numel: int = 0  # total elements in unsharded param
     bucket_layout: BucketLayout | None = None
+    # Outer (TP/EP) layout declared by the input param; ``global_shape`` is then
+    # the outer local shape.
+    outer_layout: GlobalLayout | None = None
 
     @property
     def placement(self) -> Placement:
@@ -490,6 +499,7 @@ class ShardedBucketStorage:
             storage_nbytes=storage_nbytes,
             global_numel=param.numel(),
             bucket_layout=bucket_layout,
+            outer_layout=get_global_layout(param),
         )
 
     def copy_params_from(

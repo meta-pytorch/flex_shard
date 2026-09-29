@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
 import torch
+from torch.distributed.checkpoint import CheckpointableTensor
 
 if TYPE_CHECKING:
     import torch.nn as nn
@@ -46,6 +47,44 @@ class BucketStorageLayout:
 
     param_layouts: dict[str, BucketParamStorageLayout]
     total_bytes: int
+
+
+@dataclass(frozen=True)
+class GlobalLayout:
+    """Regions of the full parameter held by one rank's local tensor.
+
+    Fields match DCP's ``CheckpointableTensor`` protocol.
+    """
+
+    global_shape: tuple[int, ...]
+    global_offsets: tuple[tuple[int, ...], ...]
+    local_offsets: tuple[tuple[int, ...], ...]
+    local_sizes: tuple[tuple[int, ...], ...]
+
+
+def get_global_layout(tensor: torch.Tensor) -> GlobalLayout | None:
+    """Return the layout ``tensor`` declares, or ``None`` if it declares none."""
+    if not isinstance(tensor, CheckpointableTensor):
+        return None
+    return GlobalLayout(
+        global_shape=tuple(tensor.global_shape),
+        global_offsets=tuple(map(tuple, tensor.global_offsets)),
+        local_offsets=tuple(map(tuple, tensor.local_offsets)),
+        local_sizes=tuple(map(tuple, tensor.local_sizes)),
+    )
+
+
+def set_global_layout(tensor: torch.Tensor, layout: GlobalLayout) -> None:
+    """Declare where ``tensor`` sits in the full parameter.
+
+    Sets the fields of DCP's ``CheckpointableTensor`` protocol. Parameters
+    passed to ``flex_shard()`` that are local shards of an outer (e.g. TP/EP)
+    sharding must declare their layout this way.
+    """
+    tensor.global_shape = layout.global_shape
+    tensor.global_offsets = layout.global_offsets
+    tensor.local_offsets = layout.local_offsets
+    tensor.local_sizes = layout.local_sizes
 
 
 class Placement(ABC):
@@ -269,10 +308,13 @@ class PlacementReduceGradResult:
 __all__ = [
     "BucketParamStorageLayout",
     "BucketStorageLayout",
+    "get_global_layout",
+    "GlobalLayout",
     "LocalStorageLayout",
     "Placement",
     "PlacementPreparedUnshard",
     "PlacementPreparedReduceGrad",
     "PlacementReduceGradResult",
     "PlacementUnshardResult",
+    "set_global_layout",
 ]

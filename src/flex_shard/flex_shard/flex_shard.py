@@ -11,7 +11,6 @@ from typing import cast, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import DTensor
 
 from .bucket_runtime import (
     _create_unsharded_param_slots,
@@ -32,7 +31,6 @@ from .unsharded_param_getters import _install_unsharded_param_getters
 from .utils import (
     _get_device_from_mesh,
     _get_managed_named_params,
-    _set_param_on_module,
     _validate_bucket_uniform_dtype_and_placement,
     _validate_eager_params,
     _validate_flex_shard_mesh,
@@ -195,6 +193,11 @@ def flex_shard(
             When ``reshard_after_forward=True``, FlexShard raises if bucket
             hooks cannot run in both the original forward and activation
             checkpoint recomputation.
+
+    Parameters must be plain tensors. Parameters that are local shards of an
+    outer (e.g. TP/EP) sharding declare their position in the full parameter
+    with ``set_global_layout``; ``flex_shard.layout_adapters.dtensor_to_global_layout``
+    does this for DTensor parameters.
 
     Returns:
         The module (mutated in-place). Use
@@ -384,7 +387,6 @@ def _prepare_flex_shard_inputs(
 ) -> PreparedFlexShardInputs:
     """Validate inputs and derive setup state for flex_shard()."""
     _check_not_already_flex_sharded(module)
-    _unwrap_dtensor_params_to_local(module)
 
     if not buckets:
         raise ValueError("flex_shard requires at least one BucketSpec in buckets.")
@@ -452,19 +454,3 @@ def _prepare_flex_shard_inputs(
         param_placements=param_placements,
         bucket_assignments=bucket_assignments,
     )
-
-
-def _unwrap_dtensor_params_to_local(module: nn.Module) -> None:
-    """Replace DTensor parameters with their local shards before bucket sharding.
-
-    FlexShard owns the data-parallel bucket dimension. When a model has already
-    applied expert parallelism, those DTensor parameters represent an outer EP
-    shard; FlexShard should bucket-shard the local EP payload, not the global
-    pre-EP tensor.
-    """
-    for fqn, param in list(module.named_parameters(remove_duplicate=False)):
-        if not isinstance(param, DTensor):
-            continue
-        local_tensor = param.to_local().detach().contiguous()
-        local_param = nn.Parameter(local_tensor, requires_grad=param.requires_grad)
-        _set_param_on_module(module, fqn, local_param)

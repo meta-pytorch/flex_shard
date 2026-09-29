@@ -269,7 +269,8 @@ def _validate_eager_params(
         if DTensor is not None and isinstance(param, DTensor):
             raise ValueError(
                 "FlexShard eager mode expects plain parameters; "
-                f"{fqn!r} is a DTensor. DTensor composition is not supported yet."
+                f"{fqn!r} is a DTensor. Convert DTensor parameters with "
+                "flex_shard.layout_adapters.dtensor_to_global_layout(module) first."
             )
         if (
             expected_device is not None
