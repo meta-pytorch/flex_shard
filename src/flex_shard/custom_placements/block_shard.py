@@ -18,6 +18,7 @@ from typing_extensions import override
 from ..flex_shard.placement_contract import (
     BucketParamStorageLayout,
     BucketStorageLayout,
+    GlobalLayout,
     Placement,
     PlacementPreparedReduceGrad,
     PlacementPreparedUnshard,
@@ -262,6 +263,22 @@ class BlockShard(Placement):
         dim = self._normalize_dim(param.shape)
         start, end = self._shard_bounds_for_rank(param.shape, rank, world_size)
         return param.narrow(dim, start, end - start)
+
+    @override
+    def global_layout(
+        self, info: ParamInfo, rank: int, world_size: int
+    ) -> GlobalLayout:
+        dim = self._normalize_dim(info.global_shape)
+        start, _ = self._shard_bounds_for_rank(info.global_shape, rank, world_size)
+        global_offset = [0] * len(info.global_shape)
+        global_offset[dim] = start
+        has_data = info.local_numel > 0
+        return GlobalLayout(
+            global_shape=tuple(info.global_shape),
+            global_offsets=(tuple(global_offset),) if has_data else (),
+            local_offsets=((0,) * len(info.local_shape),) if has_data else (),
+            local_sizes=(tuple(info.local_shape),) if has_data else (),
+        )
 
     @override
     def prepare_unshard_bucket(
@@ -625,6 +642,36 @@ class BucketedBlockShard(Placement):
         raise NotImplementedError(
             "BucketedBlockShard extracts local shards from bucket-global ranges. "
             "Use bucket storage views instead."
+        )
+
+    @override
+    def global_layout(
+        self, info: ParamInfo, rank: int, world_size: int
+    ) -> GlobalLayout:
+        if self.dims != (0,):
+            raise NotImplementedError(
+                "BucketedBlockShard distributed checkpointing supports only dims=(0,)."
+            )
+        if info.local_numel == 0:
+            return GlobalLayout(tuple(info.global_shape), (), (), ())
+        param_layout = self._param_layout(info)
+        local_param_offset = (
+            param_layout.local_global_offset - param_layout.param_offset
+        )
+        row_numel = self._suffix_numel(info.global_shape)
+        if local_param_offset % row_numel != 0:
+            raise AssertionError(
+                f"BucketedBlockShard local range for {info.fqn!r} is not row-aligned."
+            )
+        global_offset = (
+            local_param_offset // row_numel,
+            *((0,) * (len(info.global_shape) - 1)),
+        )
+        return GlobalLayout(
+            global_shape=tuple(info.global_shape),
+            global_offsets=(global_offset,),
+            local_offsets=((0,) * len(info.local_shape),),
+            local_sizes=(tuple(info.local_shape),),
         )
 
     def _param_alignment_numel(

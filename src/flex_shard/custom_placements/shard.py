@@ -18,6 +18,7 @@ from ..flex_shard.bucket_storage import gradient_reduce_op_from_infos, GradientR
 from ..flex_shard.placement_contract import (
     BucketParamStorageLayout,
     BucketStorageLayout,
+    GlobalLayout,
     Placement,
     PlacementPreparedReduceGrad,
     PlacementPreparedUnshard,
@@ -106,6 +107,22 @@ class Shard(Placement):
         while len(chunks) < world_size:
             chunks.append(param.new_empty(empty_shape))
         return chunks[rank]
+
+    @override
+    def global_layout(
+        self, info: ParamInfo, rank: int, world_size: int
+    ) -> GlobalLayout:
+        dim_size = info.global_shape[self.dim]
+        chunk_size = (dim_size + world_size - 1) // world_size
+        global_offset = [0] * len(info.global_shape)
+        global_offset[self.dim] = min(chunk_size * rank, dim_size)
+        has_data = info.local_numel > 0
+        return GlobalLayout(
+            global_shape=tuple(info.global_shape),
+            global_offsets=(tuple(global_offset),) if has_data else (),
+            local_offsets=((0,) * len(info.local_shape),) if has_data else (),
+            local_sizes=(tuple(info.local_shape),) if has_data else (),
+        )
 
     @override
     def bucket_storage_layout(

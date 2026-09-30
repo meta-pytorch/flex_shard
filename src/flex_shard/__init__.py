@@ -10,6 +10,7 @@ from .flex_shard import (
     BucketStorageLayout,
     GlobalLayout,
     flex_shard,
+    get_flex_shard_global_layouts,
     get_global_layout,
     get_global_shape,
     get_placements,
@@ -20,6 +21,7 @@ from .flex_shard import (
     Placement,
     PlacementFn,
     set_global_layout,
+    set_state_dict_global_layouts,
 )
 
 
@@ -29,6 +31,7 @@ __all__ = [
     "BucketStorageLayout",
     "GlobalLayout",
     "flex_shard",
+    "get_flex_shard_global_layouts",
     "get_global_layout",
     "get_global_shape",
     "get_placements",
@@ -39,4 +42,5 @@ __all__ = [
     "Placement",
     "PlacementFn",
     "set_global_layout",
+    "set_state_dict_global_layouts",
 ]
