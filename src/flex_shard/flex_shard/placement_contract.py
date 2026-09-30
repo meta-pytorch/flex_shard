@@ -87,6 +87,44 @@ def set_global_layout(tensor: torch.Tensor, layout: GlobalLayout) -> None:
     tensor.local_sizes = layout.local_sizes
 
 
+def compose_global_layouts(outer: GlobalLayout, inner: GlobalLayout) -> GlobalLayout:
+    """Map ``inner`` chunks into ``outer``'s global coordinates.
+
+    ``outer`` maps an intermediate tensor ``T`` into the global tensor ``G``;
+    ``inner`` maps the local tensor ``L`` into ``T``. Each overlapping pair of
+    chunks in ``T`` yields one chunk mapping ``L`` directly into ``G``.
+    """
+    global_offsets = []
+    local_offsets = []
+    local_sizes = []
+    for o_global, o_local, o_size in zip(
+        outer.global_offsets, outer.local_offsets, outer.local_sizes, strict=True
+    ):
+        for i_global, i_local, i_size in zip(
+            inner.global_offsets, inner.local_offsets, inner.local_sizes, strict=True
+        ):
+            start = tuple(map(max, i_global, o_local))
+            end = tuple(
+                min(ig + isz, ol + osz)
+                for ig, isz, ol, osz in zip(i_global, i_size, o_local, o_size)
+            )
+            if any(e <= s for s, e in zip(start, end)):
+                continue
+            global_offsets.append(
+                tuple(og + s - ol for og, s, ol in zip(o_global, start, o_local))
+            )
+            local_offsets.append(
+                tuple(il + s - ig for il, s, ig in zip(i_local, start, i_global))
+            )
+            local_sizes.append(tuple(e - s for s, e in zip(start, end)))
+    return GlobalLayout(
+        global_shape=outer.global_shape,
+        global_offsets=tuple(global_offsets),
+        local_offsets=tuple(local_offsets),
+        local_sizes=tuple(local_sizes),
+    )
+
+
 class Placement(ABC):
     """Base class for FlexShard placement strategies.
 
@@ -209,6 +247,14 @@ class Placement(ABC):
         byte_view = byte_storage[info.byte_offset : info.byte_offset + nbytes]
         return byte_view.view(info.dtype).view(info.local_shape)
 
+    def global_layout(
+        self, info: ParamInfo, rank: int, world_size: int
+    ) -> GlobalLayout:
+        """Return where this rank's local parameter sits in the full parameter."""
+        raise NotImplementedError(
+            f"{self!r} does not support distributed checkpointing."
+        )
+
     def prepare_unshard_bucket(
         self,
         tensors: list[torch.Tensor],
@@ -308,6 +354,7 @@ class PlacementReduceGradResult:
 __all__ = [
     "BucketParamStorageLayout",
     "BucketStorageLayout",
+    "compose_global_layouts",
     "get_global_layout",
     "GlobalLayout",
     "LocalStorageLayout",

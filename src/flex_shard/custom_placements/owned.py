@@ -18,6 +18,7 @@ from typing_extensions import override
 
 from ..flex_shard.placement_contract import (
     BucketStorageLayout,
+    GlobalLayout,
     Placement,
     PlacementPreparedReduceGrad,
     PlacementPreparedUnshard,
@@ -254,6 +255,16 @@ class BucketedOwned(Placement):
         raise NotImplementedError(
             "BucketedOwned local shard is FQN-dependent; use copy_param_to_storage()."
         )
+
+    @override
+    def global_layout(
+        self, info: ParamInfo, rank: int, world_size: int
+    ) -> GlobalLayout:
+        block_shard = self._lower_to_block_shards(
+            {info.fqn: tuple(info.global_shape)},
+            world_size,
+        )[info.fqn]
+        return block_shard.global_layout(info, rank, world_size)
 
     @override
     def bucket_storage_layout(
