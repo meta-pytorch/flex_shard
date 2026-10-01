@@ -132,52 +132,72 @@ class TestFlexShardEagerRuntime(TestCase):
             unrelated_tensor = torch.ones(1)
             self.assertIs(context.pack(unrelated_tensor), unrelated_tensor)
 
-    def test_backward_reads_param_without_reshard_after_forward(self):
-        with single_rank_cuda_mesh() as mesh:
-            torch.manual_seed(0)
-            model = nn.Sequential(_BackwardWeightReader(8), _BackwardWeightReader(8))
-            reference = copy.deepcopy(model).cuda()
-            flex_shard(
-                model,
-                buckets=[
-                    _bucket(["0.*"], mesh, reshard_after_forward=False),
-                    _bucket(["1.*"], mesh, reshard_after_forward=False),
-                ],
-            )
-            x = torch.randn(4, 8, device="cuda")
+    def test_backward_reads_param(self):
+        for reshard_after_forward in (False, True):
+            with self.subTest(reshard_after_forward=reshard_after_forward):
+                with single_rank_cuda_mesh() as mesh:
+                    torch.manual_seed(0)
+                    model = nn.Sequential(
+                        _BackwardWeightReader(8), _BackwardWeightReader(8)
+                    )
+                    reference = copy.deepcopy(model).cuda()
+                    flex_shard(
+                        model,
+                        buckets=[
+                            _bucket(
+                                ["0.*"],
+                                mesh,
+                                reshard_after_forward=reshard_after_forward,
+                            ),
+                            _bucket(
+                                ["1.*"],
+                                mesh,
+                                reshard_after_forward=reshard_after_forward,
+                            ),
+                        ],
+                    )
+                    x = torch.randn(4, 8, device="cuda")
 
-            model(x).sum().backward()
-            reference(x).sum().backward()
+                    model(x).sum().backward()
+                    reference(x).sum().backward()
 
-            for param, ref_param in zip(
-                model.parameters(), reference.parameters(), strict=True
-            ):
-                torch.testing.assert_close(param.grad, ref_param.grad)
+                    for param, ref_param in zip(
+                        model.parameters(), reference.parameters(), strict=True
+                    ):
+                        torch.testing.assert_close(param.grad, ref_param.grad)
 
     def test_backward_param_frames_released_after_backward(self):
-        with single_rank_cuda_mesh() as mesh:
-            torch.manual_seed(0)
-            model = _CallTwice(8)
-            reference = copy.deepcopy(model).cuda()
-            flex_shard(
-                model,
-                buckets=[_bucket(["inner.*"], mesh, reshard_after_forward=False)],
-            )
-            x = torch.randn(4, 8, device="cuda")
+        for reshard_after_forward in (False, True):
+            with self.subTest(reshard_after_forward=reshard_after_forward):
+                with single_rank_cuda_mesh() as mesh:
+                    torch.manual_seed(0)
+                    model = _CallTwice(8)
+                    reference = copy.deepcopy(model).cuda()
+                    flex_shard(
+                        model,
+                        buckets=[
+                            _bucket(
+                                ["inner.*"],
+                                mesh,
+                                reshard_after_forward=reshard_after_forward,
+                            )
+                        ],
+                    )
+                    x = torch.randn(4, 8, device="cuda")
 
-            model(x).sum().backward()
-            reference(x).sum().backward()
+                    model(x).sum().backward()
+                    reference(x).sum().backward()
 
-            torch.testing.assert_close(
-                model.inner._parameters["weight"].grad,
-                reference.inner.weight.grad,
-            )
-            with self.assertRaisesRegex(RuntimeError, "did not run"):
-                model.inner.weight
-            with torch.no_grad():
-                model(x)
-            with self.assertRaisesRegex(RuntimeError, "did not run"):
-                model.inner.weight
+                    torch.testing.assert_close(
+                        model.inner._parameters["weight"].grad,
+                        reference.inner.weight.grad,
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "did not run"):
+                        model.inner.weight
+                    with torch.no_grad():
+                        model(x)
+                    with self.assertRaisesRegex(RuntimeError, "did not run"):
+                        model.inner.weight
 
     def test_forward_exposes_unsharded_params_through_parameters(self):
         for reshard_after_forward in (False, True):
@@ -217,20 +237,6 @@ class TestFlexShardEagerRuntime(TestCase):
                         model.parameters(), reference.parameters(), strict=True
                     ):
                         torch.testing.assert_close(param.grad, ref_param.grad)
-
-    def test_backward_param_read_with_reshard_after_forward_raises(self):
-        with single_rank_cuda_mesh() as mesh:
-            model = nn.Sequential(_BackwardWeightReader(8), _BackwardWeightReader(8))
-            flex_shard(
-                model,
-                buckets=[
-                    _bucket(["0.*"], mesh, reshard_after_forward=True),
-                    _bucket(["1.*"], mesh, reshard_after_forward=True),
-                ],
-            )
-            loss = model(torch.randn(4, 8, device="cuda")).sum()
-            with self.assertRaisesRegex(RuntimeError, "did not run"):
-                loss.backward()
 
     def test_meta_to_empty_materializes_bucket_storage_and_runtime(self):
         with single_rank_cuda_mesh() as mesh:

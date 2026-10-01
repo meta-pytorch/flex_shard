@@ -22,9 +22,12 @@ from torch.utils.weak import WeakTensorKeyDictionary
 class _UnshardedParamFrame:
     """Forward-scoped parameter view exposed by a bucket unshard hook."""
 
-    unsharded_param: torch.Tensor
+    unsharded_param: torch.Tensor | None
     saved_tensor_handle: Any | None = None
     exposed_param: torch.Tensor | None = None
+    # Set after forward for reshard-after-forward buckets: backward-time reads
+    # re-unshard through the saved-tensor handle instead of a held tensor.
+    resolve_in_backward: bool = False
 
 
 @dataclass(frozen=True)
@@ -123,10 +126,11 @@ class UnshardedParamSlot:
     FlexShard replaces managed module parameters with dynamic properties.
     A bucket pre-forward hook writes the full parameter tensor produced by
     bucket unshard into this slot. The dynamic property getter returns that
-    tensor when module code reads ``self.weight``. The post-forward hook clears
-    the forward frame, unless the bucket keeps its full parameters until
-    backward (``reshard_after_forward=False``). Then the frame stays until the
-    end of backward, so module backward code may read ``self.weight`` too.
+    tensor when module code reads ``self.weight``. When a forward runs with
+    grad enabled, its frame stays until the end of backward, so module backward
+    code may read ``self.weight`` too. Buckets without reshard-after-forward
+    keep the full tensor. Reshard-after-forward buckets drop it after forward,
+    and a backward read re-unshards the bucket through its saved-tensor handle.
 
     The slot also carries per-parameter dtype/device policy for the getter; it
     does not own the unsharded parameter tensor's storage.
@@ -151,6 +155,17 @@ class UnshardedParamSlot:
         )
         self._unsharded_param_stack.append(frame)
         return frame
+
+    def resolve_frame_in_backward(self, frame: _UnshardedParamFrame) -> None:
+        """Drop the frame's tensors; later reads re-unshard via its handle."""
+        if frame.saved_tensor_handle is None:
+            raise AssertionError(
+                f"FlexShard frame for {self.param_fqn!r} has no saved-tensor handle "
+                "to re-unshard from in backward."
+            )
+        frame.unsharded_param = None
+        frame.exposed_param = None
+        frame.resolve_in_backward = True
 
     def remove_unsharded_param_frame(self, frame: _UnshardedParamFrame) -> None:
         """Remove a frame pushed by ``push_unsharded_param``.
@@ -183,6 +198,8 @@ class UnshardedParamSlot:
         # parameter attribute more than once.
         if self._unsharded_param_stack:
             frame = self._unsharded_param_stack[-1]
+            if frame.resolve_in_backward:
+                return frame.saved_tensor_handle.unpack_raf_saved_tensor()
             if frame.exposed_param is not None:
                 return frame.exposed_param
 
