@@ -508,6 +508,15 @@ class BucketUnshardRuntime:
     # ``self.weight`` (e.g. TransformerEngine fused-op norms).
     keep_params_for_backward: bool = False
     slot_frames: list[tuple[UnshardedParamSlot, Any]] = field(default_factory=list)
+    # Sharded params moved out of ``module._parameters`` for this forward.
+    swapped_params: list[tuple[ParamOwnerRef, torch.Tensor]] = field(
+        default_factory=list
+    )
+
+    def restore_swapped_params(self) -> None:
+        swapped_params, self.swapped_params = self.swapped_params, []
+        for param_owner, sharded_param in reversed(swapped_params):
+            param_owner.module._parameters[param_owner.param_name] = sharded_param
 
     def take_unshard_lease(self) -> UnshardLease | None:
         unshard_lease = self.unshard_lease
@@ -1000,11 +1009,27 @@ class BucketRuntime:
                 saved_tensor_handle=saved_tensor_handle,
             )
             runtime.slot_frames.append((slot, frame))
+        if not is_compiling:
+            # Expose the unsharded params through ``module._parameters`` for the
+            # forward, like FSDP2's unsharded-parameter swap. Code that collects
+            # ``module.parameters()`` as autograd inputs (e.g. TransformerEngine's
+            # operation fuser) then uses the tensors the getter returns, and their
+            # gradients reach the bucket reduce-grad.
+            for bucket_param in self.bucket_params:
+                param_owner = bucket_param.param_owner
+                params = param_owner.module._parameters
+                runtime.swapped_params.append(
+                    (param_owner, params[param_owner.param_name])
+                )
+                params[param_owner.param_name] = (
+                    bucket_param.unsharded_param_slot.get_unsharded_param()
+                )
 
     def post_forward_hook(self, mod, args, output) -> None:
         if not self.active_unshard_invocations:
             raise AssertionError("Expected an active FlexShard unshard invocation.")
         runtime = self.active_unshard_invocations.pop()
+        runtime.restore_swapped_params()
         retained_for_backward = False
         post_succeeded = False
         try:

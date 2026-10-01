@@ -48,6 +48,34 @@ class _BackwardWeightReader(nn.Module):
         return _ScaleReadingWeightInBackward.apply(x, self.weight, self)
 
 
+class _ScaleWithParamsAsInputs(torch.autograd.Function):
+    """Like TransformerEngine's operation fuser: ``module.parameters()`` are the
+    autograd inputs, while the computation reads ``module.weight``."""
+
+    @staticmethod
+    def forward(ctx, x, module, *params):
+        weight = module.weight
+        ctx.save_for_backward(x, weight)
+        return x * weight
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        return grad_output * weight, None, (grad_output * x).sum(0)
+
+
+class _ParamsAsInputsScale(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(dim))
+        self.params_match_getter: list[bool] = []
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        params = list(self.parameters())
+        self.params_match_getter.append(params[0] is self.weight)
+        return _ScaleWithParamsAsInputs.apply(x, self, *params)
+
+
 class _CallTwice(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
@@ -150,6 +178,45 @@ class TestFlexShardEagerRuntime(TestCase):
                 model(x)
             with self.assertRaisesRegex(RuntimeError, "did not run"):
                 model.inner.weight
+
+    def test_forward_exposes_unsharded_params_through_parameters(self):
+        for reshard_after_forward in (False, True):
+            with self.subTest(reshard_after_forward=reshard_after_forward):
+                with single_rank_cuda_mesh() as mesh:
+                    torch.manual_seed(0)
+                    model = nn.Sequential(
+                        _ParamsAsInputsScale(8), _ParamsAsInputsScale(8)
+                    )
+                    reference = copy.deepcopy(model).cuda()
+                    flex_shard(
+                        model,
+                        buckets=[
+                            _bucket(
+                                ["0.*"],
+                                mesh,
+                                reshard_after_forward=reshard_after_forward,
+                            ),
+                            _bucket(
+                                ["1.*"],
+                                mesh,
+                                reshard_after_forward=reshard_after_forward,
+                            ),
+                        ],
+                    )
+                    x = torch.randn(4, 8, device="cuda")
+
+                    model(x).sum().backward()
+                    reference(x).sum().backward()
+
+                    for module in model:
+                        self.assertEqual(module.params_match_getter, [True])
+                        self.assertTrue(
+                            is_flex_shard_param(module._parameters["weight"])
+                        )
+                    for param, ref_param in zip(
+                        model.parameters(), reference.parameters(), strict=True
+                    ):
+                        torch.testing.assert_close(param.grad, ref_param.grad)
 
     def test_backward_param_read_with_reshard_after_forward_raises(self):
         with single_rank_cuda_mesh() as mesh:
