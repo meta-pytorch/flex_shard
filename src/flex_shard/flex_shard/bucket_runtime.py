@@ -506,7 +506,7 @@ class BucketUnshardRuntime:
     retain_lease_for_backward: bool = False
     # Keep the getter frames past post-forward so module backward code can read
     # ``self.weight`` (e.g. TransformerEngine fused-op norms).
-    keep_params_for_backward: bool = False
+    keep_frames_for_backward: bool = False
     slot_frames: list[tuple[UnshardedParamSlot, Any]] = field(default_factory=list)
     # Sharded params moved out of ``module._parameters`` for this forward.
     swapped_params: list[tuple[ParamOwnerRef, torch.Tensor]] = field(
@@ -527,6 +527,10 @@ class BucketUnshardRuntime:
         unshard_lease = self.take_unshard_lease()
         if unshard_lease is not None:
             unshard_lease.release()
+
+    def resolve_slot_frames_in_backward(self) -> None:
+        for slot, frame in self.slot_frames:
+            slot.resolve_frame_in_backward(frame)
 
     def release_slot_frames(self) -> None:
         slot_frames, self.slot_frames = self.slot_frames, []
@@ -979,13 +983,12 @@ class BucketRuntime:
             unshard_lease = runtime.unshard_lease
             if unshard_lease is None:
                 raise AssertionError("Expected a completed FlexShard unshard lease.")
-            runtime.keep_params_for_backward = (
-                not is_compiling
-                and not self.bucket_storage._reshard_after_forward
-                and torch.is_grad_enabled()
+            runtime.keep_frames_for_backward = (
+                not is_compiling and not is_recompute and torch.is_grad_enabled()
             )
             runtime.retain_lease_for_backward = (
-                runtime.keep_params_for_backward
+                runtime.keep_frames_for_backward
+                and not self.bucket_storage._reshard_after_forward
                 and unshard_lease.has_consumer_buffers()
             )
             self.active_unshard_invocations.append(runtime)
@@ -1033,7 +1036,7 @@ class BucketRuntime:
         retained_for_backward = False
         post_succeeded = False
         try:
-            if output is not None and runtime.keep_params_for_backward:
+            if output is not None and runtime.keep_frames_for_backward:
 
                 def defer_release(grad: torch.Tensor) -> torch.Tensor:
                     runtime.defer_unshard_lease_release()
@@ -1048,10 +1051,14 @@ class BucketRuntime:
             if not post_succeeded or not retained_for_backward:
                 runtime.release_slot_frames()
                 runtime.release_unshard_lease()
-            elif not runtime.retain_lease_for_backward:
-                # Only the getter frames outlive forward; the lease holds no
-                # consumer buffers, so release it now as before.
-                runtime.release_unshard_lease()
+            else:
+                if self.bucket_storage._reshard_after_forward:
+                    # Free the full params now; backward reads re-unshard.
+                    runtime.resolve_slot_frames_in_backward()
+                if not runtime.retain_lease_for_backward:
+                    # Only the getter frames outlive forward, so release the
+                    # lease now as before.
+                    runtime.release_unshard_lease()
 
 
 class _BucketUnshard(torch.autograd.Function):
