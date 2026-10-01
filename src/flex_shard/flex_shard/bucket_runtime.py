@@ -504,6 +504,10 @@ class BucketUnshardRuntime:
     prefetched_result: UnshardHandle | None
     unshard_lease: UnshardLease | None = None
     retain_lease_for_backward: bool = False
+    # Keep the getter frames past post-forward so module backward code can read
+    # ``self.weight`` (e.g. TransformerEngine fused-op norms).
+    keep_params_for_backward: bool = False
+    slot_frames: list[tuple[UnshardedParamSlot, Any]] = field(default_factory=list)
 
     def take_unshard_lease(self) -> UnshardLease | None:
         unshard_lease = self.unshard_lease
@@ -515,13 +519,25 @@ class BucketUnshardRuntime:
         if unshard_lease is not None:
             unshard_lease.release()
 
+    def release_slot_frames(self) -> None:
+        slot_frames, self.slot_frames = self.slot_frames, []
+        for slot, frame in slot_frames:
+            slot.remove_unsharded_param_frame(frame)
+
     def defer_unshard_lease_release(self) -> None:
-        """Transfer the lease to the current backward's final callback."""
+        """Transfer the lease and slot frames to the backward's final callback."""
         unshard_lease = self.take_unshard_lease()
-        if unshard_lease is not None:
-            torch.autograd.Variable._execution_engine.queue_callback(
-                unshard_lease.release
-            )
+        slot_frames, self.slot_frames = self.slot_frames, []
+        if unshard_lease is None and not slot_frames:
+            return
+
+        def release() -> None:
+            for slot, frame in slot_frames:
+                slot.remove_unsharded_param_frame(frame)
+            if unshard_lease is not None:
+                unshard_lease.release()
+
+        torch.autograd.Variable._execution_engine.queue_callback(release)
 
 
 @dataclass(frozen=True)
@@ -954,10 +970,13 @@ class BucketRuntime:
             unshard_lease = runtime.unshard_lease
             if unshard_lease is None:
                 raise AssertionError("Expected a completed FlexShard unshard lease.")
-            runtime.retain_lease_for_backward = (
+            runtime.keep_params_for_backward = (
                 not is_compiling
                 and not self.bucket_storage._reshard_after_forward
                 and torch.is_grad_enabled()
+            )
+            runtime.retain_lease_for_backward = (
+                runtime.keep_params_for_backward
                 and unshard_lease.has_consumer_buffers()
             )
             self.active_unshard_invocations.append(runtime)
@@ -975,10 +994,12 @@ class BucketRuntime:
                 if self.bucket_storage._reshard_after_forward
                 else None
             )
-            bucket_param.unsharded_param_slot.push_unsharded_param(
+            slot = bucket_param.unsharded_param_slot
+            frame = slot.push_unsharded_param(
                 full_param,
                 saved_tensor_handle=saved_tensor_handle,
             )
+            runtime.slot_frames.append((slot, frame))
 
     def post_forward_hook(self, mod, args, output) -> None:
         if not self.active_unshard_invocations:
@@ -987,9 +1008,7 @@ class BucketRuntime:
         retained_for_backward = False
         post_succeeded = False
         try:
-            for bucket_param in self.bucket_params:
-                bucket_param.unsharded_param_slot.pop_unsharded_param()
-            if output is not None and runtime.retain_lease_for_backward:
+            if output is not None and runtime.keep_params_for_backward:
 
                 def defer_release(grad: torch.Tensor) -> torch.Tensor:
                     runtime.defer_unshard_lease_release()
@@ -1002,6 +1021,11 @@ class BucketRuntime:
             post_succeeded = True
         finally:
             if not post_succeeded or not retained_for_backward:
+                runtime.release_slot_frames()
+                runtime.release_unshard_lease()
+            elif not runtime.retain_lease_for_backward:
+                # Only the getter frames outlive forward; the lease holds no
+                # consumer buffers, so release it now as before.
                 runtime.release_unshard_lease()
 
 
