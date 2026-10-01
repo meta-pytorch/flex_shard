@@ -124,7 +124,9 @@ class UnshardedParamSlot:
     A bucket pre-forward hook writes the full parameter tensor produced by
     bucket unshard into this slot. The dynamic property getter returns that
     tensor when module code reads ``self.weight``. The post-forward hook clears
-    the forward frame.
+    the forward frame, unless the bucket keeps its full parameters until
+    backward (``reshard_after_forward=False``). Then the frame stays until the
+    end of backward, so module backward code may read ``self.weight`` too.
 
     The slot also carries per-parameter dtype/device policy for the getter; it
     does not own the unsharded parameter tensor's storage.
@@ -141,23 +143,29 @@ class UnshardedParamSlot:
         self,
         unsharded_param: torch.Tensor,
         saved_tensor_handle: Any | None = None,
-    ) -> None:
+    ) -> _UnshardedParamFrame:
         """Push the hook-provided full parameter for a module forward."""
-        self._unsharded_param_stack.append(
-            _UnshardedParamFrame(
-                unsharded_param,
-                saved_tensor_handle=saved_tensor_handle,
-            )
+        frame = _UnshardedParamFrame(
+            unsharded_param,
+            saved_tensor_handle=saved_tensor_handle,
         )
+        self._unsharded_param_stack.append(frame)
+        return frame
 
-    def pop_unsharded_param(self) -> None:
-        """Pop the current module forward's full parameter frame."""
-        if not self._unsharded_param_stack:
-            raise AssertionError(
-                "Attempted to clear a FlexShard unsharded parameter slot "
-                f"for {self.param_fqn!r}, but no slot frame is active."
-            )
-        self._unsharded_param_stack.pop()
+    def remove_unsharded_param_frame(self, frame: _UnshardedParamFrame) -> None:
+        """Remove a frame pushed by ``push_unsharded_param``.
+
+        Frames kept for backward may be removed after frames pushed by later
+        forwards, so remove by identity rather than popping the top.
+        """
+        for index in range(len(self._unsharded_param_stack) - 1, -1, -1):
+            if self._unsharded_param_stack[index] is frame:
+                del self._unsharded_param_stack[index]
+                return
+        raise AssertionError(
+            "Attempted to clear a FlexShard unsharded parameter slot "
+            f"for {self.param_fqn!r}, but its frame is not active."
+        )
 
     def apply_unsharded_param_policy(
         self, unsharded_param: torch.Tensor
