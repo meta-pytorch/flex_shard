@@ -381,7 +381,8 @@ class TestBlockwiseFp8FlexShardTraining(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_transformer_training_matches_bf16_allgather_then_quantize(self) -> None:
-        """Five training steps match the BF16-all-gather FP8-GEMM reference."""
+        """Five training steps match the BF16-all-gather FP8-GEMM reference,
+        also with microbatches without gradient sync."""
         self._skip_unless_blockwise_linear_supported()
         mesh = self._mesh()
         model_args, fp8_model, bf16_model = self._make_transformer_model_pair(
@@ -414,6 +415,17 @@ class TestBlockwiseFp8FlexShardTraining(FSDPTest):
             dist.broadcast(targets, src=0)
             fp8_optim.zero_grad(set_to_none=True)
             bf16_optim.zero_grad(set_to_none=True)
+            if step in (1, 3):
+                # A microbatch without sync first, keeping the params unsharded
+                # after it on step 1; its grads accumulate on the unsharded
+                # params, fp8 weights included.
+                for model in (fp8_model, bf16_model):
+                    model.set_reshard_after_backward(step != 1)
+                    model.set_requires_gradient_sync(False)
+                    nn.functional.cross_entropy(
+                        model(tokens).flatten(0, 1), targets.flatten()
+                    ).backward()
+                    model.set_requires_gradient_sync(True)
 
             fp8_logits = fp8_model(tokens)
             bf16_logits = bf16_model(tokens)

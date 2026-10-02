@@ -714,6 +714,14 @@ class TestFlexShardTraining(FSDPTest):
 
         optim.zero_grad(set_to_none=True)
         ref_optim.zero_grad(set_to_none=True)
+        # A microbatch without sync first, keeping the params unsharded after
+        # it: the next forward skips the all-gather and still reshards after
+        # forward, and the recompute in backward re-gathers.
+        model.set_reshard_after_backward(False)
+        model.set_requires_gradient_sync(False)
+        model(x).sum().backward()
+        model.set_requires_gradient_sync(True)
+        reference(x).sum().backward()
         loss = model(x).sum()
         ref_loss = reference(x).sum()
         self.assertEqual(loss, ref_loss)
