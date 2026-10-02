@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 
 from .bucket_runtime import (
-    _create_unsharded_param_slots,
     _EAGER_COMM_CONTEXTS_ATTR,
     _install_bucket_unshard_hooks,
     _MAX_PENDING_REDUCE_GRADS_ATTR,
@@ -25,9 +24,7 @@ from .bucket_storage import (
     GradientReduceOp,
     ShardedBucketStorage,
 )
-from .reshard_after_forward import _apply_reshard_after_forward
 from .sharded_param import is_flex_shard_param
-from .unsharded_param_getters import _install_unsharded_param_getters
 from .utils import (
     _get_device_from_mesh,
     _get_managed_named_params,
@@ -47,7 +44,6 @@ __all__ = [
 
 
 _SHARDED_BUCKET_STORAGES_ATTR = "_sharded_bucket_storages"
-_MODULE_PARAM_SLOTS_ATTR = "_flex_shard_module_param_slots"
 _EAGER_HOOKS_INSTALLED_ATTR = "_flex_shard_eager_hooks_installed"
 
 
@@ -94,6 +90,10 @@ class FlexShardModule:
                 )
             bucket_storage.install_sharded_params(bucket_storage.byte_storage.device)
 
+        # Installed runtime hooks still hold the replaced local-shard params.
+        for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
+            for bucket in context.buckets:
+                bucket.reset_sharded_params()
         self._install_runtime_if_materialized()
 
     def _install_runtime_if_materialized(self) -> None:
@@ -107,9 +107,19 @@ class FlexShardModule:
         ):
             return
 
-        module_param_slots = getattr(self, _MODULE_PARAM_SLOTS_ATTR)
-        _install_bucket_unshard_hooks(bucket_storages, module_param_slots)
+        _install_bucket_unshard_hooks(bucket_storages)
         setattr(self, _EAGER_HOOKS_INSTALLED_ATTR, True)
+
+    def reshard(self) -> None:
+        """Reshard every unsharded bucket, like FSDP2's ``FSDPModule.reshard()``.
+
+        Buckets with ``reshard_after_forward=False`` stay unsharded after a
+        forward until its backward; call this when that backward will not run.
+        Until then, ``module.parameters()`` returns their unsharded params, so
+        zero grads through the optimizer rather than ``module.zero_grad()``.
+        """
+        for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
+            context.reset()
 
     def set_gradient_reduce_op(
         self,
@@ -174,7 +184,8 @@ def flex_shard(
     2. Groups parameters into communication buckets (one per bucket, or all in one)
     3. Creates a unified byte buffer per bucket for all its parameters
     4. Replaces each parameter with a plain tensor annotated with placement metadata
-    5. Registers property-based accessors for eager parameter access
+    5. Installs per-bucket forward hooks that unshard into persistent unsharded
+       parameters (FSDP2-style) swapped into the owning modules
     6. Stores ShardedBucketStorage objects on the module
 
     Each bucket gets its own byte buffer and ShardedBucketStorage, enabling
@@ -190,9 +201,6 @@ def flex_shard(
             buckets may use different meshes (all sharing one device type). A
             single whole-module bucket can be expressed as
             ``[BucketSpec(["*"], placement_fn=per_param_placements, mesh=mesh)]``.
-            When ``reshard_after_forward=True``, FlexShard raises if bucket
-            hooks cannot run in both the original forward and activation
-            checkpoint recomputation.
 
     Parameters must be plain tensors. Parameters that are local shards of an
     outer (e.g. TP/EP) sharding declare their position in the full parameter
@@ -238,7 +246,7 @@ def flex_shard(
         buckets,
     )
 
-    bucket_storages, fqn_to_bucket_spec = _materialize_bucket_storages(
+    bucket_storages = _materialize_bucket_storages(
         module,
         inputs,
         buckets,
@@ -246,22 +254,6 @@ def flex_shard(
 
     flex_shard_module = _attach_flex_shard_module_state(module, bucket_storages)
     flex_shard_module.set_max_pending_reduce_grads()
-
-    module_param_slots = _create_unsharded_param_slots(
-        module,
-        bucket_storages,
-        fqn_to_bucket_spec,
-        inputs.device,
-    )
-    setattr(module, _MODULE_PARAM_SLOTS_ATTR, module_param_slots)
-    _install_unsharded_param_getters(module_param_slots)
-
-    # Reshard-after-forward: in eager mode, wrap each layer in checkpoint with
-    # a selective policy that recomputes only collective ops (all-gather,
-    # broadcast), saving compute ops to avoid redundant work.
-    reshard_bucket_storages = [s for s in bucket_storages if s._reshard_after_forward]
-    if reshard_bucket_storages:
-        _apply_reshard_after_forward(module, reshard_bucket_storages)
 
     # Install bucket unshard hooks for eager mode when the storage layout
     # supports one collective per bucket. Meta modules are materialized later by
@@ -327,20 +319,16 @@ def _materialize_bucket_storages(
     module: nn.Module,
     inputs: PreparedFlexShardInputs,
     buckets: list[BucketSpec],
-) -> tuple[list[ShardedBucketStorage], dict[str, BucketSpec]]:
+) -> list[ShardedBucketStorage]:
     """Create ShardedBucketStorage objects and install sharded parameters."""
     named_params_dict = dict(inputs.named_params)
     bucket_storages: list[ShardedBucketStorage] = []
-    fqn_to_bucket_spec: dict[str, BucketSpec] = {}
 
     for bucket_idx, bucket_fqns in enumerate(inputs.bucket_assignments):
         if not bucket_fqns:
             continue
 
         bucket_spec = buckets[bucket_idx]
-        for fqn in bucket_fqns:
-            fqn_to_bucket_spec[fqn] = bucket_spec
-
         bucket_named_params = [(fqn, named_params_dict[fqn]) for fqn in bucket_fqns]
         bucket_placements = {fqn: inputs.param_placements[fqn] for fqn in bucket_fqns}
         bucket_storages.append(
@@ -354,7 +342,7 @@ def _materialize_bucket_storages(
             )
         )
 
-    return bucket_storages, fqn_to_bucket_spec
+    return bucket_storages
 
 
 def _resolve_bucket_param_placements(

@@ -79,6 +79,17 @@ def _init_params_deterministically(model: torch.nn.Module) -> None:
             param.copy_(values.div(max(param.numel(), 1)).add_(idx))
 
 
+class _RankRoutedExperts(torch.nn.Module):
+    """Each rank routes to one expert, like experts that got tokens on one rank."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.experts = torch.nn.ModuleList(torch.nn.Linear(8, 8) for _ in range(2))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.experts[dist.get_rank()](x)
+
+
 def _average_reference_grads(model: torch.nn.Module) -> None:
     for param in model.parameters():
         if param.grad is not None:
@@ -114,31 +125,6 @@ def _checkpoint_transformer_execution_units(model: torch.nn.Module) -> None:
         model.output,
         context_fn=_prefer_recompute_context_fn,
     )
-
-
-def _layer_buckets_with_grouped_root_rest(
-    num_layers: int,
-    mesh,
-    *,
-    reshard_after_forward: bool,
-) -> list[BucketSpec]:
-    return [
-        *[
-            BucketSpec(
-                [f"layers.{idx}.*"],
-                placement_fn=per_param_placements,
-                mesh=mesh,
-                reshard_after_forward=reshard_after_forward,
-            )
-            for idx in range(num_layers)
-        ],
-        BucketSpec(
-            ["tok_embeddings.*", "pos_embeddings.*", "norm.*", "output.*"],
-            placement_fn=per_param_placements,
-            mesh=mesh,
-            reshard_after_forward=reshard_after_forward,
-        ),
-    ]
 
 
 class TestFlexShardTraining(FSDPTest):
@@ -180,7 +166,14 @@ class TestFlexShardTraining(FSDPTest):
         )
         model.set_max_pending_reduce_grads(1)
 
-        x = torch.ones((2, width), dtype=torch.bfloat16, device=device_type.type)
+        # Grad-requiring inputs let each layer's input-grad trigger reduce
+        # mid-backward, one bucket after the other.
+        x = torch.ones(
+            (2, width),
+            dtype=torch.bfloat16,
+            device=device_type.type,
+            requires_grad=True,
+        )
         output = sum(layer((index + 1) * x) for index, layer in enumerate(model))
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -232,8 +225,6 @@ class TestFlexShardTraining(FSDPTest):
         placement_fn,
         placement_type,
         run_backward,
-        expect_reuse_before_forward,
-        expect_reuse_after_forward,
     ):
         width = 1024
         x = torch.ones(
@@ -309,11 +300,7 @@ class TestFlexShardTraining(FSDPTest):
             nonlocal reused_before_forward
             reused_before_forward = try_reuse_gathered_buffer()
 
-        before_forward_hook = (
-            model[0].register_forward_pre_hook(probe_before_forward)
-            if expect_reuse_before_forward is not None
-            else None
-        )
+        before_forward_hook = model[0].register_forward_pre_hook(probe_before_forward)
         with mock.patch.object(
             placement_type,
             "finish_prepared_unshard",
@@ -324,16 +311,11 @@ class TestFlexShardTraining(FSDPTest):
             else:
                 with torch.no_grad():
                     output = model[0](x)
-        if before_forward_hook is not None:
-            before_forward_hook.remove()
+        before_forward_hook.remove()
 
-        if expect_reuse_before_forward is not None:
-            self.assertEqual(reused_before_forward, expect_reuse_before_forward)
-        if expect_reuse_after_forward is not None:
-            self.assertEqual(
-                try_reuse_gathered_buffer(),
-                expect_reuse_after_forward,
-            )
+        # The unshard copied the gathered bucket into the persistent buffers, so
+        # the all-gather output is reusable before module compute and backward.
+        self.assertTrue(reused_before_forward)
         if not run_backward:
             self.assertEqual(output, x)
             return
@@ -342,7 +324,6 @@ class TestFlexShardTraining(FSDPTest):
         backward_delay_done = torch.cuda.Event()
         backward_delay_done.record()
         output.sum().backward()
-        self.assertTrue(try_reuse_gathered_buffer())
         self.assertTrue(backward_delay_done.query())
         self.assertEqual(x.grad, torch.ones_like(x))
 
@@ -358,22 +339,13 @@ class TestFlexShardTraining(FSDPTest):
             blocks_per_rank=(1, 1),
         )
         cases = (
-            ("shard", per_param_placements, Shard, False, True, None),
-            (
-                "bucketed_block",
-                bucketed_block_placements,
-                BucketedBlockShard,
-                False,
-                False,
-                True,
-            ),
+            ("shard", per_param_placements, Shard, False),
+            ("bucketed_block", bucketed_block_placements, BucketedBlockShard, False),
             (
                 "bucketed_block_backward",
                 bucketed_block_placements,
                 BucketedBlockShard,
                 True,
-                None,
-                False,
             ),
         )
         for case in cases:
@@ -579,6 +551,31 @@ class TestFlexShardTraining(FSDPTest):
         self.assertEqual(grad, expected_grad)
 
     @skip_if_lt_x_gpu(2)
+    def test_rank_dependent_unused_params(self):
+        # Ranks leave different params of a bucket without grads; every rank
+        # still reduce-scatters all of them, with zeros for its unused ones.
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+        torch.manual_seed(0)
+        model = _RankRoutedExperts().to(device_type)
+        reference = copy.deepcopy(model)
+        flex_shard(
+            model,
+            buckets=[BucketSpec(["*"], placement_fn=per_param_placements, mesh=mesh)],
+        )
+        x = torch.randn(4, 8, device=device_type)
+        model(x).sum().backward()
+        reference(x).sum().backward()
+        for param in reference.parameters():
+            if param.grad is None:
+                param.grad = torch.zeros_like(param)
+        _average_reference_grads(reference)
+        check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
+
+    @skip_if_lt_x_gpu(2)
     def test_reshard_after_forward_with_activation_checkpointing(self):
         mesh = init_device_mesh(
             device_type.type,
@@ -604,29 +601,11 @@ class TestFlexShardTraining(FSDPTest):
             ),
         )
 
+        # FlexShard leaves the user's activation-checkpoint wrapper untouched.
         self.assertIsInstance(model.layers[0], CheckpointWrapper)
-        composed_context_fn = model.layers[0].checkpoint_fn.keywords["context_fn"]
-        self.assertIsNot(composed_context_fn, _prefer_recompute_context_fn)
-        forward_ctx, _ = composed_context_fn()
-        from ..flex_shard.unshard_op import UNSHARD_BUCKET_OP
-
-        self.assertEqual(
-            forward_ctx.policy_fn(
-                None,
-                UNSHARD_BUCKET_OP,
-            ),
-            CheckpointPolicy.MUST_RECOMPUTE,
-        )
-        self.assertEqual(
-            forward_ctx.policy_fn(None, torch.ops.aten.mm.default),
-            CheckpointPolicy.PREFER_RECOMPUTE,
-        )
-        self.assertEqual(
-            forward_ctx.policy_fn(
-                None,
-                torch.ops._c10d_functional.all_to_all_single.default,
-            ),
-            CheckpointPolicy.PREFER_RECOMPUTE,
+        self.assertIs(
+            model.layers[0].checkpoint_fn.keywords["context_fn"],
+            _prefer_recompute_context_fn,
         )
 
         torch.manual_seed(42 + self.rank + 1)
@@ -648,27 +627,6 @@ class TestFlexShardTraining(FSDPTest):
         optim.step()
         ref_optim.step()
         check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
-
-    @skip_if_lt_x_gpu(2)
-    def test_reshard_after_forward_grouped_root_rest_bucket_unsupported(self):
-        mesh = init_device_mesh(
-            device_type.type,
-            (self.world_size,),
-            mesh_dim_names=("fsdp",),
-        )
-
-        args, model = make_transformer_model(device=device_type.type, n_layers=2)
-        _checkpoint_transformer_execution_units(model)
-
-        with self.assertRaisesRegex(RuntimeError, "recomputation-safe"):
-            flex_shard(
-                model,
-                buckets=_layer_buckets_with_grouped_root_rest(
-                    args.n_layers,
-                    mesh,
-                    reshard_after_forward=True,
-                ),
-            )
 
 
 if __name__ == "__main__":

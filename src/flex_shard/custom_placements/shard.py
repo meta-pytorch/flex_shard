@@ -221,21 +221,32 @@ class Shard(Placement):
         infos: list[ParamInfo],
         world_size: int,
         layout: Shard._PaddedUnshardLayout,
-    ) -> list[torch.Tensor]:
+        persistent_buffers: list[torch.Tensor] | None = None,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Return full params and the padded buffers backing them.
+
+        ``persistent_buffers`` are padded buffers from a previous persistent unshard
+        to write into instead of allocating.
+        """
         full_params: list[torch.Tensor] = []
+        padded_full_params: list[torch.Tensor] = []
         split_out: list[torch.Tensor] = []
-        for info, padded_local_numel in zip(
-            infos,
-            layout.padded_local_numels,
-            strict=True,
+        for idx, (info, padded_local_numel) in enumerate(
+            zip(infos, layout.padded_local_numels, strict=True)
         ):
-            padded_full_param = torch.empty(
-                world_size * padded_local_numel,
-                dtype=info.unsharded_dtype,
-                device=gathered.device,
+            padded_full_param = (
+                persistent_buffers[idx]
+                if persistent_buffers is not None
+                else torch.empty(
+                    world_size * padded_local_numel,
+                    dtype=info.unsharded_dtype,
+                    device=gathered.device,
+                )
             )
-            full_param = padded_full_param[: info.global_numel].view(info.global_shape)
-            full_params.append(full_param)
+            padded_full_params.append(padded_full_param)
+            full_params.append(
+                padded_full_param[: info.global_numel].view(info.global_shape)
+            )
             split_out.append(padded_full_param.view(world_size, padded_local_numel))
 
         torch.split_with_sizes_copy(
@@ -244,7 +255,7 @@ class Shard(Placement):
             dim=1,
             out=split_out,
         )
-        return full_params
+        return full_params, padded_full_params
 
     @override
     def prepare_unshard_bucket(
@@ -321,14 +332,18 @@ class Shard(Placement):
             )
         with _record_copy_out_if_eager():
             state = prepared.placement_state
-            full_params = self._copy_out_dim0_unshard(
+            full_params, padded_full_params = self._copy_out_dim0_unshard(
                 prepared.buffers[1],
                 state.infos,
                 state.world_size,
                 state.padded_layout,
+                persistent_buffers=prepared.persistent_buffers,
             )
 
-        return PlacementUnshardResult(full_params=full_params)
+        return PlacementUnshardResult(
+            full_params=full_params,
+            persistent_buffers=padded_full_params if prepared.persistent else [],
+        )
 
     def _pack_reduce_scatter_grad(
         self,

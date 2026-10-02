@@ -369,6 +369,7 @@ class BlockShard(Placement):
             state.layout.padded_segment_numel,
         )
         full_params: list[torch.Tensor] = []
+        persistent_buffers = prepared.persistent_buffers
         with _record_copy_out_if_eager():
             for index, info in enumerate(state.infos):
                 offset = state.layout.param_offsets[index]
@@ -386,13 +387,18 @@ class BlockShard(Placement):
                     )
                     for rank in range(world_size)
                 ]
+                dim = self._normalize_dim(info.global_shape)
                 full_params.append(
-                    torch.cat(
-                        rank_shards,
-                        dim=self._normalize_dim(info.global_shape),
-                    )
+                    torch.cat(rank_shards, dim=dim, out=persistent_buffers[index])
+                    if persistent_buffers is not None
+                    else torch.cat(rank_shards, dim=dim)
                 )
-        return PlacementUnshardResult(full_params=full_params)
+        # The concatenated params are fresh tensors, so they are their own
+        # persistent storage.
+        return PlacementUnshardResult(
+            full_params=full_params,
+            persistent_buffers=list(full_params) if prepared.persistent else [],
+        )
 
     def _pack_reduce_scatter_grad(
         self,
@@ -529,8 +535,9 @@ class BucketedBlockShard(Placement):
     they must be ``(0,)``, ``(0, 1)``, etc. ``blocks_per_rank`` assigns each rank
     a number of contiguous bucket-global blocks. The placement plans the whole
     bucket as one param-major logical buffer, then shards that buffer into
-    rank-local ranges so the all-gather output is directly viewable as full
-    parameters.
+    rank-local ranges so the all-gather output is laid out as the full
+    parameters. In eager mode it is copied into one persistent bucket buffer
+    that the full parameters view; during graph capture they view it directly.
     """
 
     @dataclass(frozen=True)
@@ -968,17 +975,29 @@ class BucketedBlockShard(Placement):
                 f"got {type(prepared.placement_state).__name__}"
             )
         gathered_bucket = prepared.buffers[1]
+        if prepared.persistent:
+            # The gathered bucket comes from the unshard stream; persistent
+            # storage lives on the current stream, so copy into it.
+            bucket = (
+                prepared.persistent_buffers[0]
+                if prepared.persistent_buffers is not None
+                else torch.empty_like(gathered_bucket)
+            )
+            with _record_copy_out_if_eager():
+                bucket.copy_(gathered_bucket)
+        else:
+            bucket = gathered_bucket
         full_params: list[torch.Tensor] = []
         for info in prepared.placement_state.infos:
             param_offset = self._param_layout(info).param_offset
             full_params.append(
-                gathered_bucket[param_offset : param_offset + info.global_numel].view(
+                bucket[param_offset : param_offset + info.global_numel].view(
                     info.global_shape
                 )
             )
         return PlacementUnshardResult(
             full_params=full_params,
-            consumer_buffers=[gathered_bucket],
+            persistent_buffers=[bucket] if prepared.persistent else [],
         )
 
     @override

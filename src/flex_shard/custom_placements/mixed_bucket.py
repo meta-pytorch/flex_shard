@@ -516,16 +516,28 @@ class MixedBucketPlacement(Placement):
         full_params: list[torch.Tensor | None] = [None] * sum(
             len(group.indices) for group in state.groups
         )
-        finish_buffers: list[torch.Tensor] = []
-        consumer_buffers: list[torch.Tensor] = []
+        buffers: list[torch.Tensor] = []
+        persistent_buffers: list[torch.Tensor] = []
+        buffer_offset = 0
         with _record_copy_out_if_eager():
             for group in state.groups:
+                placement = group.prepared.placement
+                num_buffers = _num_persistent_buffers(placement, len(group.indices))
+                group_persistent_buffers = (
+                    prepared.persistent_buffers[
+                        buffer_offset : buffer_offset + num_buffers
+                    ]
+                    if prepared.persistent_buffers is not None
+                    else None
+                )
+                buffer_offset += num_buffers
                 group_gathered_by_rank = gathered_by_rank[
                     :, group.offset : group.offset + group.numel
                 ]
-                placement = group.prepared.placement
                 if isinstance(placement, Fp8BucketedBlockShard):
                     gathered = group_gathered_by_rank
+                    group.prepared.persistent = prepared.persistent
+                    group.prepared.persistent_buffers = group_persistent_buffers
                     result = placement._finish_unshard_from_rank_rows(
                         group.prepared,
                         gathered,
@@ -546,18 +558,19 @@ class MixedBucketPlacement(Placement):
                             *group.prepared.buffers[2:],
                         ],
                         placement_state=group.prepared.placement_state,
+                        persistent=prepared.persistent,
+                        persistent_buffers=group_persistent_buffers,
                     )
                     result = placement.finish_prepared_unshard(group_prepared)
-                finish_buffers.append(gathered)
+                buffers.append(gathered)
                 for index, full_param in zip(
                     group.indices,
                     result.full_params,
                     strict=True,
                 ):
                     full_params[index] = full_param
-                finish_buffers.extend(result.buffers)
-                finish_buffers.extend(result.finish_buffers)
-                consumer_buffers.extend(result.consumer_buffers)
+                buffers.extend(result.buffers)
+                persistent_buffers.extend(result.persistent_buffers)
 
         ordered_full_params: list[torch.Tensor] = []
         for full_param in full_params:
@@ -566,8 +579,8 @@ class MixedBucketPlacement(Placement):
             ordered_full_params.append(full_param)
         return PlacementUnshardResult(
             full_params=ordered_full_params,
-            finish_buffers=finish_buffers,
-            consumer_buffers=consumer_buffers,
+            buffers=buffers,
+            persistent_buffers=persistent_buffers,
         )
 
     def prepare_reduce_grad(
@@ -885,6 +898,13 @@ def _group_local_params_by_placement(
         else:
             groups.append([local_param])
     return groups
+
+
+def _num_persistent_buffers(placement: Placement, num_params: int) -> int:
+    """persistent buffers a group's persistent unshard returns (see finish)."""
+    # Fp8 groups back all params with one compact buffer; Shard and
+    # BlockShard groups back each param with its own buffer.
+    return 1 if isinstance(placement, Fp8BucketedBlockShard) else num_params
 
 
 def _collective_placement(

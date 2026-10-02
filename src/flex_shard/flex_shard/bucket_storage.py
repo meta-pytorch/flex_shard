@@ -9,7 +9,7 @@ from __future__ import annotations
 import fnmatch
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Literal, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -29,7 +29,6 @@ if TYPE_CHECKING:
         LocalStorageLayout,
         Placement,
     )
-    from .reshard_after_forward import _ReshardAfterForwardRecomputeState
 
 
 BucketParamFQNsByIndex = list[list[str]]
@@ -119,10 +118,9 @@ class BucketSpec:
             ``dist.ReduceOp.SUM`` matches FSDP2's no-gradient-division mode,
             where the training loop owns global gradient scaling.
         reshard_after_forward: Whether to free this bucket's unsharded
-            parameters after forward and recompute them in backward. This
-            defaults to True. Buckets that reshard after forward must have
-            hooks that run in both the original forward and activation
-            checkpoint recomputation.
+            parameters after forward and re-gather them before backward. This
+            defaults to True. Under ``torch.compile`` the traced graph owns
+            buffer lifetimes instead.
     """
 
     patterns: list[str]
@@ -175,6 +173,9 @@ class ParamInfo:
     # Outer (TP/EP) layout declared by the input param; ``global_shape`` is then
     # the outer local shape.
     outer_layout: GlobalLayout | None = None
+    # Python attributes of the original parameter (e.g. framework tags), copied
+    # onto its persistent unsharded parameter.
+    param_attrs: dict[str, Any] = field(default_factory=dict)
 
     @property
     def placement(self) -> Placement:
@@ -201,7 +202,7 @@ class ShardedBucketStorage:
     exposed tensor view; ShardedBucketStorage only places those layouts
     sequentially in one byte buffer.
 
-    Communication is delegated to eager hooks and parameter accessors; this
+    Communication is delegated to the bucket runtime's forward hooks; this
     bucket storage object owns the byte buffer and metadata.
     """
 
@@ -226,9 +227,6 @@ class ShardedBucketStorage:
         self._gradient_reduce_op = gradient_reduce_op
         for info in self._param_infos.values():
             info.gradient_reduce_op = self._gradient_reduce_op
-        self._reshard_after_forward_recompute_state: (
-            _ReshardAfterForwardRecomputeState | None
-        ) = None
 
     @classmethod
     def from_bucket(
@@ -500,6 +498,7 @@ class ShardedBucketStorage:
             global_numel=param.numel(),
             bucket_layout=bucket_layout,
             outer_layout=get_global_layout(param),
+            param_attrs=dict(vars(param)),
         )
 
     def copy_params_from(
