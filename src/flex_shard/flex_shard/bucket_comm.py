@@ -294,7 +294,6 @@ class AsyncUnshardResult(UnshardHandle):
                 self._result.full_params,
                 self.prepared.buffers,
                 self._result.buffers,
-                self._result.finish_buffers,
                 self._result.consumer_buffers,
             )
             or self._device
@@ -344,13 +343,11 @@ class AsyncUnshardResult(UnshardHandle):
         consumer_buffers: list[torch.Tensor] = []
         if self._result is not None:
             finish_buffers.extend(self._result.buffers)
-            finish_buffers.extend(self._result.finish_buffers)
             consumer_buffers.extend(self._result.consumer_buffers)
 
         self.prepared.buffers.clear()
         if self._result is not None:
             self._result.buffers.clear()
-            self._result.finish_buffers.clear()
             self._result.consumer_buffers.clear()
         return finish_buffers, consumer_buffers
 
