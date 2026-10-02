@@ -279,6 +279,33 @@ class Placement(ABC):
         """Finish the prepared unshard and return full parameters."""
         raise NotImplementedError
 
+    def supports_persistent_unsharded_params(self) -> bool:
+        """Return whether unshard outputs fit a dense persistent parameter.
+
+        Placements whose unshard produces a tensor subclass the module consumes
+        directly (e.g. blockwise-fp8 weights) return False; their buckets use
+        the legacy property-getter path.
+        """
+        return True
+
+    def supports_copy_out_destinations(self) -> bool:
+        """Return whether finish can copy into ``prepared.copy_out_destinations``.
+
+        Persistent unsharded parameters pass their storage as destinations so
+        the unshard copy-out writes into them directly. Placements that return
+        False produce fresh tensors, which the runtime then copies.
+        """
+        return False
+
+    def unshard_storage_numel(self, info: ParamInfo, world_size: int) -> int:
+        """Elements of storage a copy-out destination needs for ``info``.
+
+        Defaults to the full parameter size. Placements whose copy-out writes a
+        padded buffer (e.g. ``Shard`` with uneven dim-0) return the padded size.
+        """
+        _ = world_size
+        return info.global_numel
+
     def prepare_reduce_grad(
         self,
         tensors: list[torch.Tensor],
@@ -310,6 +337,10 @@ class PlacementPreparedUnshard:
     placement: Placement
     buffers: list[torch.Tensor]
     placement_state: Any
+    # Persistent unsharded parameters to copy into, one per param, when the
+    # placement supports it. Each tensor's storage holds at least
+    # ``unshard_storage_numel`` elements.
+    copy_out_destinations: list[torch.Tensor] | None = None
 
 
 @dataclass
