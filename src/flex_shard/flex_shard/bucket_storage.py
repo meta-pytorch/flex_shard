@@ -224,6 +224,9 @@ class ShardedBucketStorage:
         self._total_bytes = total_bytes
         self._module = module
         self._reshard_after_forward = reshard_after_forward
+        # See set_requires_gradient_sync and set_reshard_after_backward.
+        self._requires_gradient_sync = True
+        self._reshard_after_backward = True
         self._gradient_reduce_op = gradient_reduce_op
         for info in self._param_infos.values():
             info.gradient_reduce_op = self._gradient_reduce_op
@@ -579,6 +582,22 @@ class ShardedBucketStorage:
         self._gradient_reduce_op = op
         for info in self._param_infos.values():
             info.gradient_reduce_op = op
+
+    def set_requires_gradient_sync(self, requires_gradient_sync: bool) -> None:
+        """Set whether backward reduce-scatters this bucket's gradients.
+
+        ``FlexShardModule.set_requires_gradient_sync`` documents the behavior
+        and sets every bucket.
+        """
+        self._requires_gradient_sync = requires_gradient_sync
+
+    def set_reshard_after_backward(self, reshard_after_backward: bool) -> None:
+        """Set whether a backward without gradient sync reshards this bucket.
+
+        ``FlexShardModule.set_reshard_after_backward`` documents the behavior
+        and sets every bucket.
+        """
+        self._reshard_after_backward = reshard_after_backward
 
     @property
     def world_size(self) -> int:
