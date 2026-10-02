@@ -180,6 +180,13 @@ class BucketSpec:
             parameters after forward and re-gather them before backward. This
             defaults to True. Under ``torch.compile`` the traced graph owns
             buffer lifetimes instead.
+        main_grad: Whether to expose each unsharded parameter's grad as
+            ``param.main_grad``, for kernels that add weight grads into it in
+            place and give autograd none, such as TransformerEngine's
+            ``fuse_wgrad_accumulation`` and Megatron-LM's gradient accumulation
+            fusion. Before this bucket's backward, a missing grad is allocated
+            zeroed in the param's accumulation dtype; the reduce-scatter frees
+            it and the alias. Eager only.
     """
 
     patterns: list[str]
@@ -189,6 +196,7 @@ class BucketSpec:
     offload_policy: OffloadPolicy | None = None
     gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG
     reshard_after_forward: bool = True
+    main_grad: bool = False
 
 
 @dataclass(frozen=True)
@@ -293,6 +301,7 @@ class ShardedBucketStorage:
         module: nn.Module,
         reshard_after_forward: bool = True,
         gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG,
+        main_grad: bool = False,
     ) -> None:
         if byte_storage.dtype != torch.uint8:
             raise ValueError(f"Expected uint8 storage, got {byte_storage.dtype}")
@@ -302,6 +311,7 @@ class ShardedBucketStorage:
         self._total_bytes = total_bytes
         self._module = module
         self._reshard_after_forward = reshard_after_forward
+        self._main_grad = main_grad
         # See set_requires_gradient_sync and set_reshard_after_backward.
         self._requires_gradient_sync = True
         self._reshard_after_backward = True
@@ -347,6 +357,7 @@ class ShardedBucketStorage:
             module,
             reshard_after_forward=bucket_spec.reshard_after_forward,
             gradient_reduce_op=bucket_spec.gradient_reduce_op,
+            main_grad=bucket_spec.main_grad,
         )
         bucket_storage.copy_params_from(named_params)
         bucket_storage.install_sharded_params(expected_param_device)

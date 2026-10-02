@@ -6,6 +6,7 @@
 
 import copy
 import dataclasses
+import weakref
 from collections import Counter
 from unittest import mock
 
@@ -116,6 +117,40 @@ class _AccumulatingWeights(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.a(x) + self.b(x)
+
+
+class _FusedWgradLinearFn(torch.autograd.Function):
+    """``x @ weight.t()`` whose backward adds the weight grad into
+    ``weight.main_grad`` in place and gives autograd none, like
+    TransformerEngine's ``fuse_wgrad_accumulation``."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(x, weight)
+        # The parameter object carrying main_grad, as TransformerEngine keeps it.
+        ctx.weight_ref = weakref.ref(weight)
+        return x @ weight.t()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        x, weight = ctx.saved_tensors
+        main_grad = ctx.weight_ref().main_grad
+        main_grad.add_(grad_output.t().to(main_grad.dtype) @ x.to(main_grad.dtype))
+        return grad_output @ weight, None
+
+
+class _FusedWgradLinear(torch.nn.Module):
+    """A linear layer with fused weight-grad accumulation and an ordinary bias."""
+
+    def __init__(self, *, device: torch.device, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(8, 8, device=device, dtype=dtype))
+        self.bias = torch.nn.Parameter(torch.randn(8, device=device, dtype=dtype))
+        self.weights_seen: list[torch.Tensor] = []
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.weights_seen.append(self.weight)
+        return _FusedWgradLinearFn.apply(x, self.weight) + self.bias
 
 
 def _init_params_deterministically(model: torch.nn.Module) -> None:
@@ -983,6 +1018,75 @@ class TestFlexShardTraining(FSDPTest):
         optim.step()
         ref_optim.step()
         check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
+
+    @skip_if_lt_x_gpu(2)
+    def test_main_grad_fused_accumulation(self):
+        # Fused gradient accumulation adds weight grads into main_grad and
+        # gives autograd none. BucketSpec(main_grad=True) aliases each unsharded
+        # param's grad as main_grad before its bucket's backward, so the fused
+        # weight grads and the bias's autograd grads accumulate there over two
+        # backwards without sync, and the third reduce-scatters them and drops
+        # the alias. The first bucket reshards after forward, so its backward
+        # re-gathers before aliasing.
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+        for dtype, reduce_dtype in (
+            (torch.float32, None),
+            (torch.bfloat16, torch.float32),
+        ):
+            grad_dtype = reduce_dtype or dtype
+            with self.subTest(dtype=dtype):
+                torch.manual_seed(0)
+                model = torch.nn.Sequential(
+                    _FusedWgradLinear(device=device_type, dtype=dtype),
+                    _FusedWgradLinear(device=device_type, dtype=dtype),
+                )
+                reference = copy.deepcopy(model)
+                # As Megatron-LM's wrapper does, so the local shards keep
+                # grads in the accumulation dtype too.
+                for param in (*model.parameters(), *reference.parameters()):
+                    param.grad_dtype = grad_dtype
+                for layer in reference:
+                    layer.weight.main_grad = torch.zeros_like(
+                        layer.weight, dtype=grad_dtype
+                    )
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            [f"{idx}.*"],
+                            placement_fn=per_param_placements,
+                            mesh=mesh,
+                            mp_policy=MixedPrecisionPolicy(reduce_dtype=reduce_dtype),
+                            reshard_after_forward=idx == 0,
+                            main_grad=True,
+                        )
+                        for idx in range(2)
+                    ],
+                )
+                torch.manual_seed(1 + self.rank)
+                for idx in range(3):
+                    x = torch.randn(4, 8, device=device_type, dtype=dtype)
+                    model.set_requires_gradient_sync(idx == 2)
+                    model(x).float().sum().backward()
+                    reference(x).float().sum().backward()
+                    for layer in model:
+                        weight = layer.weights_seen[-1]
+                        if idx < 2:
+                            self.assertIs(weight.main_grad, weight.grad)
+                            self.assertEqual(weight.grad.dtype, grad_dtype)
+                        else:
+                            self.assertIsNone(weight.grad)
+                            self.assertFalse(hasattr(weight, "main_grad"))
+                for layer in reference:
+                    layer.weight.grad = layer.weight.main_grad
+                _average_reference_grads(reference)
+                check_flex_shard_parity(
+                    self, reference, model, self.rank, self.world_size
+                )
 
 
 if __name__ == "__main__":
