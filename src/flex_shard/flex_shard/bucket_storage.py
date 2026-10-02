@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import fnmatch
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, TYPE_CHECKING
@@ -30,7 +29,6 @@ if TYPE_CHECKING:
         LocalStorageLayout,
         Placement,
     )
-    from .reshard_after_forward import _ReshardAfterForwardRecomputeState
 
 
 BucketParamFQNsByIndex = list[list[str]]
@@ -120,21 +118,8 @@ class BucketSpec:
             ``dist.ReduceOp.SUM`` matches FSDP2's no-gradient-division mode,
             where the training loop owns global gradient scaling.
         reshard_after_forward: Whether to free this bucket's unsharded
-            parameters after forward and recompute them in backward. This
-            defaults to True. Buckets that reshard after forward must have
-            hooks that run in both the original forward and activation
-            checkpoint recomputation.
-        persistent_unsharded_params: Whether module code sees a persistent
-            unsharded ``nn.Parameter`` per managed parameter (FSDP2-style). It
-            is created from the first unshard; the placement-owned storage
-            backing it is freed with ``untyped_storage().resize_(0)`` on reshard
-            and re-allocated and refilled in place on later unshards. It is
-            swapped into the owning module's ``_parameters`` while unsharded,
-            so attribute reads and ``module.parameters()`` see it in forward and
-            backward. Gradients accumulate into it through autograd and are
-            then reduce-scattered into the local shard. Defaults to True (see
-            ``_default_persistent_unsharded_params``). False selects the legacy
-            property-getter path.
+            parameters after forward and re-gather them before backward. This
+            defaults to True.
     """
 
     patterns: list[str]
@@ -144,19 +129,6 @@ class BucketSpec:
     offload_policy: OffloadPolicy | None = None
     gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG
     reshard_after_forward: bool = True
-    persistent_unsharded_params: bool = field(
-        default_factory=lambda: _default_persistent_unsharded_params()
-    )
-
-
-def _default_persistent_unsharded_params() -> bool:
-    """Default for ``BucketSpec.persistent_unsharded_params``.
-
-    Transitional: ``FLEX_SHARD_PERSISTENT_UNSHARDED_PARAMS=0`` selects the legacy
-    property-getter path, so whole test suites can A/B both paths. Removed with
-    the legacy path.
-    """
-    return os.environ.get("FLEX_SHARD_PERSISTENT_UNSHARDED_PARAMS", "1") != "0"
 
 
 @dataclass(frozen=True)
@@ -229,7 +201,7 @@ class ShardedBucketStorage:
     exposed tensor view; ShardedBucketStorage only places those layouts
     sequentially in one byte buffer.
 
-    Communication is delegated to eager hooks and parameter accessors; this
+    Communication is delegated to the bucket runtime's forward hooks; this
     bucket storage object owns the byte buffer and metadata.
     """
 
@@ -242,7 +214,6 @@ class ShardedBucketStorage:
         module: nn.Module,
         reshard_after_forward: bool = True,
         gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG,
-        persistent_unsharded_params: bool = False,
     ) -> None:
         if byte_storage.dtype != torch.uint8:
             raise ValueError(f"Expected uint8 storage, got {byte_storage.dtype}")
@@ -252,13 +223,9 @@ class ShardedBucketStorage:
         self._total_bytes = total_bytes
         self._module = module
         self._reshard_after_forward = reshard_after_forward
-        self._persistent_unsharded_params = persistent_unsharded_params
         self._gradient_reduce_op = gradient_reduce_op
         for info in self._param_infos.values():
             info.gradient_reduce_op = self._gradient_reduce_op
-        self._reshard_after_forward_recompute_state: (
-            _ReshardAfterForwardRecomputeState | None
-        ) = None
 
     @classmethod
     def from_bucket(
@@ -299,7 +266,6 @@ class ShardedBucketStorage:
             module,
             reshard_after_forward=bucket_spec.reshard_after_forward,
             gradient_reduce_op=bucket_spec.gradient_reduce_op,
-            persistent_unsharded_params=bucket_spec.persistent_unsharded_params,
         )
         bucket_storage.copy_params_from(named_params)
         bucket_storage.install_sharded_params(expected_param_device)

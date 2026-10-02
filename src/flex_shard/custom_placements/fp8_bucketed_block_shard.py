@@ -1101,10 +1101,9 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         """All-gather packed fp8 data and fp32 scale bytes in one collective.
 
         Each rank's payload is padded to the same size, so the collective writes
-        directly into one flat output tensor. Reshard-after-forward tags the
-        semantic unshard op ``MUST_RECOMPUTE`` -- so the gathered fp8 weight is
-        freed after forward and re-gathered in backward. The local packed payload
-        is reused while its dense source shards remain unchanged. Both fp8 data
+        directly into one flat output tensor. Reshard-after-forward frees the
+        compacted fp8 weight after forward and re-gathers it before backward.
+        The local packed payload is reused while its dense source shards remain unchanged. Both fp8 data
         and fp32 scale bit patterns are transported as uint8, making the
         collective dtype-agnostic.
         """

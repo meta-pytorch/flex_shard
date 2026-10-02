@@ -36,7 +36,6 @@ from ..flex_shard.placement_contract import (
     PlacementPreparedUnshard,
     PlacementUnshardResult,
 )
-from ..flex_shard.unshard_op import mark_unshard_bucket
 from ..flex_shard.utils import (
     _record_copy_in_if_eager,
     _record_copy_out_if_eager,
@@ -251,25 +250,6 @@ class TestBlockwiseFp8Weight(TestCase):
         self.assertEqual(
             wrapped.dequantize(torch.float32),
             wrapped.fp8_data.float() * 0.5,
-        )
-
-    def test_mark_unshard_bucket_preserves_blockwise_fp8_weight(self) -> None:
-        wrapped = _make_blockwise_fp8_weight()
-
-        (marked,) = mark_unshard_bucket([wrapped])
-
-        self.assertIsInstance(marked, BlockwiseFp8Weight)
-        self.assertIsNot(marked, wrapped)
-        self.assertTrue(marked.requires_grad)
-        self.assertEqual(marked.block_size, wrapped.block_size)
-        self.assertEqual(marked.orig_dtype, wrapped.orig_dtype)
-        self.assertEqual(
-            marked.fp8_data.untyped_storage().data_ptr(),
-            wrapped.fp8_data.untyped_storage().data_ptr(),
-        )
-        self.assertEqual(
-            marked.recip_scale.untyped_storage().data_ptr(),
-            wrapped.recip_scale.untyped_storage().data_ptr(),
         )
 
 

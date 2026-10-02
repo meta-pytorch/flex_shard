@@ -4,14 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import torch
 import torch.nn as nn
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 from .. import is_flex_shard_param
-from ..flex_shard import bucket_runtime, unsharded_param_getters
+from ..flex_shard import bucket_runtime
 from .common import (
     flex_shard_cuda,
     flex_shard_transformer_model,
@@ -29,11 +29,8 @@ class TestFlexShardEagerRuntime(TestCase):
             bucket_params=[
                 bucket_runtime.BucketParam(
                     param_owner=bucket_runtime.ParamOwnerRef(module, "weight"),
-                    unsharded_param_slot=unsharded_param_getters.UnshardedParamSlot(
-                        param_fqn="weight",
-                        bucket_fqn=None,
-                    ),
                     param_info=Mock(),
+                    sharded_param=module.weight,
                 )
             ],
             context=Mock(),
@@ -47,17 +44,6 @@ class TestFlexShardEagerRuntime(TestCase):
 
         self.assertFalse(local_shard.requires_grad)
         self.assertEqual(local_shard._version, original_version + 1)
-
-    def test_raf_saved_tensor_registry_ignores_reused_python_id(self):
-        context = unsharded_param_getters._RafSavedTensorContext()
-        registered_tensor = torch.ones(1)
-        handle = object()
-
-        with patch.object(unsharded_param_getters, "id", return_value=1, create=True):
-            context.register(registered_tensor, handle)
-            del registered_tensor
-            unrelated_tensor = torch.ones(1)
-            self.assertIs(context.pack(unrelated_tensor), unrelated_tensor)
 
     def test_meta_to_empty_materializes_bucket_storage_and_runtime(self):
         with single_rank_cuda_mesh() as mesh:

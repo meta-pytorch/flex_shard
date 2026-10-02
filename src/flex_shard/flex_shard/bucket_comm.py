@@ -86,10 +86,6 @@ class UnshardLease:
     # PlacementUnshardResult.persistent_buffers).
     persistent_buffers: list[torch.Tensor] = field(default_factory=list)
 
-    def has_consumer_buffers(self) -> bool:
-        """Return whether this lease owns storage needed by a consumer."""
-        return self.consumer_handoff is not None
-
     def take_full_params(self) -> list[torch.Tensor]:
         """Transfer full-parameter references while retaining buffer ownership."""
         full_params = self.full_params
@@ -150,12 +146,11 @@ def begin_bucket_unshard(
     mesh: DeviceMesh,
     unshard_stream: torch.Stream,
     debug_fqn: str | None = None,
-    persistent: bool = False,
 ) -> UnshardHandle:
     """Begin a bucket unshard and return a handle for full params.
 
-    ``persistent`` requests a persistent unshard (eager only; see
-    ``PlacementPreparedUnshard``).
+    Eager unshards are persistent (see ``PlacementPreparedUnshard``); during
+    graph capture the traced graph owns buffer lifetimes.
     """
     placement = _get_bucket_placement(infos, "unshard")
 
@@ -171,7 +166,7 @@ def begin_bucket_unshard(
     with device_handle.stream(unshard_stream):
         unshard_stream.wait_event(copy_in_done)
         prepared = placement.prepare_unshard_bucket(tensors, infos, mesh, debug_fqn)
-        prepared.persistent = persistent
+        prepared.persistent = True
         prepared.placement.run_prepared_unshard(prepared)
         event = device_handle.Event()
         event.record(unshard_stream)

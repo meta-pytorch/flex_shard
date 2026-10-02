@@ -361,14 +361,14 @@ class TestPersistentUnshardedParams(TestCase):
             # While unsharded, each persistent param is backed by a persistent buffer.
             buffer_ptrs = set()
             for bucket in _buckets(model):
-                bucket.pre_forward_persistent()
+                bucket.unshard(backward=False)
                 buffer_ptrs.update(
                     buffer.untyped_storage().data_ptr()
                     for buffer in bucket.persistent_buffers
                 )
                 for param in bucket.unsharded_params:
                     self.assertIn(param.untyped_storage().data_ptr(), buffer_ptrs)
-                bucket.reshard_persistent()
+                bucket.reshard()
 
     def test_persistent_param_inherits_attributes(self):
         with single_rank_cuda_mesh() as mesh:

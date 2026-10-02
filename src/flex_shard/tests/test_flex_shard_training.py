@@ -232,8 +232,6 @@ class TestFlexShardTraining(FSDPTest):
         placement_fn,
         placement_type,
         run_backward,
-        expect_reuse_before_forward,
-        expect_reuse_after_forward,
     ):
         width = 1024
         x = torch.ones(
@@ -266,8 +264,6 @@ class TestFlexShardTraining(FSDPTest):
                     placement_fn=placement_fn,
                     mesh=mesh,
                     reshard_after_forward=False,
-                    # Checks legacy unshard-lease buffer lifetimes.
-                    persistent_unsharded_params=False,
                 )
             ],
         )
@@ -311,11 +307,7 @@ class TestFlexShardTraining(FSDPTest):
             nonlocal reused_before_forward
             reused_before_forward = try_reuse_gathered_buffer()
 
-        before_forward_hook = (
-            model[0].register_forward_pre_hook(probe_before_forward)
-            if expect_reuse_before_forward is not None
-            else None
-        )
+        before_forward_hook = model[0].register_forward_pre_hook(probe_before_forward)
         with mock.patch.object(
             placement_type,
             "finish_prepared_unshard",
@@ -326,16 +318,11 @@ class TestFlexShardTraining(FSDPTest):
             else:
                 with torch.no_grad():
                     output = model[0](x)
-        if before_forward_hook is not None:
-            before_forward_hook.remove()
+        before_forward_hook.remove()
 
-        if expect_reuse_before_forward is not None:
-            self.assertEqual(reused_before_forward, expect_reuse_before_forward)
-        if expect_reuse_after_forward is not None:
-            self.assertEqual(
-                try_reuse_gathered_buffer(),
-                expect_reuse_after_forward,
-            )
+        # The unshard copied the gathered bucket into the persistent buffers, so
+        # the all-gather output is reusable before module compute and backward.
+        self.assertTrue(reused_before_forward)
         if not run_backward:
             self.assertEqual(output, x)
             return
@@ -344,7 +331,6 @@ class TestFlexShardTraining(FSDPTest):
         backward_delay_done = torch.cuda.Event()
         backward_delay_done.record()
         output.sum().backward()
-        self.assertTrue(try_reuse_gathered_buffer())
         self.assertTrue(backward_delay_done.query())
         self.assertEqual(x.grad, torch.ones_like(x))
 
@@ -360,22 +346,13 @@ class TestFlexShardTraining(FSDPTest):
             blocks_per_rank=(1, 1),
         )
         cases = (
-            ("shard", per_param_placements, Shard, False, True, None),
-            (
-                "bucketed_block",
-                bucketed_block_placements,
-                BucketedBlockShard,
-                False,
-                False,
-                True,
-            ),
+            ("shard", per_param_placements, Shard, False),
+            ("bucketed_block", bucketed_block_placements, BucketedBlockShard, False),
             (
                 "bucketed_block_backward",
                 bucketed_block_placements,
                 BucketedBlockShard,
                 True,
-                None,
-                False,
             ),
         )
         for case in cases:
@@ -582,15 +559,6 @@ class TestFlexShardTraining(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_reshard_after_forward_with_activation_checkpointing(self):
-        for persistent in (True, False):
-            with self.subTest(persistent_unsharded_params=persistent):
-                self._check_reshard_after_forward_with_activation_checkpointing(
-                    persistent
-                )
-
-    def _check_reshard_after_forward_with_activation_checkpointing(
-        self, persistent: bool
-    ):
         mesh = init_device_mesh(
             device_type.type,
             (self.world_size,),
@@ -612,37 +580,15 @@ class TestFlexShardTraining(FSDPTest):
                 args.n_layers,
                 mesh,
                 reshard_after_forward=True,
-                persistent_unsharded_params=persistent,
             ),
         )
 
+        # FlexShard leaves the user's activation-checkpoint wrapper untouched.
         self.assertIsInstance(model.layers[0], CheckpointWrapper)
-        if not persistent:
-            # Legacy buckets compose FlexShard's recompute policy into the
-            # user's activation-checkpoint wrapper; persistent buckets don't.
-            composed_context_fn = model.layers[0].checkpoint_fn.keywords["context_fn"]
-            self.assertIsNot(composed_context_fn, _prefer_recompute_context_fn)
-            forward_ctx, _ = composed_context_fn()
-            from ..flex_shard.unshard_op import UNSHARD_BUCKET_OP
-
-            self.assertEqual(
-                forward_ctx.policy_fn(
-                    None,
-                    UNSHARD_BUCKET_OP,
-                ),
-                CheckpointPolicy.MUST_RECOMPUTE,
-            )
-            self.assertEqual(
-                forward_ctx.policy_fn(None, torch.ops.aten.mm.default),
-                CheckpointPolicy.PREFER_RECOMPUTE,
-            )
-            self.assertEqual(
-                forward_ctx.policy_fn(
-                    None,
-                    torch.ops._c10d_functional.all_to_all_single.default,
-                ),
-                CheckpointPolicy.PREFER_RECOMPUTE,
-            )
+        self.assertIs(
+            model.layers[0].checkpoint_fn.keywords["context_fn"],
+            _prefer_recompute_context_fn,
+        )
 
         torch.manual_seed(42 + self.rank + 1)
         x = transformer_inputs(args, batch_size=3, device=device_type)
@@ -665,25 +611,45 @@ class TestFlexShardTraining(FSDPTest):
         check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
 
     @skip_if_lt_x_gpu(2)
-    def test_reshard_after_forward_grouped_root_rest_bucket_unsupported(self):
+    def test_reshard_after_forward_grouped_root_rest_bucket(self):
+        # The root/rest bucket hooks the root module while its children are
+        # checkpointed: its params stay unsharded from the root's pre-backward
+        # hook through every child's recompute.
         mesh = init_device_mesh(
             device_type.type,
             (self.world_size,),
             mesh_dim_names=("fsdp",),
         )
 
-        args, model = make_transformer_model(device=device_type.type, n_layers=2)
+        args, model = make_transformer_model(
+            device=device_type.type,
+            n_layers=2,
+            vocab_size=15,
+        )
+        _init_params_deterministically(model)
+        reference = copy.deepcopy(model)
         _checkpoint_transformer_execution_units(model)
+        _checkpoint_transformer_execution_units(reference)
 
-        with self.assertRaisesRegex(RuntimeError, "recomputation-safe"):
-            flex_shard(
-                model,
-                buckets=_layer_buckets_with_grouped_root_rest(
-                    args.n_layers,
-                    mesh,
-                    reshard_after_forward=True,
-                ),
-            )
+        flex_shard(
+            model,
+            buckets=_layer_buckets_with_grouped_root_rest(
+                args.n_layers,
+                mesh,
+                reshard_after_forward=True,
+            ),
+        )
+
+        torch.manual_seed(42 + self.rank + 1)
+        x = transformer_inputs(args, batch_size=3, device=device_type)
+        loss = model(x).sum()
+        ref_loss = reference(x).sum()
+        self.assertEqual(loss, ref_loss)
+        loss.backward()
+        ref_loss.backward()
+
+        _average_reference_grads(reference)
+        check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
 
 
 if __name__ == "__main__":
