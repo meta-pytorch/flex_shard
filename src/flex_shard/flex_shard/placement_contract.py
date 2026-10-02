@@ -314,6 +314,8 @@ class PlacementPreparedUnshard:
     ``PlacementUnshardResult.persistent_buffers``. On later unshards
     ``persistent_buffers`` holds those buffers, with storage re-allocated by
     the caller, and finish writes the new values into them in the same layout.
+    Eager unshards are persistent. During graph capture they are not, and the
+    full params may view gathered buffers whose lifetime the traced graph owns.
     """
 
     placement: Placement
@@ -325,24 +327,19 @@ class PlacementPreparedUnshard:
 
 @dataclass
 class PlacementUnshardResult:
-    """Full parameters and buffers with post-finish lifetime requirements.
+    """Full parameters and the buffers behind them.
 
-    ``buffers`` preserves the legacy finish lifetime for custom
-    placements. New placements should classify storage explicitly.
-    ``finish_buffers`` are tensors created during finish that may be released
-    after its copy-out work. ``consumer_buffers`` are the minimal storage roots
-    backing full-parameter views and must remain live through their consumer.
-    ``persistent_buffers`` (persistent unshards only) are the storage backing
-    ``full_params`` that the caller keeps across unshards: it frees their
-    storage on reshard and re-allocates it before the next unshard refills
-    them. They correspond to FSDP2's all-gather outputs and unsharded inner
-    tensors.
+    ``buffers`` are tensors created during finish; like the prepared buffers,
+    the bucket runtime releases them once the work finish queued (e.g. a
+    copy-out) is ordered. ``persistent_buffers`` (persistent unshards only) are
+    the storage backing ``full_params`` that the caller keeps across unshards:
+    it frees their storage on reshard and re-allocates it before the next
+    unshard refills them. They correspond to FSDP2's all-gather outputs and
+    unsharded inner tensors.
     """
 
     full_params: list[torch.Tensor]
     buffers: list[torch.Tensor] = field(default_factory=list)
-    finish_buffers: list[torch.Tensor] = field(default_factory=list)
-    consumer_buffers: list[torch.Tensor] = field(default_factory=list)
     persistent_buffers: list[torch.Tensor] = field(default_factory=list)
 
 

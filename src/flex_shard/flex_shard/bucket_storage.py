@@ -119,7 +119,8 @@ class BucketSpec:
             where the training loop owns global gradient scaling.
         reshard_after_forward: Whether to free this bucket's unsharded
             parameters after forward and re-gather them before backward. This
-            defaults to True.
+            defaults to True. Under ``torch.compile`` the traced graph owns
+            buffer lifetimes instead.
     """
 
     patterns: list[str]

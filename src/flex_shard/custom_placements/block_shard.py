@@ -994,15 +994,9 @@ class BucketedBlockShard(Placement):
                     info.global_shape
                 )
             )
-        if prepared.persistent:
-            return PlacementUnshardResult(
-                full_params=full_params,
-                finish_buffers=[gathered_bucket],
-                persistent_buffers=[bucket],
-            )
         return PlacementUnshardResult(
             full_params=full_params,
-            consumer_buffers=[gathered_bucket],
+            persistent_buffers=[bucket] if prepared.persistent else [],
         )
 
     @override

@@ -516,8 +516,7 @@ class MixedBucketPlacement(Placement):
         full_params: list[torch.Tensor | None] = [None] * sum(
             len(group.indices) for group in state.groups
         )
-        finish_buffers: list[torch.Tensor] = []
-        consumer_buffers: list[torch.Tensor] = []
+        buffers: list[torch.Tensor] = []
         persistent_buffers: list[torch.Tensor] = []
         buffer_offset = 0
         with _record_copy_out_if_eager():
@@ -563,16 +562,14 @@ class MixedBucketPlacement(Placement):
                         persistent_buffers=group_persistent_buffers,
                     )
                     result = placement.finish_prepared_unshard(group_prepared)
-                finish_buffers.append(gathered)
+                buffers.append(gathered)
                 for index, full_param in zip(
                     group.indices,
                     result.full_params,
                     strict=True,
                 ):
                     full_params[index] = full_param
-                finish_buffers.extend(result.buffers)
-                finish_buffers.extend(result.finish_buffers)
-                consumer_buffers.extend(result.consumer_buffers)
+                buffers.extend(result.buffers)
                 persistent_buffers.extend(result.persistent_buffers)
 
         ordered_full_params: list[torch.Tensor] = []
@@ -582,8 +579,7 @@ class MixedBucketPlacement(Placement):
             ordered_full_params.append(full_param)
         return PlacementUnshardResult(
             full_params=ordered_full_params,
-            finish_buffers=finish_buffers,
-            consumer_buffers=consumer_buffers,
+            buffers=buffers,
             persistent_buffers=persistent_buffers,
         )
 

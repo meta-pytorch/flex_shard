@@ -642,9 +642,10 @@ class TestFp8AllGatherLayout(TestCase):
                 local_packed[scale_start:payload_end]
             )
 
+        prepared.persistent = True
         result = placement._finish_unshard_from_rank_rows(prepared, rank_rows)
-        self.assertEqual(len(result.consumer_buffers), 1)
-        compact = result.consumer_buffers[0]
+        self.assertEqual(len(result.persistent_buffers), 1)
+        compact = result.persistent_buffers[0]
         expected_fp8_nbytes = sum(param.numel() for _, param in named_params)
         self.assertNotEqual(expected_fp8_nbytes % torch.float32.itemsize, 0)
         self.assertIn(0, metadata.rank_fp8_numels)

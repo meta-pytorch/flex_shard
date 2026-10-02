@@ -42,7 +42,6 @@ from ..custom_placements.block_shard import BlockShard
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..custom_placements.owned import make_bucketed_owned_full_param_segments
 from ..custom_placements.shard import per_param_placements, Shard
-from ..flex_shard.bucket_comm import prepare_reduce_grad
 from ..flex_shard.bucket_storage import (
     _assign_params_to_buckets,
     ParamInfo,
@@ -520,9 +519,7 @@ class TestMixedBucketComposition(TestCase):
 
             self.assertEqual(result.full_params, local_params)
             uint8_groups = [
-                buffer
-                for buffer in result.finish_buffers
-                if buffer.dtype == torch.uint8
+                buffer for buffer in result.buffers if buffer.dtype == torch.uint8
             ]
             self.assertEqual(len(uint8_groups), 1)
             self.assertEqual(
@@ -713,12 +710,12 @@ class TestDistributedBuckets(FSDPTest):
             [originals[fqn] for fqn, _ in named_params],
         )
 
-        prepared_reduce = prepare_reduce_grad(
+        prepared_reduce = infos[0].placement.prepare_reduce_grad(
             [originals[fqn] for fqn, _ in named_params],
             infos,
             mesh,
             None,
-        ).prepared
+        )
         self.assertEqual(prepared_reduce.placement_state.row_numel, 14)
         shard_reduce_group = next(
             group

@@ -90,6 +90,10 @@ class FlexShardModule:
                 )
             bucket_storage.install_sharded_params(bucket_storage.byte_storage.device)
 
+        # Installed runtime hooks still hold the replaced local-shard params.
+        for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
+            for bucket in context.buckets:
+                bucket.reset_sharded_params()
         self._install_runtime_if_materialized()
 
     def _install_runtime_if_materialized(self) -> None:
@@ -105,6 +109,19 @@ class FlexShardModule:
 
         _install_bucket_unshard_hooks(bucket_storages)
         setattr(self, _EAGER_HOOKS_INSTALLED_ATTR, True)
+
+    def reshard(self) -> None:
+        """Reshard every unsharded bucket, like FSDP2's ``FSDPModule.reshard()``.
+
+        Buckets with ``reshard_after_forward=False`` stay unsharded after a
+        forward until its backward; call this when that backward will not run.
+        """
+        for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
+            context.take_pending_unshard(None)
+            for bucket in context.buckets:
+                if bucket.is_unsharded:
+                    bucket.reshard()
+                bucket.reset_backward_state()
 
     def set_gradient_reduce_op(
         self,

@@ -876,7 +876,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         infos: list[ParamInfo],
         rank: int,
     ) -> tuple[torch.Tensor, _Fp8BucketMetadata]:
-        """Cache one forward payload for its backward recomputation.
+        """Cache one forward payload for its backward re-gather.
 
         Some fused optimizers mutate parameters without advancing ``_version``.
         Forward therefore always refreshes the entry; backward may consume that
@@ -1299,14 +1299,9 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             scale_offset += scale_numel
         if fp8_offset != fp8_flat.numel() or scale_offset != scale_flat.numel():
             raise AssertionError("Compacted FP8 bucket metadata is inconsistent.")
-        if prepared.persistent:
-            return PlacementUnshardResult(
-                full_params=full_params,
-                persistent_buffers=[compact],
-            )
         return PlacementUnshardResult(
             full_params=full_params,
-            consumer_buffers=[compact],
+            persistent_buffers=[compact] if prepared.persistent else [],
         )
 
 
