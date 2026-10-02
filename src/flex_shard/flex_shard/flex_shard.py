@@ -14,6 +14,7 @@ import torch.nn as nn
 
 from .bucket_runtime import (
     _create_unsharded_param_slots,
+    ParamOwnerRef,
     _EAGER_COMM_CONTEXTS_ATTR,
     _install_bucket_unshard_hooks,
     _MAX_PENDING_REDUCE_GRADS_ATTR,
@@ -27,7 +28,10 @@ from .bucket_storage import (
 )
 from .reshard_after_forward import _apply_reshard_after_forward
 from .sharded_param import is_flex_shard_param
-from .unsharded_param_getters import _install_unsharded_param_getters
+from .unsharded_param_getters import (
+    _install_unsharded_param_getters,
+    UnshardedParamSlot,
+)
 from .utils import (
     _get_device_from_mesh,
     _get_managed_named_params,
@@ -254,12 +258,22 @@ def flex_shard(
         inputs.device,
     )
     setattr(module, _MODULE_PARAM_SLOTS_ATTR, module_param_slots)
-    _install_unsharded_param_getters(module_param_slots)
+    # Persistent-param buckets expose their parameters through the modules'
+    # ``_parameters`` instead, so only legacy buckets get property getters.
+    _install_unsharded_param_getters(
+        _legacy_param_slots(module, module_param_slots, bucket_storages)
+    )
 
-    # Reshard-after-forward: in eager mode, wrap each layer in checkpoint with
-    # a selective policy that recomputes only collective ops (all-gather,
-    # broadcast), saving compute ops to avoid redundant work.
-    reshard_bucket_storages = [s for s in bucket_storages if s._reshard_after_forward]
+    # Reshard-after-forward (legacy buckets): in eager mode, wrap each layer in
+    # checkpoint with a selective policy that recomputes only collective ops
+    # (all-gather, broadcast), saving compute ops to avoid redundant work.
+    # Persistent-param buckets free their storage after forward and re-gather
+    # in a pre-backward hook instead.
+    reshard_bucket_storages = [
+        s
+        for s in bucket_storages
+        if s._reshard_after_forward and not s._persistent_unsharded_params
+    ]
     if reshard_bucket_storages:
         _apply_reshard_after_forward(module, reshard_bucket_storages)
 
@@ -269,6 +283,25 @@ def flex_shard(
     flex_shard_module._install_runtime_if_materialized()
 
     return flex_shard_module
+
+
+def _legacy_param_slots(
+    module: nn.Module,
+    module_param_slots: dict[nn.Module, dict[str, UnshardedParamSlot]],
+    bucket_storages: list[ShardedBucketStorage],
+) -> dict[nn.Module, dict[str, UnshardedParamSlot]]:
+    """Return the slots of params in buckets without persistent params."""
+    legacy_slots: dict[nn.Module, dict[str, UnshardedParamSlot]] = {}
+    for bucket_storage in bucket_storages:
+        if bucket_storage._persistent_unsharded_params:
+            continue
+        for fqn in bucket_storage._param_infos:
+            param_owner = ParamOwnerRef.resolve(module, fqn)
+            slot = module_param_slots[param_owner.module][param_owner.param_name]
+            legacy_slots.setdefault(param_owner.module, {})[param_owner.param_name] = (
+                slot
+            )
+    return legacy_slots
 
 
 def _check_not_already_flex_sharded(module: nn.Module) -> None:

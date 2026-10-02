@@ -7,9 +7,10 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Literal, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -123,6 +124,17 @@ class BucketSpec:
             defaults to True. Buckets that reshard after forward must have
             hooks that run in both the original forward and activation
             checkpoint recomputation.
+        persistent_unsharded_params: Whether module code sees a persistent
+            unsharded ``nn.Parameter`` per managed parameter (FSDP2-style). Its
+            storage is allocated and filled on unshard and freed with
+            ``untyped_storage().resize_(0)`` on reshard; it is swapped into the
+            owning module's ``_parameters`` while unsharded, so attribute reads
+            and ``module.parameters()`` see it in forward and backward.
+            Gradients accumulate into it through autograd and are then
+            reduce-scattered into the local shard. Defaults to True (see
+            ``_default_persistent_unsharded_params``). False selects the legacy
+            property-getter path. Placements whose unshard output is a tensor
+            subclass (blockwise fp8) always use the legacy path.
     """
 
     patterns: list[str]
@@ -132,6 +144,19 @@ class BucketSpec:
     offload_policy: OffloadPolicy | None = None
     gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG
     reshard_after_forward: bool = True
+    persistent_unsharded_params: bool = field(
+        default_factory=lambda: _default_persistent_unsharded_params()
+    )
+
+
+def _default_persistent_unsharded_params() -> bool:
+    """Default for ``BucketSpec.persistent_unsharded_params``.
+
+    Transitional: ``FLEX_SHARD_PERSISTENT_UNSHARDED_PARAMS=0`` selects the legacy
+    property-getter path, so whole test suites can A/B both paths. Removed with
+    the legacy path.
+    """
+    return os.environ.get("FLEX_SHARD_PERSISTENT_UNSHARDED_PARAMS", "1") != "0"
 
 
 @dataclass(frozen=True)
@@ -175,6 +200,9 @@ class ParamInfo:
     # Outer (TP/EP) layout declared by the input param; ``global_shape`` is then
     # the outer local shape.
     outer_layout: GlobalLayout | None = None
+    # Python attributes of the original parameter (e.g. framework tags), copied
+    # onto its persistent unsharded parameter.
+    param_attrs: dict[str, Any] = field(default_factory=dict)
 
     @property
     def placement(self) -> Placement:
@@ -214,6 +242,7 @@ class ShardedBucketStorage:
         module: nn.Module,
         reshard_after_forward: bool = True,
         gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG,
+        persistent_unsharded_params: bool = False,
     ) -> None:
         if byte_storage.dtype != torch.uint8:
             raise ValueError(f"Expected uint8 storage, got {byte_storage.dtype}")
@@ -223,6 +252,7 @@ class ShardedBucketStorage:
         self._total_bytes = total_bytes
         self._module = module
         self._reshard_after_forward = reshard_after_forward
+        self._persistent_unsharded_params = persistent_unsharded_params
         self._gradient_reduce_op = gradient_reduce_op
         for info in self._param_infos.values():
             info.gradient_reduce_op = self._gradient_reduce_op
@@ -269,6 +299,13 @@ class ShardedBucketStorage:
             module,
             reshard_after_forward=bucket_spec.reshard_after_forward,
             gradient_reduce_op=bucket_spec.gradient_reduce_op,
+            persistent_unsharded_params=(
+                bucket_spec.persistent_unsharded_params
+                and all(
+                    info.placement.supports_persistent_unsharded_params()
+                    for info in param_infos.values()
+                )
+            ),
         )
         bucket_storage.copy_params_from(named_params)
         bucket_storage.install_sharded_params(expected_param_device)
@@ -500,6 +537,7 @@ class ShardedBucketStorage:
             global_numel=param.numel(),
             bucket_layout=bucket_layout,
             outer_layout=get_global_layout(param),
+            param_attrs=dict(vars(param)),
         )
 
     def copy_params_from(

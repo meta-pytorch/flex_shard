@@ -208,6 +208,7 @@ def transformer_bucket_specs(
     mesh,
     *,
     reshard_after_forward: bool = False,
+    persistent_unsharded_params: bool = True,
 ) -> list[BucketSpec]:
     """Bucket the shared Transformer by top-level execution units."""
     return (
@@ -217,12 +218,14 @@ def transformer_bucket_specs(
                 placement_fn=per_param_placements,
                 mesh=mesh,
                 reshard_after_forward=reshard_after_forward,
+                persistent_unsharded_params=persistent_unsharded_params,
             ),
             BucketSpec(
                 ["pos_embeddings.*"],
                 placement_fn=per_param_placements,
                 mesh=mesh,
                 reshard_after_forward=reshard_after_forward,
+                persistent_unsharded_params=persistent_unsharded_params,
             ),
         ]
         + [
@@ -231,6 +234,7 @@ def transformer_bucket_specs(
                 placement_fn=per_param_placements,
                 mesh=mesh,
                 reshard_after_forward=reshard_after_forward,
+                persistent_unsharded_params=persistent_unsharded_params,
             )
             for idx in range(num_layers)
         ]
@@ -240,12 +244,14 @@ def transformer_bucket_specs(
                 placement_fn=per_param_placements,
                 mesh=mesh,
                 reshard_after_forward=reshard_after_forward,
+                persistent_unsharded_params=persistent_unsharded_params,
             ),
             BucketSpec(
                 ["output.*"],
                 placement_fn=per_param_placements,
                 mesh=mesh,
                 reshard_after_forward=reshard_after_forward,
+                persistent_unsharded_params=persistent_unsharded_params,
             ),
         ]
     )

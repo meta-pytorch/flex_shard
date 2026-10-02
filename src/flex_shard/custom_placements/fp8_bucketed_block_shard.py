@@ -188,6 +188,11 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
     FP8 data and scales to the configured ``weight_factory``.
     """
 
+    def supports_persistent_unsharded_params(self) -> bool:
+        # Unshard returns BlockwiseFp8Weight, which the fp8 linear consumes
+        # directly; a dense persistent parameter cannot hold it.
+        return False
+
     @dataclass(frozen=True)
     class _BlockRowParam:
         """Per-parameter block-row span used by the bucket partition planner."""
