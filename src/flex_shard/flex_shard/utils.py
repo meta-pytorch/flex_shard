@@ -6,8 +6,7 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, contextmanager, nullcontext
-from contextvars import ContextVar
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -21,22 +20,6 @@ if TYPE_CHECKING:
     from .placement_contract import Placement
 
 
-_SUPPRESS_EAGER_PROFILING: ContextVar[bool] = ContextVar(
-    "_flex_shard_suppress_eager_profiling",
-    default=False,
-)
-
-
-@contextmanager
-def _suppress_eager_profiling():
-    """Temporarily suppress eager profiler ranges for SAC-hidden physical work."""
-    token = _SUPPRESS_EAGER_PROFILING.set(True)
-    try:
-        yield
-    finally:
-        _SUPPRESS_EAGER_PROFILING.reset(token)
-
-
 def _with_fqn(label: str, fqn: str | None) -> str:
     """Append a module/bucket FQN to profiler labels, matching FSDP style."""
     if fqn:
@@ -44,61 +27,32 @@ def _with_fqn(label: str, fqn: str | None) -> str:
     return label
 
 
-def _inside_selective_checkpoint_dispatch() -> bool:
-    try:
-        from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
-    except ImportError:
-        return False
-
-    for mode in _get_current_dispatch_mode_stack():
-        mode_type = type(mode)
-        if mode_type.__module__ == "torch.utils.checkpoint" and mode_type.__name__ in {
-            "_CachingTorchDispatchMode",
-            "_CachedTorchDispatchMode",
-        }:
-            return True
-    return False
-
-
-def _disable_selective_checkpoint_dispatch() -> AbstractContextManager[Any]:
-    if not _inside_selective_checkpoint_dispatch():
-        return nullcontext()
-
-    from torch.utils._python_dispatch import _disable_current_modes
-
-    return _disable_current_modes()
-
-
 def _record_function_if_eager(
     label: str,
     fqn: str | None,
 ) -> AbstractContextManager[Any]:
     """Return a profiler range in eager and a no-op context during compile."""
-    if (
-        torch.compiler.is_compiling()
-        or _SUPPRESS_EAGER_PROFILING.get()
-        or _inside_selective_checkpoint_dispatch()
-    ):
+    if torch.compiler.is_compiling():
         return nullcontext()
     return torch.profiler.record_function(_with_fqn(label, fqn))
 
 
 def _record_copy_in_if_eager() -> AbstractContextManager[Any]:
-    """Record unshard copy-in even when physical unshard profiling is suppressed."""
+    """Return an eager profiler range for unshard copy-in."""
     if torch.compiler.is_compiling():
         return nullcontext()
     return torch.profiler.record_function("FlexShard::copy_in")
 
 
 def _record_copy_out_if_eager() -> AbstractContextManager[Any]:
-    """Record unshard copy-out even when physical unshard profiling is suppressed."""
+    """Return an eager profiler range for unshard copy-out."""
     if torch.compiler.is_compiling():
         return nullcontext()
     return torch.profiler.record_function("FlexShard::copy_out")
 
 
 def _record_view_out_if_eager() -> AbstractContextManager[Any]:
-    """Record unshard view-out even when physical unshard profiling is suppressed."""
+    """Return an eager profiler range for unshard view-out."""
     if torch.compiler.is_compiling():
         return nullcontext()
     return torch.profiler.record_function("FlexShard::view_out")
@@ -147,7 +101,7 @@ def _strip_checkpoint_wrapped_module_path(path: str) -> str:
 
 
 def _top_level_owner_path(module: nn.Module, owner_path: str) -> str:
-    """Choose the outer module to checkpoint for a parameter owner path."""
+    """Return the top-level module path (one level into containers) of an owner path."""
     parts = owner_path.split(".")
     if not parts or not parts[0]:
         return ""

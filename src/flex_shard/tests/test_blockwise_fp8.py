@@ -36,7 +36,6 @@ from ..flex_shard.placement_contract import (
     PlacementPreparedUnshard,
     PlacementUnshardResult,
 )
-from ..flex_shard.unshard_op import mark_unshard_bucket
 from ..flex_shard.utils import (
     _record_copy_in_if_eager,
     _record_copy_out_if_eager,
@@ -194,7 +193,8 @@ class _DenseAllGatherReferencePlacement(Fp8BucketedBlockShard):
                 )
             foreach_copy_(copy_dsts, copy_srcs)
         full_params = []
-        for info in state.infos:
+        persistent_buffers: list[torch.Tensor] = []
+        for index, info in enumerate(state.infos):
             dense_weight = dense_by_fqn[info.fqn]
             dense_weight.requires_grad_(info.requires_grad)
             fp8_data, recip_scale = _quantize_dense_weight_to_blockwise_fp8(
@@ -202,6 +202,14 @@ class _DenseAllGatherReferencePlacement(Fp8BucketedBlockShard):
                 self.block_size,
                 self.fp8_dtype,
             )
+            if prepared.persistent_buffers is not None:
+                # Persistent unshard: refill the previous fp8 data and scales.
+                persistent_data = prepared.persistent_buffers[2 * index]
+                persistent_scale = prepared.persistent_buffers[2 * index + 1]
+                persistent_data.copy_(fp8_data)
+                persistent_scale.copy_(recip_scale)
+                fp8_data, recip_scale = persistent_data, persistent_scale
+            persistent_buffers.extend((fp8_data, recip_scale))
             full_params.append(
                 self._make_blockwise_fp8_weight(
                     fp8_data,
@@ -210,7 +218,10 @@ class _DenseAllGatherReferencePlacement(Fp8BucketedBlockShard):
                     requires_grad=dense_weight.requires_grad,
                 )
             )
-        return PlacementUnshardResult(full_params=full_params)
+        return PlacementUnshardResult(
+            full_params=full_params,
+            persistent_buffers=persistent_buffers if prepared.persistent else [],
+        )
 
 
 def _make_blockwise_fp8_weight() -> BlockwiseFp8Weight:
@@ -239,25 +250,6 @@ class TestBlockwiseFp8Weight(TestCase):
         self.assertEqual(
             wrapped.dequantize(torch.float32),
             wrapped.fp8_data.float() * 0.5,
-        )
-
-    def test_mark_unshard_bucket_preserves_blockwise_fp8_weight(self) -> None:
-        wrapped = _make_blockwise_fp8_weight()
-
-        (marked,) = mark_unshard_bucket([wrapped])
-
-        self.assertIsInstance(marked, BlockwiseFp8Weight)
-        self.assertIsNot(marked, wrapped)
-        self.assertTrue(marked.requires_grad)
-        self.assertEqual(marked.block_size, wrapped.block_size)
-        self.assertEqual(marked.orig_dtype, wrapped.orig_dtype)
-        self.assertEqual(
-            marked.fp8_data.untyped_storage().data_ptr(),
-            wrapped.fp8_data.untyped_storage().data_ptr(),
-        )
-        self.assertEqual(
-            marked.recip_scale.untyped_storage().data_ptr(),
-            wrapped.recip_scale.untyped_storage().data_ptr(),
         )
 
 
