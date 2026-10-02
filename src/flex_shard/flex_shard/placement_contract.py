@@ -316,16 +316,13 @@ class PlacementPreparedUnshard:
 class PlacementUnshardResult:
     """Full parameters and buffers with post-finish lifetime requirements.
 
-    ``buffers`` preserves the legacy finish lifetime for custom
-    placements. New placements should classify storage explicitly.
-    ``finish_buffers`` are tensors created during finish that may be released
-    after its copy-out work. ``consumer_buffers`` are the minimal storage roots
+    ``buffers`` are tensors created during finish that may be released after
+    its copy-out work. ``consumer_buffers`` are the minimal storage roots
     backing full-parameter views and must remain live through their consumer.
     """
 
     full_params: list[torch.Tensor]
     buffers: list[torch.Tensor] = field(default_factory=list)
-    finish_buffers: list[torch.Tensor] = field(default_factory=list)
     consumer_buffers: list[torch.Tensor] = field(default_factory=list)
 
 
