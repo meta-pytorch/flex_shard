@@ -7,6 +7,7 @@
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 
+from .. import is_flex_shard_param
 from .common import (
     flex_shard_cuda,
     make_test_sgd,
@@ -47,6 +48,12 @@ class TestFlexShardStateDict(TestCase):
 
             x = transformer_inputs(args, batch_size=3, device="cuda")
             self.assertEqual(source(x), target(x))
+            # Those forwards left the buckets unsharded: state_dict() reshards
+            # first, and so does reshard().
+            sharded = source.state_dict(keep_vars=True).values()
+            self.assertTrue(all(is_flex_shard_param(value) for value in sharded))
+            target.reshard()
+            self.assertTrue(all(is_flex_shard_param(p) for p in target.parameters()))
 
             source_optim = make_test_sgd(source.parameters(), lr=0.05)
             target_optim = make_test_sgd(target.parameters(), lr=0.05)

@@ -161,21 +161,16 @@ FlexShard exposes this capability through its explicit buckets: the model's
 forward graph contains per-bucket autograd operations whose forward and
 backward subgraphs contain functional collectives.
 
-The tracing path uses the same model and mesh assignment with
-`reshard_after_forward=False`: FlexShard's saved-tensor hooks for resharding
-currently require eager execution. Following the unit test, configure a fresh
-model for tracing, then capture it:
+The tracing path uses the same model and mesh assignment. Under
+`torch.compile`, the traced graph owns buffer lifetimes, so
+`reshard_after_forward` does not apply. Following the unit test, configure a
+fresh model for tracing, then capture it:
 
 ```python
-from dataclasses import replace
-
 from examples.tiny_moe_transformer import TinyMoETransformer
 
 model = TinyMoETransformer().to(device).train()
-trace_buckets = [
-    replace(spec, reshard_after_forward=False) for spec in buckets
-]
-flex_shard(model, buckets=trace_buckets)
+flex_shard(model, buckets=buckets)
 optimizer = torch.optim.AdamW(
     model.parameters(), lr=1e-3, eps=1e-6, weight_decay=0.01, foreach=False,
 )
@@ -239,15 +234,30 @@ memory use, or equivalence to GraphTrainer's scheduling and optimization passes.
 
 `BucketSpec` defaults to `gradient_reduce_op=dist.ReduceOp.AVG`, so the examples
 omit that argument. Its `reshard_after_forward` default is `True`, which the
-eager AdamW example uses. FlexShard's saved-tensor hooks replay parameter
-unshards as needed in backward. That does not itself recompute the whole
-Transformer block; existing activation checkpointing can compose with that
-policy.
+eager AdamW example uses.
+
+As in FSDP2, each managed parameter has a persistent unsharded `nn.Parameter`.
+While its bucket is unsharded, the owning module's `_parameters` holds it, so
+module code sees a regular parameter in forward and backward; otherwise it holds
+the rank-local shard. With `reshard_after_forward=True`, FlexShard frees the
+unsharded storage with `untyped_storage().resize_(0)` after the bucket's
+forward and re-gathers it in a pre-backward hook. This composes with existing
+activation checkpointing without wrapping the model.
 
 Setting `reshard_after_forward=False` keeps gathered parameters available
-through backward, trading memory for fewer all-gathers. The tracing example
-uses this setting because the resharding hooks currently require eager
-execution.
+through backward, trading memory for fewer all-gathers. Such a bucket stays
+unsharded after a forward until its backward; call `model.reshard()` when that
+backward will not run, as with FSDP2's `FSDPModule.reshard()`.
+
+For gradient accumulation, `model.no_sync()` (or FSDP2's
+`model.set_requires_gradient_sync(False)`) skips the reduce-scatter. Backward
+keeps full gradients on the unsharded parameters, accumulating in the bucket's
+`reduce_dtype` when it is wider, and the next syncing backward reduce-scatters
+them. `model.set_reshard_after_backward(False)` also keeps the parameters
+unsharded between those microbatches, so only the first one all-gathers when
+`reshard_after_forward=False`. Unlike FSDP2, a syncing backward always
+reshards, so the optimizer step never leaves stale unsharded parameters. Both
+are eager-only.
 
 A regular FlexShard `state_dict()` contains rank-local shards. It is not a
 gathered model checkpoint. Existing FSDP2 checkpoint code needs an explicit

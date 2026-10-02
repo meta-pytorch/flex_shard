@@ -279,33 +279,6 @@ class Placement(ABC):
         """Finish the prepared unshard and return full parameters."""
         raise NotImplementedError
 
-    def supports_persistent_unsharded_params(self) -> bool:
-        """Return whether unshard outputs fit a dense persistent parameter.
-
-        Placements whose unshard produces a tensor subclass the module consumes
-        directly (e.g. blockwise-fp8 weights) return False; their buckets use
-        the legacy property-getter path.
-        """
-        return True
-
-    def supports_copy_out_destinations(self) -> bool:
-        """Return whether finish can copy into ``prepared.copy_out_destinations``.
-
-        Persistent unsharded parameters pass their storage as destinations so
-        the unshard copy-out writes into them directly. Placements that return
-        False produce fresh tensors, which the runtime then copies.
-        """
-        return False
-
-    def unshard_storage_numel(self, info: ParamInfo, world_size: int) -> int:
-        """Elements of storage a copy-out destination needs for ``info``.
-
-        Defaults to the full parameter size. Placements whose copy-out writes a
-        padded buffer (e.g. ``Shard`` with uneven dim-0) return the padded size.
-        """
-        _ = world_size
-        return info.global_numel
-
     def prepare_reduce_grad(
         self,
         tensors: list[torch.Tensor],
@@ -332,32 +305,42 @@ class PlacementPreparedUnshard:
     ``finish_prepared_unshard()`` queues their final use.
     ``placement_state`` is private metadata passed back to the same placement's
     run/finish methods.
+
+    ``persistent`` asks finish to back the full parameters with buffers the
+    caller keeps across unshards (FSDP2-style persistent unsharded
+    parameters). On the first persistent unshard ``persistent_buffers`` is
+    None: the placement allocates fresh buffers on the current stream, backs
+    the full params with them only, and returns them as
+    ``PlacementUnshardResult.persistent_buffers``. On later unshards
+    ``persistent_buffers`` holds those buffers, with storage re-allocated by
+    the caller, and finish writes the new values into them in the same layout.
+    Eager unshards are persistent. During graph capture they are not, and the
+    full params may view gathered buffers whose lifetime the traced graph owns.
     """
 
     placement: Placement
     buffers: list[torch.Tensor]
     placement_state: Any
-    # Persistent unsharded parameters to copy into, one per param, when the
-    # placement supports it. Each tensor's storage holds at least
-    # ``unshard_storage_numel`` elements.
-    copy_out_destinations: list[torch.Tensor] | None = None
+    persistent: bool = False
+    persistent_buffers: list[torch.Tensor] | None = None
 
 
 @dataclass
 class PlacementUnshardResult:
-    """Full parameters and buffers with post-finish lifetime requirements.
+    """Full parameters and the buffers behind them.
 
-    ``buffers`` preserves the legacy finish lifetime for custom
-    placements. New placements should classify storage explicitly.
-    ``finish_buffers`` are tensors created during finish that may be released
-    after its copy-out work. ``consumer_buffers`` are the minimal storage roots
-    backing full-parameter views and must remain live through their consumer.
+    ``buffers`` are tensors created during finish; like the prepared buffers,
+    the bucket runtime releases them once the work finish queued (e.g. a
+    copy-out) is ordered. ``persistent_buffers`` (persistent unshards only) are
+    the storage backing ``full_params`` that the caller keeps across unshards:
+    it frees their storage on reshard and re-allocates it before the next
+    unshard refills them. They correspond to FSDP2's all-gather outputs and
+    unsharded inner tensors.
     """
 
     full_params: list[torch.Tensor]
     buffers: list[torch.Tensor] = field(default_factory=list)
-    finish_buffers: list[torch.Tensor] = field(default_factory=list)
-    consumer_buffers: list[torch.Tensor] = field(default_factory=list)
+    persistent_buffers: list[torch.Tensor] = field(default_factory=list)
 
 
 @dataclass

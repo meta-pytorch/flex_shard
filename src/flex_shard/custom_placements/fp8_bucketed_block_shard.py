@@ -14,8 +14,9 @@ gathered fp8 weight is **bit-identical** to "all-gather bf16, then
 block-quantize".
 
 The master weight stays dense bf16/fp32-sharded with no fp8 padding in
-persistent storage. FP8 data, scales, and tail padding exist only in the
-unshard collective buffers.
+sharded storage. The gathered FP8 data and scales are compacted into one buffer
+that backs the unsharded weights; in eager mode the bucket runtime keeps it as
+a persistent buffer, freed on reshard and refilled on the next unshard.
 """
 
 from __future__ import annotations
@@ -64,7 +65,13 @@ _VEC_ALIGN_BYTES = 16
 
 
 class BlockwiseFp8WeightFactory(Protocol):
-    """Construct a consumer-specific tensor from gathered FP8 operands."""
+    """Construct a consumer-specific tensor from gathered FP8 operands.
+
+    The result must view ``fp8_data`` and ``recip_scale`` (a tensor subclass
+    may hold them as inner tensors) rather than copy them: eager unshards
+    refill those buffers in place, and the weight built on the first unshard is
+    reused afterwards.
+    """
 
     def __call__(
         self,
@@ -187,11 +194,6 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
     padding for the all-gather. ``finish_prepared_unshard`` passes the gathered
     FP8 data and scales to the configured ``weight_factory``.
     """
-
-    def supports_persistent_unsharded_params(self) -> bool:
-        # Unshard returns BlockwiseFp8Weight, which the fp8 linear consumes
-        # directly; a dense persistent parameter cannot hold it.
-        return False
 
     @dataclass(frozen=True)
     class _BlockRowParam:
@@ -881,7 +883,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         infos: list[ParamInfo],
         rank: int,
     ) -> tuple[torch.Tensor, _Fp8BucketMetadata]:
-        """Cache one forward payload for its backward recomputation.
+        """Cache one forward payload for its backward re-gather.
 
         Some fused optimizers mutate parameters without advancing ``_version``.
         Forward therefore always refreshes the entry; backward may consume that
@@ -1106,10 +1108,9 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         """All-gather packed fp8 data and fp32 scale bytes in one collective.
 
         Each rank's payload is padded to the same size, so the collective writes
-        directly into one flat output tensor. Reshard-after-forward tags the
-        semantic unshard op ``MUST_RECOMPUTE`` -- so the gathered fp8 weight is
-        freed after forward and re-gathered in backward. The local packed payload
-        is reused while its dense source shards remain unchanged. Both fp8 data
+        directly into one flat output tensor. Reshard-after-forward frees the
+        compacted fp8 weight after forward and re-gathers it before backward.
+        The local packed payload is reused while its dense source shards remain unchanged. Both fp8 data
         and fp32 scale bit patterns are transported as uint8, making the
         collective dtype-agnostic.
         """
@@ -1192,10 +1193,16 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         fp8_nbytes = sum(metadata.rank_fp8_numels)
         scale_nbytes = sum(metadata.rank_scale_numels) * torch.float32.itemsize
         scale_byte_offset = _align_up(fp8_nbytes, _VEC_ALIGN_BYTES)
-        compact = torch.empty(
-            scale_byte_offset + scale_nbytes,
-            dtype=torch.uint8,
-            device=rank_rows.device,
+        # Persistent unshards keep ``compact`` (fp8 data + scales) as the
+        # storage backing the returned BlockwiseFp8Weights.
+        compact = (
+            prepared.persistent_buffers[0]
+            if prepared.persistent_buffers is not None
+            else torch.empty(
+                scale_byte_offset + scale_nbytes,
+                dtype=torch.uint8,
+                device=rank_rows.device,
+            )
         )
         fp8_bytes = compact[:fp8_nbytes]
         scale_bytes = compact[scale_byte_offset:]
@@ -1301,7 +1308,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             raise AssertionError("Compacted FP8 bucket metadata is inconsistent.")
         return PlacementUnshardResult(
             full_params=full_params,
-            consumer_buffers=[compact],
+            persistent_buffers=[compact] if prepared.persistent else [],
         )
 
 

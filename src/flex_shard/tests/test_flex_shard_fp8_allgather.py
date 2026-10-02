@@ -642,9 +642,10 @@ class TestFp8AllGatherLayout(TestCase):
                 local_packed[scale_start:payload_end]
             )
 
+        prepared.persistent = True
         result = placement._finish_unshard_from_rank_rows(prepared, rank_rows)
-        self.assertEqual(len(result.consumer_buffers), 1)
-        compact = result.consumer_buffers[0]
+        self.assertEqual(len(result.persistent_buffers), 1)
+        compact = result.persistent_buffers[0]
         expected_fp8_nbytes = sum(param.numel() for _, param in named_params)
         self.assertNotEqual(expected_fp8_nbytes % torch.float32.itemsize, 0)
         self.assertIn(0, metadata.rank_fp8_numels)
@@ -844,6 +845,38 @@ class TestFp8AllGather(FSDPTest):
         self.assertEqual(reduce_scatter.call_count, 1)
         for grad, info in zip(reduced.sharded_grads, infos, strict=True):
             self.assertEqual(grad, storage.get_local_view(info.fqn))
+
+        # A persistent unshard, then a refill after the local shards change: the
+        # weights built by the first unshard see the new values.
+        def persistent_unshard(persistent_buffers=None):
+            prepared = mixed.prepare_unshard_bucket(local_params, infos, mesh, None)
+            prepared.persistent = True
+            prepared.persistent_buffers = persistent_buffers
+            mixed.run_prepared_unshard(prepared)
+            return mixed.finish_prepared_unshard(prepared)
+
+        first = persistent_unshard()
+        with torch.no_grad():
+            for local_param in local_params:
+                local_param.add_(1.0)
+        for buffer in first.persistent_buffers:
+            nbytes = buffer.untyped_storage().size()
+            buffer.untyped_storage().resize_(0)
+            buffer.untyped_storage().resize_(nbytes)
+        persistent_unshard(first.persistent_buffers)
+        self.assertEqual(first.full_params[0], originals["norm"] + 1.0)
+        reference_fp8, reference_scale = _reference_blockwise_quant_weight(
+            originals["weight"] + 1.0,
+            block,
+        )
+        first_call = weight_factory.calls[1]
+        self.assertTrue(
+            torch.equal(
+                first_call.fp8_data.view(torch.uint8),
+                reference_fp8.view(torch.uint8),
+            )
+        )
+        self.assertTrue(torch.equal(first_call.recip_scale, reference_scale))
 
 
 if __name__ == "__main__":
