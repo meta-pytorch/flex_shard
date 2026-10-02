@@ -679,6 +679,19 @@ class TestFlexShardTraining(FSDPTest):
         )
         self.assertEqual(grad, expected_grad)
 
+        # A syncing backward without a kept grad defers the upcast: the bf16
+        # grad reaches the reduce-scatter, whose copy-in widens it, and
+        # grad_dtype is restored afterwards.
+        runtime = bucket_runtime.BucketRuntime
+        with mock.patch.object(
+            runtime, "reduce_grads", autospec=True, side_effect=runtime.reduce_grads
+        ) as reduces:
+            model.tok_embeddings(x).float().sum().backward()
+        self.assertEqual(
+            [grad.dtype for grad in reduces.call_args.args[1]], [torch.bfloat16]
+        )
+        self.assertEqual(unsharded_param.grad_dtype, torch.float32)
+
     @skip_if_lt_x_gpu(2)
     def test_rank_dependent_unused_params(self):
         # Ranks leave different params of a bucket, or a whole bucket's
@@ -800,6 +813,9 @@ class TestFlexShardTraining(FSDPTest):
         )
         bf16, fp32 = torch.bfloat16, torch.float32
         # Each case exercises one source of the unsharded accumulation dtype.
+        # The first backward runs without sync, so autograd casts each use's
+        # grad before summing them; a syncing backward defers that cast to the
+        # reduce-scatter copy-in, as FSDP2 does, and its zero grads only add.
         cases = (
             ("storage_dtype", fp32, None, bf16, None, 257.0),
             ("explicit_grad_dtype", bf16, fp32, None, None, 257.0),
@@ -836,7 +852,10 @@ class TestFlexShardTraining(FSDPTest):
                 )
 
                 x = torch.ones(1, 8, dtype=compute_dtype, device=device_type)
+                model.set_requires_gradient_sync(False)
                 model(x).backward()
+                model.set_requires_gradient_sync(True)
+                model(0 * x).backward()
                 grad = model._parameters["weight"].grad
                 self.assertIsNotNone(grad)
                 self.assertEqual(grad.dtype, fp32)
@@ -866,7 +885,12 @@ class TestFlexShardTraining(FSDPTest):
         flex_shard_cuda(model, mesh)
 
         x = torch.ones(1, 8, dtype=torch.bfloat16, device=device_type)
+        # As above, the backward without sync sums each use's grad in the
+        # accumulation dtype, and the syncing one reduces.
+        model.set_requires_gradient_sync(False)
         model(x).backward()
+        model.set_requires_gradient_sync(True)
+        model(0 * x).backward()
 
         # b's fp32 sum of 257 survives only if the shared reduction promotes
         # a's bf16 and b's fp32 gradients to fp32.
