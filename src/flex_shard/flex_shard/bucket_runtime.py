@@ -111,6 +111,16 @@ def _in_backward() -> bool:
     return torch._C._current_graph_task_id() != -1
 
 
+def _storage_alias(tensor: torch.Tensor) -> torch.Tensor:
+    """Alias ``tensor``'s storage with an independent version counter."""
+    return torch.empty(0, dtype=tensor.dtype, device=tensor.device).set_(
+        tensor.untyped_storage(),
+        tensor.storage_offset(),
+        tensor.size(),
+        tensor.stride(),
+    )
+
+
 def _alloc_storage(tensor: torch.Tensor, nbytes: int) -> None:
     storage = tensor.untyped_storage()
     if storage.size() != nbytes:
@@ -1113,15 +1123,20 @@ class BucketRuntime:
                 bucket_param.unsharded_param,
                 bucket_param.unsharded_storage_nbytes,
             )
-        copied_out = result.set_copy_out_destinations(unsharded_params)
-        unshard_lease = result.finish()
-        full_params = unshard_lease.take_full_params()
-        if not copied_out:
-            with torch.no_grad():
-                for unsharded_param, full_param in zip(
-                    unsharded_params, full_params, strict=True
-                ):
-                    unsharded_param.copy_(full_param)
+        # Write through storage aliases with their own version counters: the
+        # copy-out refills storage autograd may have saved (the backward
+        # re-gather), and must not bump the parameters' versions.
+        destinations = [
+            _storage_alias(unsharded_param) for unsharded_param in unsharded_params
+        ]
+        copied_out = result.set_copy_out_destinations(destinations)
+        with torch.no_grad():
+            unshard_lease = result.finish()
+            full_params = unshard_lease.take_full_params()
+            if not copied_out:
+                # e.g. BucketedBlockShard, whose outputs are views of the
+                # gathered bucket: one batched copy into the persistent storage.
+                torch._foreach_copy_(destinations, full_params)
         del full_params
         unshard_lease.release()
         self.is_unsharded = True
