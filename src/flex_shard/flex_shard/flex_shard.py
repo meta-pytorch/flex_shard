@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import cast, TYPE_CHECKING
 
@@ -129,6 +131,87 @@ class FlexShardModule:
                 continue
             for bucket_storage in bucket_storages:
                 bucket_storage.set_gradient_reduce_op(op)
+
+    def _bucket_storages_for(self, recurse: bool) -> list[ShardedBucketStorage]:
+        modules = self.modules() if recurse else [self]
+        return [
+            bucket_storage
+            for module in modules
+            for bucket_storage in getattr(module, _SHARDED_BUCKET_STORAGES_ATTR, [])
+        ]
+
+    def _bucket_runtimes_for(self, bucket_storages) -> list:
+        storage_ids = {id(bucket_storage) for bucket_storage in bucket_storages}
+        contexts = getattr(self, _EAGER_COMM_CONTEXTS_ATTR, None) or {}
+        return [
+            bucket
+            for context in contexts.values()
+            for bucket in context.buckets
+            if id(bucket.bucket_storage) in storage_ids
+        ]
+
+    def set_requires_gradient_sync(
+        self,
+        requires_gradient_sync: bool,
+        *,
+        recurse: bool = True,
+    ) -> None:
+        """Set whether backward reduce-scatters gradients (FSDP2-style).
+
+        With ``False``, backward keeps each bucket's full gradients on its
+        persistent unsharded parameters, and autograd accumulates later
+        backwards into them. The next backward with ``True`` reduce-scatters
+        the accumulated gradients. Gradients accumulate in the bucket's
+        ``reduce_dtype`` when it is wider than the parameter dtype. Requires
+        persistent-param buckets in eager mode.
+        """
+        bucket_storages = self._bucket_storages_for(recurse)
+        if not requires_gradient_sync:
+            legacy = [s for s in bucket_storages if not s._persistent_unsharded_params]
+            if legacy:
+                raise NotImplementedError(
+                    "set_requires_gradient_sync(False) requires "
+                    "persistent_unsharded_params buckets; "
+                    f"{len(legacy)} bucket(s) use the legacy path."
+                )
+        for bucket_storage in bucket_storages:
+            bucket_storage._requires_gradient_sync = requires_gradient_sync
+        if not requires_gradient_sync:
+            for bucket in self._bucket_runtimes_for(bucket_storages):
+                bucket.accumulate_grads_in_reduce_dtype()
+
+    def set_reshard_after_backward(
+        self,
+        reshard_after_backward: bool,
+        *,
+        recurse: bool = True,
+    ) -> None:
+        """Set whether backward frees each bucket's unsharded parameters.
+
+        With ``False``, persistent unsharded parameters stay allocated and
+        swapped in after backward, so the next forward skips the all-gather.
+        With ``set_requires_gradient_sync(False)`` this gives one all-gather and
+        one reduce-scatter per optimizer step. While kept unsharded, the
+        owning modules expose the persistent parameters through
+        ``_parameters`` (as FSDP2 exposes unsharded params until reshard);
+        optimizers keep the local shards they were built with. If a local
+        shard changes in place (e.g. an optimizer step), the next forward
+        re-gathers it.
+        """
+        for bucket_storage in self._bucket_storages_for(recurse):
+            bucket_storage._reshard_after_backward = reshard_after_backward
+
+    @contextmanager
+    def no_sync(self, *, recurse: bool = True) -> Iterator[None]:
+        """Skip gradient reduce-scatter for backwards inside the context."""
+        bucket_storages = self._bucket_storages_for(recurse)
+        previous = [s._requires_gradient_sync for s in bucket_storages]
+        self.set_requires_gradient_sync(False, recurse=recurse)
+        try:
+            yield
+        finally:
+            for bucket_storage, value in zip(bucket_storages, previous, strict=True):
+                bucket_storage._requires_gradient_sync = value
 
     def set_max_pending_reduce_grads(
         self,

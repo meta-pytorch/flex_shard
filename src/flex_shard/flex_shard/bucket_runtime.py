@@ -401,9 +401,7 @@ class BucketCommContext:
         def _flush_persistent_buckets() -> None:
             try:
                 for bucket in self.buckets:
-                    if bucket.persistent and (
-                        bucket.is_unsharded or bucket.grad_ready_indices
-                    ):
+                    if bucket.persistent and bucket.needs_post_backward():
                         bucket.post_backward_persistent()
                 self.flush_pending_reduce_grad_launches(max_to_flush=None)
                 self.wait_and_clear_reduce_grad_states(debug_fqn=None)
@@ -704,6 +702,9 @@ class BucketRuntime:
     # in the current backward.
     is_unsharded: bool = False
     grad_ready_indices: set[int] = field(default_factory=set)
+    # Local-shard versions the persistent params were gathered from, so a
+    # kept-unsharded bucket re-gathers after an in-place shard update.
+    unsharded_shard_versions: tuple[int, ...] = ()
 
     @property
     def persistent(self) -> bool:
@@ -1025,6 +1026,9 @@ class BucketRuntime:
         next_bucket = prefetch_order[next_idx]
         if not self.context.should_prefetch_bucket(next_bucket):
             return
+        if next_bucket.persistent and next_bucket.has_current_unshard():
+            # Kept unsharded (e.g. reshard_after_backward=False): no gather.
+            return
         key = next_bucket.pending_unshard_key(recompute=is_recompute)
         self.context.pending_unshards[key] = PendingUnshard(
             bucket=next_bucket,
@@ -1139,7 +1143,42 @@ class BucketRuntime:
                 torch._foreach_copy_(destinations, full_params)
         del full_params
         unshard_lease.release()
+        self.unsharded_shard_versions = self._shard_versions()
         self.is_unsharded = True
+
+    def _shard_versions(self) -> tuple[int, ...]:
+        return tuple(
+            bucket_param.param_owner.get_sharded_param()._version
+            for bucket_param in self.bucket_params
+        )
+
+    def has_current_unshard(self) -> bool:
+        """Whether the persistent params hold data for the current shards."""
+        return (
+            self.is_unsharded
+            and self.unsharded_shard_versions == self._shard_versions()
+        )
+
+    def needs_post_backward(self) -> bool:
+        """Whether the end-of-backward flush must finish this bucket."""
+        if self.is_unsharded or self.grad_ready_indices:
+            return True
+        return self.bucket_storage._requires_gradient_sync and any(
+            bucket_param.unsharded_param.grad is not None
+            for bucket_param in self.bucket_params
+        )
+
+    def accumulate_grads_in_reduce_dtype(self) -> None:
+        """Accumulate grads across backwards in reduce_dtype when wider."""
+        for bucket_param in self.bucket_params:
+            unsharded_param = bucket_param.unsharded_param
+            reduce_dtype = bucket_param.param_info.grad_reduce_dtype
+            if (
+                unsharded_param is not None
+                and unsharded_param.requires_grad
+                and reduce_dtype.itemsize > unsharded_param.dtype.itemsize
+            ):
+                unsharded_param.grad_dtype = reduce_dtype
 
     def swap_in_persistent(self) -> None:
         """Expose the persistent params through their modules' ``_parameters``."""
@@ -1190,7 +1229,7 @@ class BucketRuntime:
         )
 
     def pre_forward_persistent(self) -> None:
-        if not self.is_unsharded:
+        if not self.has_current_unshard():
             result = self.take_pending()
             if result is None:
                 result = self.begin_unshard(sac_transparent=False)
@@ -1249,7 +1288,17 @@ class BucketRuntime:
             self.post_backward_persistent()
 
     def post_backward_persistent(self) -> None:
-        """Reduce-scatter accumulated full grads into the shards and reshard."""
+        """Reduce-scatter accumulated full grads into the shards and reshard.
+
+        Without gradient sync, keep the full grads for autograd to accumulate
+        into. Without reshard-after-backward, keep the params unsharded.
+        """
+        self.grad_ready_indices.clear()
+        reshard = self.is_unsharded and self.bucket_storage._reshard_after_backward
+        if not self.bucket_storage._requires_gradient_sync:
+            if reshard:
+                self.reshard_persistent()
+            return
         grads: list[torch.Tensor] = []
         infos: list[ParamInfo] = []
         param_owners: list[ParamOwnerRef] = []
@@ -1261,8 +1310,8 @@ class BucketRuntime:
             infos.append(bucket_param.param_info)
             param_owners.append(bucket_param.param_owner)
             unsharded_param.grad = None
-        self.grad_ready_indices.clear()
-        if self.is_unsharded:
+            unsharded_param.grad_dtype = None
+        if reshard:
             self.reshard_persistent()
         if grads:
             self.schedule_reduce_grad_tensors(grads, infos, param_owners)
@@ -1279,6 +1328,11 @@ class BucketRuntime:
         graph passes may reorder them. The traced graph owns buffer lifetimes,
         so the persistent storage is not used here.
         """
+        if not self.bucket_storage._requires_gradient_sync:
+            raise NotImplementedError(
+                "FlexShard set_requires_gradient_sync(False) / no_sync() is "
+                "eager-only; torch.compile reduce-scatters in the traced backward."
+            )
         local_shards = self._local_shards(use_autograd=True)
         runtime = BucketUnshardRuntime(bucket=self, prefetched_result=None)
         with _disable_selective_checkpoint_dispatch():

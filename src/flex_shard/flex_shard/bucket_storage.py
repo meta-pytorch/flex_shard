@@ -253,6 +253,9 @@ class ShardedBucketStorage:
         self._module = module
         self._reshard_after_forward = reshard_after_forward
         self._persistent_unsharded_params = persistent_unsharded_params
+        # Gradient accumulation controls (persistent-param buckets, eager).
+        self._requires_gradient_sync = True
+        self._reshard_after_backward = True
         self._gradient_reduce_op = gradient_reduce_op
         for info in self._param_infos.values():
             info.gradient_reduce_op = self._gradient_reduce_op

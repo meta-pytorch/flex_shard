@@ -665,6 +665,54 @@ class TestFlexShardTraining(FSDPTest):
         check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
 
     @skip_if_lt_x_gpu(2)
+    def test_no_sync_gradient_accumulation_matches_reference(self):
+        for reshard_after_forward in (False, True):
+            with self.subTest(reshard_after_forward=reshard_after_forward):
+                self._check_no_sync_gradient_accumulation(reshard_after_forward)
+
+    def _check_no_sync_gradient_accumulation(self, reshard_after_forward: bool):
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+        args, model = make_transformer_model(device=device_type.type, vocab_size=15)
+        _init_params_deterministically(model)
+        reference = copy.deepcopy(model)
+        flex_shard(
+            model,
+            buckets=transformer_bucket_specs(
+                args.n_layers,
+                mesh,
+                reshard_after_forward=reshard_after_forward,
+            ),
+        )
+        optim = make_test_sgd(model.parameters(), lr=0.1)
+        ref_optim = make_test_sgd(reference.parameters(), lr=0.1)
+        torch.manual_seed(42 + self.rank)
+        for _step in range(2):
+            optim.zero_grad(set_to_none=True)
+            ref_optim.zero_grad(set_to_none=True)
+            # Microbatches 1-2: no reduce-scatter, params kept unsharded.
+            model.set_reshard_after_backward(False)
+            with model.no_sync():
+                for _ in range(2):
+                    x = transformer_inputs(args, batch_size=3, device=device_type)
+                    model(x).sum().backward()
+                    reference(x).sum().backward()
+            # Final microbatch reduce-scatters the accumulated grads.
+            model.set_reshard_after_backward(True)
+            x = transformer_inputs(args, batch_size=3, device=device_type)
+            model(x).sum().backward()
+            reference(x).sum().backward()
+
+            _average_reference_grads(reference)
+            check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
+            optim.step()
+            ref_optim.step()
+            check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
+
+    @skip_if_lt_x_gpu(2)
     def test_reshard_after_forward_grouped_root_rest_bucket_unsupported(self):
         mesh = init_device_mesh(
             device_type.type,
