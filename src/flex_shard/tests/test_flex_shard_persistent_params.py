@@ -7,13 +7,16 @@
 """Persistent unsharded parameters (FSDP2-style ``resize_``)."""
 
 import copy
+from unittest import mock
 
 import torch
 import torch.nn as nn
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 from .. import BucketSpec, flex_shard, is_flex_shard_param
-from ..custom_placements.shard import per_param_placements
+from ..custom_placements.block_shard import BucketedBlockShard
+from ..custom_placements.shard import per_param_placements, Shard
+from ..flex_shard.bucket_comm import AsyncUnshardResult
 from .common import single_rank_cuda_mesh
 
 
@@ -281,6 +284,61 @@ class TestPersistentUnshardedParams(TestCase):
                         self._assert_grads_match(model, reference)
                         optim.step()
                         ref_optim.step()
+
+    def test_copy_out_path_per_placement(self):
+        cases = (
+            ("shard", lambda fqns: {fqn: (Shard(0),) for fqn in fqns}, True),
+            (
+                # Outputs are views of the gathered bucket: one batched copy.
+                "bucketed_block_shard",
+                lambda fqns: {
+                    fqn: (BucketedBlockShard(dims=(0,), blocks_per_rank=(1,)),)
+                    for fqn in fqns
+                },
+                False,
+            ),
+        )
+        for name, make_placements, expect_direct in cases:
+            with self.subTest(placement=name):
+                with single_rank_cuda_mesh() as mesh:
+                    torch.manual_seed(0)
+                    model = nn.Sequential(nn.Linear(8, 16), nn.Linear(16, 8))
+                    reference = copy.deepcopy(model).cuda()
+                    flex_shard(
+                        model,
+                        buckets=[
+                            BucketSpec(
+                                [f"{idx}.*"],
+                                placement_fn=lambda named_params, mesh: make_placements(
+                                    [fqn for fqn, _ in named_params]
+                                ),
+                                mesh=mesh,
+                                # The backward re-gather refills storage that
+                                # autograd saved in forward.
+                                reshard_after_forward=True,
+                            )
+                            for idx in (0, 1)
+                        ],
+                    )
+                    accepted: list[bool] = []
+                    original = AsyncUnshardResult.set_copy_out_destinations
+
+                    def spy(handle, destinations):
+                        result = original(handle, destinations)
+                        accepted.append(result)
+                        return result
+
+                    x = torch.randn(4, 8, device="cuda")
+                    with mock.patch.object(
+                        AsyncUnshardResult, "set_copy_out_destinations", spy
+                    ):
+                        model(x).sum().backward()
+                    reference(x).sum().backward()
+
+                    self._assert_grads_match(model, reference)
+                    # Two buckets, each unsharded in forward and re-gathered
+                    # for backward.
+                    self.assertEqual(accepted, [expect_direct] * 4)
 
     def test_persistent_param_inherits_attributes(self):
         with single_rank_cuda_mesh() as mesh:

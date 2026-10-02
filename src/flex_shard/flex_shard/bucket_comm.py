@@ -42,10 +42,11 @@ class UnshardHandle:
         raise NotImplementedError
 
     def set_copy_out_destinations(self, destinations: list[torch.Tensor]) -> bool:
-        """Ask finish() to copy full params into ``destinations``.
+        """Ask finish() to copy full params into flat ``destinations``.
 
-        Returns whether the placement accepted them; if not, finish() returns
-        fresh tensors and the caller copies.
+        See ``PlacementPreparedUnshard.copy_out_destinations``. Returns whether
+        the placement accepted them; if not, finish() returns fresh tensors and
+        the caller copies.
         """
         _ = destinations
         return False

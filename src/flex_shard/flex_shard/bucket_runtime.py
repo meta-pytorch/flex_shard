@@ -111,6 +111,19 @@ def _in_backward() -> bool:
     return torch._C._current_graph_task_id() != -1
 
 
+def _flat_storage_alias(tensor: torch.Tensor, nbytes: int) -> torch.Tensor:
+    """1-D alias of ``tensor``'s first ``nbytes`` of storage.
+
+    The alias has its own version counter, so writes through it do not bump
+    ``tensor``'s version.
+    """
+    return torch.empty(0, dtype=tensor.dtype, device=tensor.device).set_(
+        tensor.untyped_storage(),
+        tensor.storage_offset(),
+        (nbytes // tensor.itemsize,),
+    )
+
+
 def _alloc_storage(tensor: torch.Tensor, nbytes: int) -> None:
     storage = tensor.untyped_storage()
     if storage.size() != nbytes:
@@ -1113,15 +1126,30 @@ class BucketRuntime:
                 bucket_param.unsharded_param,
                 bucket_param.unsharded_storage_nbytes,
             )
-        copied_out = result.set_copy_out_destinations(unsharded_params)
-        unshard_lease = result.finish()
-        full_params = unshard_lease.take_full_params()
-        if not copied_out:
-            with torch.no_grad():
-                for unsharded_param, full_param in zip(
-                    unsharded_params, full_params, strict=True
-                ):
-                    unsharded_param.copy_(full_param)
+        # Flat aliases of the persistent storage, with their own version
+        # counters: the backward re-gather refills storage that autograd saved
+        # in forward and must not bump the parameters' versions.
+        destinations = [
+            _flat_storage_alias(
+                bucket_param.unsharded_param,
+                bucket_param.unsharded_storage_nbytes,
+            )
+            for bucket_param in self.bucket_params
+        ]
+        copied_out = result.set_copy_out_destinations(destinations)
+        with torch.no_grad():
+            unshard_lease = result.finish()
+            full_params = unshard_lease.take_full_params()
+            if not copied_out:
+                torch._foreach_copy_(
+                    [
+                        destination[: unsharded_param.numel()].view_as(unsharded_param)
+                        for destination, unsharded_param in zip(
+                            destinations, unsharded_params, strict=True
+                        )
+                    ],
+                    full_params,
+                )
         del full_params
         unshard_lease.release()
         self.is_unsharded = True

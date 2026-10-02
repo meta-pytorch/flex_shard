@@ -228,27 +228,18 @@ class Shard(Placement):
         for idx, (info, padded_local_numel) in enumerate(
             zip(infos, layout.padded_local_numels, strict=True)
         ):
-            if destinations is not None:
-                # Write into the persistent parameter's (padded) storage.
-                destination = destinations[idx]
-                padded_full_param = torch.empty(
-                    0, dtype=info.unsharded_dtype, device=gathered.device
-                ).set_(
-                    destination.untyped_storage(),
-                    destination.storage_offset(),
-                    (world_size * padded_local_numel,),
-                )
-                full_param = destination
-            else:
-                padded_full_param = torch.empty(
+            padded_full_param = (
+                destinations[idx]
+                if destinations is not None
+                else torch.empty(
                     world_size * padded_local_numel,
                     dtype=info.unsharded_dtype,
                     device=gathered.device,
                 )
-                full_param = padded_full_param[: info.global_numel].view(
-                    info.global_shape
-                )
-            full_params.append(full_param)
+            )
+            full_params.append(
+                padded_full_param[: info.global_numel].view(info.global_shape)
+            )
             split_out.append(padded_full_param.view(world_size, padded_local_numel))
 
         torch.split_with_sizes_copy(

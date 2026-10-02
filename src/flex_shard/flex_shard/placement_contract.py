@@ -291,14 +291,15 @@ class Placement(ABC):
     def supports_copy_out_destinations(self) -> bool:
         """Return whether finish can copy into ``prepared.copy_out_destinations``.
 
-        Persistent unsharded parameters pass their storage as destinations so
-        the unshard copy-out writes into them directly. Placements that return
-        False produce fresh tensors, which the runtime then copies.
+        Persistent unsharded parameters pass flat buffers over their storage as
+        destinations, so the unshard copy-out writes into them directly.
+        Placements that return False produce fresh tensors (or views), which
+        the runtime then copies.
         """
         return False
 
     def unshard_storage_numel(self, info: ParamInfo, world_size: int) -> int:
-        """Elements of storage a copy-out destination needs for ``info``.
+        """Elements in the flat copy-out destination for ``info``.
 
         Defaults to the full parameter size. Placements whose copy-out writes a
         padded buffer (e.g. ``Shard`` with uneven dim-0) return the padded size.
@@ -337,9 +338,10 @@ class PlacementPreparedUnshard:
     placement: Placement
     buffers: list[torch.Tensor]
     placement_state: Any
-    # Persistent unsharded parameters to copy into, one per param, when the
-    # placement supports it. Each tensor's storage holds at least
-    # ``unshard_storage_numel`` elements.
+    # Flat buffers to copy into, one per param, when the placement supports
+    # it: 1-D tensors of ``unshard_storage_numel`` elements (aliasing persistent
+    # unsharded parameter storage). The placement carves each full parameter
+    # out of its buffer as it would out of a freshly allocated one.
     copy_out_destinations: list[torch.Tensor] | None = None
 
 
