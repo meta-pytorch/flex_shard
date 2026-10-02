@@ -120,6 +120,8 @@ class FlexShardModule:
         forward until its backward; call this when that backward will not run.
         Until then, ``module.parameters()`` returns their unsharded params, so
         zero grads through the optimizer rather than ``module.zero_grad()``.
+        Grads accumulated without sync are kept, except after a backward that
+        raised on this rank, since they mix with its partial grads.
         """
         for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
             context.reset()
@@ -155,7 +157,8 @@ class FlexShardModule:
         bucket's ``reduce_dtype`` when it is wider than the param dtype. The
         next backward with ``True`` reduce-scatters the accumulated gradients,
         also for buckets it does not use. A backward that raises drops the
-        gradients accumulated so far, since they mix with its partial ones.
+        gradients accumulated so far on that rank, since they mix with its
+        partial ones.
         It applies to the backwards after the call, e.g.
         ``model.set_requires_gradient_sync(is_last_microbatch)`` before each
         microbatch; like FSDP2, there is no ``no_sync()`` context manager.
