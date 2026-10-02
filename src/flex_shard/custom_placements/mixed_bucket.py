@@ -32,6 +32,7 @@ from .block_shard import BlockShard
 from .fp8_bucketed_block_shard import _align_up, _VEC_ALIGN_BYTES, Fp8BucketedBlockShard
 from .owned import BucketedOwned
 from .shard import Shard
+from .utils import foreach_copy_
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -518,8 +519,14 @@ class MixedBucketPlacement(Placement):
         )
         finish_buffers: list[torch.Tensor] = []
         consumer_buffers: list[torch.Tensor] = []
+        destinations = prepared.copy_out_destinations
         with _record_copy_out_if_eager():
             for group in state.groups:
+                group_destinations = (
+                    [destinations[index] for index in group.indices]
+                    if destinations is not None
+                    else None
+                )
                 group_gathered_by_rank = gathered_by_rank[
                     :, group.offset : group.offset + group.numel
                 ]
@@ -546,18 +553,34 @@ class MixedBucketPlacement(Placement):
                             *group.prepared.buffers[2:],
                         ],
                         placement_state=group.prepared.placement_state,
+                        copy_out_destinations=(
+                            group_destinations
+                            if placement.supports_copy_out_destinations()
+                            else None
+                        ),
                     )
                     result = placement.finish_prepared_unshard(group_prepared)
                 finish_buffers.append(gathered)
+                group_full_params = result.full_params
+                if (
+                    group_destinations is not None
+                    and group_prepared.copy_out_destinations is None
+                ):
+                    # The group's placement returned fresh tensors or views;
+                    # copy them into the persistent destinations.
+                    foreach_copy_(group_destinations, group_full_params)
+                    group_full_params = group_destinations
+                    finish_buffers.extend(result.consumer_buffers)
+                else:
+                    consumer_buffers.extend(result.consumer_buffers)
                 for index, full_param in zip(
                     group.indices,
-                    result.full_params,
+                    group_full_params,
                     strict=True,
                 ):
                     full_params[index] = full_param
                 finish_buffers.extend(result.buffers)
                 finish_buffers.extend(result.finish_buffers)
-                consumer_buffers.extend(result.consumer_buffers)
 
         ordered_full_params: list[torch.Tensor] = []
         for full_param in full_params:
@@ -569,6 +592,11 @@ class MixedBucketPlacement(Placement):
             finish_buffers=finish_buffers,
             consumer_buffers=consumer_buffers,
         )
+
+    def supports_copy_out_destinations(self) -> bool:
+        # Each placement group copies out directly when it can; the rest are
+        # copied into their destinations in finish_prepared_unshard.
+        return True
 
     def prepare_reduce_grad(
         self,
