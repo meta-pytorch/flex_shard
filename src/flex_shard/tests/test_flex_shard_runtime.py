@@ -305,6 +305,34 @@ class TestFlexShardEagerRuntime(TestCase):
         model.reshard()
         self.assertTrue(all(b.untyped_storage().size() == 0 for b in buffers))
 
+    def test_reshard_after_forward_holds_one_bucket(self):
+        # Each bucket is freed before the next one is re-gathered, in forward
+        # and in backward, as in FSDP2.
+        with single_rank_cuda_mesh() as mesh:
+            model = nn.Sequential(*(nn.Linear(8, 8) for _ in range(3)))
+            flex_shard(
+                model,
+                buckets=[
+                    _bucket([f"{idx}.*"], mesh, reshard_after_forward=True)
+                    for idx in range(3)
+                ],
+            )
+            buckets = _buckets(model)
+            others_unsharded = []
+            finish_unshard = bucket_runtime.BucketRuntime.finish_unshard
+
+            def counting_finish_unshard(bucket, result):
+                others_unsharded.append(
+                    sum(b.is_unsharded for b in buckets if b is not bucket)
+                )
+                return finish_unshard(bucket, result)
+
+            with patch.object(
+                bucket_runtime.BucketRuntime, "finish_unshard", counting_finish_unshard
+            ):
+                model(torch.randn(4, 8, device="cuda")).sum().backward()
+            self.assertEqual(others_unsharded, [0] * 6)
+
     def test_prefetch_follows_learned_order(self):
         # BucketSpec lists the buckets in reverse execution order. From the
         # second step, prefetch follows the order learned in the first, and the

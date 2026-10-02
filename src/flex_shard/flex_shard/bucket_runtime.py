@@ -651,12 +651,17 @@ class BucketRuntime:
         """Clear the post-backward trigger counts at the end of a backward."""
         self.backward_calls = self.input_triggers = self.input_triggers_run = 0
 
-    def pre_backward_hook(self, grad: torch.Tensor) -> torch.Tensor:
-        """Re-unshard before this bucket's module runs backward (output grad hook)."""
+    def pre_backward_hook(self, grad_outputs: Any) -> None:
+        """Re-unshard before this bucket's module runs backward.
+
+        A pre-hook on the autograd node that produced an output. Autograd runs
+        a tensor's hooks before its node's pre-hooks, so a consumer bucket's
+        post-backward trigger (a hook on that same output) frees its params
+        before this re-gather, as FSDP2's ordering does.
+        """
         self.context.queue_post_backward_callback()
         self.unshard()
         self.context.prefetch(self.context.next_backward_bucket(self))
-        return grad
 
     def on_input_grads(self) -> None:
         """Post-backward trigger from the hooked module's input grads.
@@ -788,14 +793,17 @@ class BucketRuntime:
             return
         self.input_triggers += has_trigger
         for value in grad_outputs:
-            # Hook a view output's base: an in-place op on the view replaces the
-            # view's autograd node, which would drop a hook registered on it.
-            # Leaves (e.g. a returned param) get none: their hooks would persist.
+            # Hook the node of a view output's base: an in-place op on the view
+            # replaces the view's node, which would drop a hook on it. Leaves
+            # (e.g. a returned param) get none: hooks on them would persist.
             base = value._base
-            if base is not None and base.grad_fn is not None:
-                base.register_hook(self.pre_backward_hook)
-            elif value.grad_fn is not None:
-                value.register_hook(self.pre_backward_hook)
+            node = (
+                base.grad_fn
+                if base is not None and base.grad_fn is not None
+                else value.grad_fn
+            )
+            if node is not None:
+                node.register_prehook(self.pre_backward_hook)
         if self.bucket_storage._reshard_after_forward:
             persistent = {_storage_ptr(buffer) for buffer in self.persistent_buffers}
             # An output viewing the persistent storage would see it freed.
