@@ -260,8 +260,9 @@ class BucketCommContext:
         """Queue the end-of-backward callback (once per backward).
 
         It finishes buckets still unsharded (no post-backward trigger fired)
-        and, in a syncing backward, buckets holding grads accumulated without
-        sync, waits on all reduce-grad work, and releases an unused prefetch.
+        and, in a syncing backward, buckets a backward without sync finished
+        since their last reduce-scatter, waits on all reduce-grad work, and
+        releases an unused prefetch.
         """
         if self.post_backward_callback_queued:
             return
@@ -270,7 +271,10 @@ class BucketCommContext:
         def _post_backward_callback() -> None:
             try:
                 for bucket in self.buckets:
-                    if bucket.is_unsharded or bucket.has_unreduced_grads():
+                    if bucket.is_unsharded or (
+                        bucket.needs_sync
+                        and bucket.bucket_storage._requires_gradient_sync
+                    ):
                         bucket.post_backward()
                     bucket.reset_backward_state()
                 self.wait_and_clear_reduce_grad_states(debug_fqn=None)
@@ -284,21 +288,24 @@ class BucketCommContext:
             _post_backward_callback
         )
 
-    def reset(self, *, clear_grads: bool) -> None:
+    def reset(self) -> None:
         """Reshard every bucket and clear per-backward state.
 
-        Used by ``FlexShardModule.reshard()``, which keeps grads accumulated
-        without sync, and with ``clear_grads`` after a backward that raised
-        before its final callback ran (autograd drops queued callbacks then),
-        whose partial grads must not be reduced.
+        Used by ``FlexShardModule.reshard()`` and after a backward that raised
+        before its final callback ran (autograd drops queued callbacks then).
+        Only after such a backward are the unsharded params' grads dropped,
+        since they are partial; otherwise they may be grads accumulated
+        without sync.
         """
+        backward_raised = self.post_backward_callback_queued
         self.post_backward_callback_queued = False
         self.take_pending_unshard(None)
         self.wait_and_clear_reduce_grad_states(debug_fqn=None)
         for bucket in self.buckets:
-            if clear_grads:
+            if backward_raised:
                 for param in bucket.unsharded_params or []:
                     param.grad = None
+                bucket.needs_sync = False
             if bucket.is_unsharded:
                 bucket.reshard()
             bucket.reset_backward_state()
@@ -392,6 +399,10 @@ class BucketRuntime:
     input_triggers: int = 0
     input_triggers_run: int = 0
     call_has_trigger: list[bool] = field(default_factory=list)
+    # Whether a backward without gradient sync finished this bucket since its
+    # last reduce-scatter, so the next syncing backward reduces it even if it
+    # does not use the bucket. Unlike grad presence, the same on every rank.
+    needs_sync: bool = False
     # Persistent unsharded params, created from the first unshard, and the
     # placement's persistent buffers backing them with their allocated storage
     # size in bytes.
@@ -680,12 +691,6 @@ class BucketRuntime:
         if self.backward_calls == self.input_triggers == self.input_triggers_run:
             self.post_backward()
 
-    def has_unreduced_grads(self) -> bool:
-        """Whether a syncing backward still has to reduce kept grads."""
-        return self.bucket_storage._requires_gradient_sync and any(
-            param.grad is not None for param in self.unsharded_params or []
-        )
-
     def post_backward(self) -> None:
         """Reduce-scatter this backward's grads into the shards and reshard.
 
@@ -699,40 +704,49 @@ class BucketRuntime:
         since the optimizer step then changes the local shards.
         """
         if not self.bucket_storage._requires_gradient_sync:
+            self.needs_sync = True
             if self.is_unsharded and self.bucket_storage._reshard_after_backward:
                 self.reshard()
             self._upcast_kept_grads()
             return
-        grads: list[torch.Tensor] = []
+        self.needs_sync = False
+        grads: list[torch.Tensor | None] = []
+        params: list[nn.Parameter] = []
         infos: list[ParamInfo] = []
         sharded_params: list[nn.Parameter] = []
         for bucket_param, unsharded_param in zip(
             self.bucket_params, self.unsharded_params or [], strict=False
         ):
+            # A param frozen since its grad was kept drops it, on every rank.
+            grad, unsharded_param.grad = unsharded_param.grad, None
             if not unsharded_param.requires_grad:
                 continue
-            grad = unsharded_param.grad
-            if grad is None:
-                grad = torch.zeros(
-                    unsharded_param.shape,
-                    dtype=unsharded_param.dtype,
-                    device=unsharded_param.device,
-                )
             grads.append(grad)
+            params.append(unsharded_param)
             infos.append(bucket_param.param_info)
             sharded_params.append(bucket_param.sharded_param)
-            unsharded_param.grad = None
-        if len({grad.dtype for grad in grads}) > 1:
-            # Some grads were kept without sync and upcast; the reduce-scatter
-            # copy-in needs one dtype.
-            grads = [
-                grad.to(info.grad_reduce_dtype)
-                for grad, info in zip(grads, infos, strict=True)
-            ]
         if self.is_unsharded:
             self.reshard()
-        if grads:
-            self.reduce_grads(grads, infos, sharded_params)
+        if not grads:
+            return
+        # Zeros fill missing grads after resharding, so they never coexist
+        # with the unsharded params. The reduce-scatter copy-in needs one
+        # dtype: the reduce dtype if some grads were kept and upcast.
+        dtypes = {grad.dtype for grad in grads if grad is not None}
+        if len(dtypes) > 1:
+            dtype = infos[0].grad_reduce_dtype
+        else:
+            dtype = dtypes.pop() if dtypes else params[0].dtype
+        self.reduce_grads(
+            [
+                torch.zeros(param.shape, dtype=dtype, device=param.device)
+                if grad is None
+                else grad.to(dtype)
+                for grad, param in zip(grads, params, strict=True)
+            ],
+            infos,
+            sharded_params,
+        )
 
     def _upcast_kept_grads(self) -> None:
         """Upcast grads kept without sync to the reduce dtype if wider.
@@ -771,7 +785,7 @@ class BucketRuntime:
             return
         if self.context.post_backward_callback_queued:
             # The previous backward raised before its final callback ran.
-            self.context.reset(clear_grads=True)
+            self.context.reset()
         if self.forward_index is None:
             self.forward_index = len(self.context.forward_order)
             self.context.forward_order.append(self)

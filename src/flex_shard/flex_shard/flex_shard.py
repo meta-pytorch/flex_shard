@@ -122,7 +122,7 @@ class FlexShardModule:
         zero grads through the optimizer rather than ``module.zero_grad()``.
         """
         for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
-            context.reset(clear_grads=False)
+            context.reset()
 
     def _bucket_storages(self, recurse: bool) -> list[ShardedBucketStorage]:
         modules = self.modules() if recurse else [self]
@@ -153,7 +153,9 @@ class FlexShardModule:
         With ``False``, backward keeps each bucket's full gradients on its
         unsharded params and later backwards accumulate into them, in the
         bucket's ``reduce_dtype`` when it is wider than the param dtype. The
-        next backward with ``True`` reduce-scatters the accumulated gradients.
+        next backward with ``True`` reduce-scatters the accumulated gradients,
+        also for buckets it does not use. A backward that raises drops the
+        gradients accumulated so far, since they mix with its partial ones.
         It applies to the backwards after the call, e.g.
         ``model.set_requires_gradient_sync(is_last_microbatch)`` before each
         microbatch; like FSDP2, there is no ``no_sync()`` context manager.

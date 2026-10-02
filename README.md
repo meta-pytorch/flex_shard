@@ -259,9 +259,10 @@ unsharded between those microbatches, so only the first one all-gathers when
 `reshard_after_forward=False`. Unlike FSDP2, a syncing backward always
 reshards, so the optimizer step never leaves stale unsharded parameters. Both
 are eager-only. Like FSDP2's per-module setters, both also exist per bucket,
-on the entries of `model.sharded_bucket_storages` (one per `BucketSpec`, in
-order). For example, a model can keep reduce-scattering expert buckets whose
-full gradients would be large.
+on the entries of `model.sharded_bucket_storages` (one per non-empty
+`BucketSpec`, in order). For example, a model can keep reduce-scattering expert
+buckets whose full gradients would be large. A backward that raises drops the
+gradients accumulated so far, since they mix with its partial ones.
 
 A regular FlexShard `state_dict()` contains rank-local shards. It is not a
 gathered model checkpoint. Existing FSDP2 checkpoint code needs an explicit

@@ -83,14 +83,25 @@ def _init_params_deterministically(model: torch.nn.Module) -> None:
 
 
 class _RankRoutedExperts(torch.nn.Module):
-    """Each rank routes to one expert, like experts that got tokens on one rank."""
+    """Each rank routes to one expert, like experts that got tokens on one rank.
+
+    The side branch runs on every rank, but only rank 0's output uses it.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.experts = torch.nn.ModuleList(torch.nn.Linear(8, 8) for _ in range(2))
+        self.side = torch.nn.Linear(8, 8)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.experts[dist.get_rank()](x)
+    def forward(
+        self, x: torch.Tensor, use_side: bool = True, shift: int = 0
+    ) -> torch.Tensor:
+        out = self.experts[(dist.get_rank() + shift) % 2](x)
+        if use_side:
+            side = self.side(x)
+            if dist.get_rank() == 0:
+                out = out + side
+        return out
 
 
 def _average_reference_grads(model: torch.nn.Module) -> None:
@@ -623,9 +634,14 @@ class TestFlexShardTraining(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_rank_dependent_unused_params(self):
-        # Ranks leave different params of a bucket without grads; every rank
-        # still reduce-scatters all of them, with zeros for its unused ones,
-        # also after a microbatch without sync kept its used ones' grads in fp32.
+        # Ranks leave different params of a bucket, or a whole bucket's
+        # outputs, without grads; every rank still reduce-scatters every
+        # bucket, with zeros for its unused params. Three microbatches: the
+        # first without sync (keeping fp32 grads on rank 0 only), the second
+        # skipping the side bucket, so the pending sync makes it reduce on
+        # every rank, and routing each rank to the other expert, so kept fp32
+        # and fresh bf16 grads mix, and the third syncing with the side
+        # bucket's outputs unused on rank 1.
         mesh = init_device_mesh(
             device_type.type,
             (self.world_size,),
@@ -638,20 +654,20 @@ class TestFlexShardTraining(FSDPTest):
             model,
             buckets=[
                 BucketSpec(
-                    ["*"],
+                    [pattern],
                     placement_fn=per_param_placements,
                     mesh=mesh,
                     mp_policy=MixedPrecisionPolicy(reduce_dtype=torch.float32),
+                    reshard_after_forward=False,
                 )
+                for pattern in ("experts.*", "side.*")
             ],
         )
         x = torch.randn(4, 8, device=device_type, dtype=torch.bfloat16)
-        model.set_requires_gradient_sync(False)
-        model(x).sum().backward()
-        model.set_requires_gradient_sync(True)
-        model(x).sum().backward()
-        for _ in range(2):
-            reference(x).sum().backward()
+        for idx, (use_side, shift) in enumerate(((True, 0), (False, 1), (True, 0))):
+            model.set_requires_gradient_sync(idx > 0)
+            model(x, use_side=use_side, shift=shift).sum().backward()
+            reference(x, use_side=use_side, shift=shift).sum().backward()
         for param in reference.parameters():
             if param.grad is None:
                 param.grad = torch.zeros_like(param)
