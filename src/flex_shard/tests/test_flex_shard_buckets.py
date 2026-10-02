@@ -394,15 +394,15 @@ class TestBucketStorageLayout(FSDPTestMultiThread):
             param_placements=placements,
             bucket_assignments=assignments,
         )
-        bucket_storages, fqn_to_bucket_spec = _materialize_bucket_storages(
+        bucket_storages = _materialize_bucket_storages(
             model,
             inputs,
             buckets,
         )
 
         self.assertEqual(len(bucket_storages), len(buckets))
-        self.assertIs(fqn_to_bucket_spec["tok_embeddings.weight"], buckets[0])
-        self.assertIs(fqn_to_bucket_spec["output.weight"], buckets[-1])
+        self.assertIn("tok_embeddings.weight", bucket_storages[0].param_infos)
+        self.assertIn("output.weight", bucket_storages[-1].param_infos)
 
         current_params = dict(model.named_parameters())
         for bucket_storage in bucket_storages:
