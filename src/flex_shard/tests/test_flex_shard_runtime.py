@@ -15,6 +15,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 from .. import BucketSpec, flex_shard, is_flex_shard_param
+from ..custom_placements.block_shard import make_bucketed_block_placement_fn
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..custom_placements.shard import per_param_placements
 from ..flex_shard import bucket_runtime
@@ -181,9 +182,11 @@ class TestFlexShardEagerRuntime(TestCase):
         def head_placements(named_params, mesh):
             return {
                 fqn: (
-                    mixed.shard0
+                    # BlockShard refills with torch.cat(out=), which bumps
+                    # version counters of weights autograd saved.
+                    mixed.block_shard(blocks_per_rank=(1,))
                     if fqn.endswith("weight")
-                    else mixed.block_shard(blocks_per_rank=(1,)),
+                    else mixed.shard0,
                 )
                 for fqn, _ in named_params
             }
@@ -194,7 +197,12 @@ class TestFlexShardEagerRuntime(TestCase):
                 # One module at a dotted path, and a bucket spanning a
                 # ModuleList, which has no forward of its own.
                 _bucket(["layers.0.*"], mesh, reshard_after_forward),
-                _bucket(["layers.1.*", "layers.2.*"], mesh, reshard_after_forward),
+                _bucket(
+                    ["layers.1.*", "layers.2.*"],
+                    mesh,
+                    reshard_after_forward,
+                    make_bucketed_block_placement_fn(dims=(0,), blocks_per_rank=(1,)),
+                ),
                 _bucket(["head.*"], mesh, reshard_after_forward, head_placements),
             ],
         )
