@@ -116,31 +116,6 @@ def _checkpoint_transformer_execution_units(model: torch.nn.Module) -> None:
     )
 
 
-def _layer_buckets_with_grouped_root_rest(
-    num_layers: int,
-    mesh,
-    *,
-    reshard_after_forward: bool,
-) -> list[BucketSpec]:
-    return [
-        *[
-            BucketSpec(
-                [f"layers.{idx}.*"],
-                placement_fn=per_param_placements,
-                mesh=mesh,
-                reshard_after_forward=reshard_after_forward,
-            )
-            for idx in range(num_layers)
-        ],
-        BucketSpec(
-            ["tok_embeddings.*", "pos_embeddings.*", "norm.*", "output.*"],
-            placement_fn=per_param_placements,
-            mesh=mesh,
-            reshard_after_forward=reshard_after_forward,
-        ),
-    ]
-
-
 class TestFlexShardTraining(FSDPTest):
     @property
     def world_size(self) -> int:
@@ -608,47 +583,6 @@ class TestFlexShardTraining(FSDPTest):
 
         optim.step()
         ref_optim.step()
-        check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
-
-    @skip_if_lt_x_gpu(2)
-    def test_reshard_after_forward_grouped_root_rest_bucket(self):
-        # The root/rest bucket hooks the root module while its children are
-        # checkpointed: its params stay unsharded from the root's pre-backward
-        # hook through every child's recompute.
-        mesh = init_device_mesh(
-            device_type.type,
-            (self.world_size,),
-            mesh_dim_names=("fsdp",),
-        )
-
-        args, model = make_transformer_model(
-            device=device_type.type,
-            n_layers=2,
-            vocab_size=15,
-        )
-        _init_params_deterministically(model)
-        reference = copy.deepcopy(model)
-        _checkpoint_transformer_execution_units(model)
-        _checkpoint_transformer_execution_units(reference)
-
-        flex_shard(
-            model,
-            buckets=_layer_buckets_with_grouped_root_rest(
-                args.n_layers,
-                mesh,
-                reshard_after_forward=True,
-            ),
-        )
-
-        torch.manual_seed(42 + self.rank + 1)
-        x = transformer_inputs(args, batch_size=3, device=device_type)
-        loss = model(x).sum()
-        ref_loss = reference(x).sum()
-        self.assertEqual(loss, ref_loss)
-        loss.backward()
-        ref_loss.backward()
-
-        _average_reference_grads(reference)
         check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
 
 

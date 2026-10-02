@@ -128,7 +128,7 @@ class TestBucketedBlockShardPlacement(TestCase):
                         blocks_per_rank=(1, 3),
                     ),
                     mesh=mesh,
-                    reshard_after_forward=False,
+                    reshard_after_forward=True,
                 )
             ]
         named_params = [
@@ -398,7 +398,7 @@ class TestBlockShardRuntime(FSDPTest):
                             ["*"],
                             placement_fn=placement_fn,
                             mesh=mesh,
-                            reshard_after_forward=False,
+                            reshard_after_forward=True,
                         )
                     ],
                 )
@@ -442,6 +442,7 @@ class TestBlockShardRuntime(FSDPTest):
                             reference_state[state_name][start : start + rows],
                         )
                     self.assertEqual(local_state["step"], reference_state["step"])
+                self.assertEqual(model(x), reference(x))
 
 
 class TestBucketedBlockShardRuntime(FSDPTest):
@@ -482,7 +483,7 @@ class TestBucketedBlockShardRuntime(FSDPTest):
                         blocks_per_rank=(1, 3),
                     ),
                     mesh=mesh,
-                    reshard_after_forward=False,
+                    reshard_after_forward=True,
                 )
             ],
         )

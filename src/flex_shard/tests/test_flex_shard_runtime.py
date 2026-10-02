@@ -4,13 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from unittest.mock import Mock
+import copy
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn as nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+)
 from torch.testing._internal.common_utils import run_tests, TestCase
 
-from .. import is_flex_shard_param
+from .. import BucketSpec, flex_shard, is_flex_shard_param
+from ..custom_placements.mixed_bucket import MixedBucketPlacement
+from ..custom_placements.shard import per_param_placements
 from ..flex_shard import bucket_runtime
 from .common import (
     flex_shard_cuda,
@@ -19,6 +25,88 @@ from .common import (
     single_rank_cuda_mesh,
     transformer_inputs,
 )
+
+
+class _TEStyleScaleFn(torch.autograd.Function):
+    """Like TransformerEngine: ``module.parameters()`` are the autograd inputs,
+    and backward reads ``module.weight`` instead of saving it."""
+
+    @staticmethod
+    def forward(ctx, x, module, *params):
+        assert params[0] is module.weight
+        ctx.save_for_backward(x)
+        ctx.module = module
+        return x * module.weight
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (x,) = ctx.saved_tensors
+        return grad_output * ctx.module.weight, None, (grad_output * x).sum(0)
+
+
+class _TEStyleScale(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _TEStyleScaleFn.apply(x, self, *self.parameters())
+
+
+class _ViewHead(nn.Module):
+    """Returns a view, and leaves one linear unused like an unrouted expert."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.used = nn.Linear(dim, dim)
+        self.unused = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.used(x).view(-1)
+
+
+class _PersistentParamsNet(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(_TEStyleScale(dim) for _ in range(3))
+        self.head = _ViewHead(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        # The head runs in two parallel branches, and the later branch's view
+        # output is modified in place.
+        out = self.head(x)
+        later = self.head(2 * x)
+        later.mul_(2)
+        return out + later
+
+
+class _TwoStageBlock(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.first = nn.Linear(dim, dim)
+        self.second = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.second(self.first(x))
+
+
+def _bucket(patterns, mesh, reshard_after_forward, placement_fn=per_param_placements):
+    return BucketSpec(
+        patterns,
+        placement_fn=placement_fn,
+        mesh=mesh,
+        reshard_after_forward=reshard_after_forward,
+    )
+
+
+def _buckets(model: nn.Module):
+    return [
+        bucket
+        for context in model._flex_shard_eager_comm_contexts.values()
+        for bucket in context.buckets
+    ]
 
 
 class TestFlexShardEagerRuntime(TestCase):
@@ -54,18 +142,155 @@ class TestFlexShardEagerRuntime(TestCase):
             for storage in model.sharded_bucket_storages:
                 self.assertEqual(storage.byte_storage.device.type, "meta")
 
-            model.to_empty(device="cuda")
-            for storage in model.sharded_bucket_storages:
-                self.assertEqual(storage.byte_storage.device.type, "cuda")
-            for param in model.parameters():
-                self.assertTrue(is_flex_shard_param(param))
-                nn.init.uniform_(param, -0.1, 0.1)
+            # The second to_empty() replaces the params the runtime captured.
+            for _ in range(2):
+                model.to_empty(device="cuda")
+                for storage in model.sharded_bucket_storages:
+                    self.assertEqual(storage.byte_storage.device.type, "cuda")
+                for param in model.parameters():
+                    self.assertTrue(is_flex_shard_param(param))
+                    nn.init.uniform_(param, -0.1, 0.1)
+                    param.grad = None
 
-            loss = model(transformer_inputs(args, device="cuda")).sum()
+                loss = model(transformer_inputs(args, device="cuda")).sum()
+                loss.backward()
+
+                for param in model.parameters():
+                    self.assertIsNotNone(param.grad)
+
+    def test_persistent_unsharded_params(self):
+        for reshard_after_forward in (False, True):
+            with (
+                self.subTest(reshard_after_forward=reshard_after_forward),
+                single_rank_cuda_mesh() as mesh,
+            ):
+                self._check_persistent_unsharded_params(mesh, reshard_after_forward)
+
+    def _check_persistent_unsharded_params(self, mesh, reshard_after_forward):
+        torch.manual_seed(0)
+        model = _PersistentParamsNet(8)
+        reference = copy.deepcopy(model).cuda()
+        model.layers[0].weight.custom_tag = "kept"
+        seen_weights = []
+        # Registered before flex_shard(), whose pre-forward hook still runs first.
+        model.layers[0].register_forward_pre_hook(
+            lambda module, args: seen_weights.append(module.weight)
+        )
+        mixed = MixedBucketPlacement({})
+
+        def head_placements(named_params, mesh):
+            return {
+                fqn: (
+                    mixed.shard0
+                    if fqn.endswith("weight")
+                    else mixed.block_shard(blocks_per_rank=(1,)),
+                )
+                for fqn, _ in named_params
+            }
+
+        flex_shard(
+            model,
+            buckets=[
+                # One module at a dotted path, and a bucket spanning a
+                # ModuleList, which has no forward of its own.
+                _bucket(["layers.0.*"], mesh, reshard_after_forward),
+                _bucket(["layers.1.*", "layers.2.*"], mesh, reshard_after_forward),
+                _bucket(["head.*"], mesh, reshard_after_forward, head_placements),
+            ],
+        )
+        buckets = _buckets(model)
+        for bucket, hook_module in zip(
+            buckets, (model.layers[0], model, model.head), strict=True
+        ):
+            self.assertIs(bucket.forward_hook_module(), hook_module)
+        head_resharded = []
+
+        def probe_head_input(module, args, output):
+            # Runs after both head branches' backward, before the layers'.
+            if output.requires_grad:
+                output.register_hook(
+                    lambda grad: head_resharded.append(not buckets[2].is_unsharded)
+                )
+
+        model.layers[2].register_forward_hook(probe_head_input)
+
+        x = torch.randn(4, 8, device="cuda")
+        with torch.inference_mode():  # the first unshard runs in inference mode
+            model(x)
+        persistent = [param for bucket in buckets for param in bucket.unsharded_params]
+        buffers = [buffer for bucket in buckets for buffer in bucket.persistent_buffers]
+        optim = torch.optim.SGD(model.parameters(), lr=0.1)
+        ref_optim = torch.optim.SGD(reference.parameters(), lr=0.1)
+        for step in range(2):
+            if step == 1:  # freezing a local shard after flex_shard() takes effect
+                model.head.used.bias.requires_grad_(False)
+                reference.head.used.bias.requires_grad_(False)
+            optim.zero_grad()
+            ref_optim.zero_grad()
+            loss = model(x).sum()
+            self.assertTrue(
+                all(
+                    (buffer.untyped_storage().size() == 0) == reshard_after_forward
+                    for buffer in buffers
+                )
+            )
             loss.backward()
+            reference(x).sum().backward()
+            for param, ref_param in zip(
+                model.parameters(), reference.parameters(), strict=True
+            ):
+                torch.testing.assert_close(param.grad, ref_param.grad)
+            optim.step()
+            ref_optim.step()
+            # The same persistent params, their storage freed after backward.
+            self.assertTrue(
+                all(
+                    a is b
+                    for a, b in zip(
+                        (p for bucket in buckets for p in bucket.unsharded_params),
+                        persistent,
+                        strict=True,
+                    )
+                )
+            )
+            self.assertTrue(all(b.untyped_storage().size() == 0 for b in buffers))
+        self.assertEqual(head_resharded, [True, True])
+        self.assertTrue(all(weight is persistent[0] for weight in seen_weights))
+        self.assertEqual(persistent[0].custom_tag, "kept")
+        with torch.inference_mode():
+            torch.testing.assert_close(model(x), reference(x))
+        model(x)  # a forward whose backward will not run
+        model.reshard()
+        self.assertTrue(all(b.untyped_storage().size() == 0 for b in buffers))
 
-            for param in model.parameters():
-                self.assertIsNotNone(param.grad)
+    def test_prefetch_follows_learned_order(self):
+        # BucketSpec lists the buckets in reverse execution order. From the
+        # second step, prefetch follows the order learned in the first, and the
+        # recompute inside backward consumes the checkpointed block's backward
+        # prefetch: one unshard per bucket in forward and backward, none wasted.
+        with single_rank_cuda_mesh() as mesh:
+            model = nn.Sequential(
+                nn.Linear(8, 8), checkpoint_wrapper(_TwoStageBlock(8))
+            )
+            block = "1._checkpoint_wrapped_module"
+            flex_shard(
+                model,
+                buckets=[
+                    _bucket([pattern], mesh, reshard_after_forward=True)
+                    for pattern in (f"{block}.second.*", f"{block}.first.*", "0.*")
+                ],
+            )
+            x = torch.randn(4, 8, device="cuda")
+            model(x).sum().backward()
+            begin_unshard = bucket_runtime.BucketRuntime.begin_unshard
+            with patch.object(
+                bucket_runtime.BucketRuntime,
+                "begin_unshard",
+                autospec=True,
+                side_effect=begin_unshard,
+            ) as unshards:
+                model(x).sum().backward()
+            self.assertEqual(unshards.call_count, 6)
 
     def test_torch_compile_forward_backward_on_cuda_mesh(self):
         with single_rank_cuda_mesh() as mesh:
