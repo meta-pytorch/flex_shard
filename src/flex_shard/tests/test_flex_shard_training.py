@@ -266,6 +266,8 @@ class TestFlexShardTraining(FSDPTest):
                     placement_fn=placement_fn,
                     mesh=mesh,
                     reshard_after_forward=False,
+                    # Checks legacy unshard-lease buffer lifetimes.
+                    persistent_unsharded_params=False,
                 )
             ],
         )
@@ -580,6 +582,15 @@ class TestFlexShardTraining(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_reshard_after_forward_with_activation_checkpointing(self):
+        for persistent in (True, False):
+            with self.subTest(persistent_unsharded_params=persistent):
+                self._check_reshard_after_forward_with_activation_checkpointing(
+                    persistent
+                )
+
+    def _check_reshard_after_forward_with_activation_checkpointing(
+        self, persistent: bool
+    ):
         mesh = init_device_mesh(
             device_type.type,
             (self.world_size,),
@@ -601,33 +612,37 @@ class TestFlexShardTraining(FSDPTest):
                 args.n_layers,
                 mesh,
                 reshard_after_forward=True,
+                persistent_unsharded_params=persistent,
             ),
         )
 
         self.assertIsInstance(model.layers[0], CheckpointWrapper)
-        composed_context_fn = model.layers[0].checkpoint_fn.keywords["context_fn"]
-        self.assertIsNot(composed_context_fn, _prefer_recompute_context_fn)
-        forward_ctx, _ = composed_context_fn()
-        from ..flex_shard.unshard_op import UNSHARD_BUCKET_OP
+        if not persistent:
+            # Legacy buckets compose FlexShard's recompute policy into the
+            # user's activation-checkpoint wrapper; persistent buckets don't.
+            composed_context_fn = model.layers[0].checkpoint_fn.keywords["context_fn"]
+            self.assertIsNot(composed_context_fn, _prefer_recompute_context_fn)
+            forward_ctx, _ = composed_context_fn()
+            from ..flex_shard.unshard_op import UNSHARD_BUCKET_OP
 
-        self.assertEqual(
-            forward_ctx.policy_fn(
-                None,
-                UNSHARD_BUCKET_OP,
-            ),
-            CheckpointPolicy.MUST_RECOMPUTE,
-        )
-        self.assertEqual(
-            forward_ctx.policy_fn(None, torch.ops.aten.mm.default),
-            CheckpointPolicy.PREFER_RECOMPUTE,
-        )
-        self.assertEqual(
-            forward_ctx.policy_fn(
-                None,
-                torch.ops._c10d_functional.all_to_all_single.default,
-            ),
-            CheckpointPolicy.PREFER_RECOMPUTE,
-        )
+            self.assertEqual(
+                forward_ctx.policy_fn(
+                    None,
+                    UNSHARD_BUCKET_OP,
+                ),
+                CheckpointPolicy.MUST_RECOMPUTE,
+            )
+            self.assertEqual(
+                forward_ctx.policy_fn(None, torch.ops.aten.mm.default),
+                CheckpointPolicy.PREFER_RECOMPUTE,
+            )
+            self.assertEqual(
+                forward_ctx.policy_fn(
+                    None,
+                    torch.ops._c10d_functional.all_to_all_single.default,
+                ),
+                CheckpointPolicy.PREFER_RECOMPUTE,
+            )
 
         torch.manual_seed(42 + self.rank + 1)
         x = transformer_inputs(args, batch_size=3, device=device_type)

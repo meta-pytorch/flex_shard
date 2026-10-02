@@ -369,6 +369,7 @@ class BlockShard(Placement):
             state.layout.padded_segment_numel,
         )
         full_params: list[torch.Tensor] = []
+        destinations = prepared.copy_out_destinations
         with _record_copy_out_if_eager():
             for index, info in enumerate(state.infos):
                 offset = state.layout.param_offsets[index]
@@ -386,13 +387,18 @@ class BlockShard(Placement):
                     )
                     for rank in range(world_size)
                 ]
-                full_params.append(
-                    torch.cat(
-                        rank_shards,
-                        dim=self._normalize_dim(info.global_shape),
+                dim = self._normalize_dim(info.global_shape)
+                if destinations is not None:
+                    full_params.append(
+                        torch.cat(rank_shards, dim=dim, out=destinations[index])
                     )
-                )
+                else:
+                    full_params.append(torch.cat(rank_shards, dim=dim))
         return PlacementUnshardResult(full_params=full_params)
+
+    @override
+    def supports_copy_out_destinations(self) -> bool:
+        return True
 
     def _pack_reduce_scatter_grad(
         self,

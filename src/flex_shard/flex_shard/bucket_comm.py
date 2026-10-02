@@ -41,6 +41,15 @@ class UnshardHandle:
         """Release buffers owned by an unconsumed unshard operation."""
         raise NotImplementedError
 
+    def set_copy_out_destinations(self, destinations: list[torch.Tensor]) -> bool:
+        """Ask finish() to copy full params into ``destinations``.
+
+        Returns whether the placement accepted them; if not, finish() returns
+        fresh tensors and the caller copies.
+        """
+        _ = destinations
+        return False
+
 
 class ReduceGradHandle:
     """Handle for a FlexShard bucket gradient reduction operation."""
@@ -314,6 +323,14 @@ class AsyncUnshardResult(UnshardHandle):
             return
         if self.event is not None:
             self.device_handle.current_stream(self._device).wait_event(self.event)
+
+    def set_copy_out_destinations(self, destinations: list[torch.Tensor]) -> bool:
+        if self._lease_taken or self._result is not None:
+            raise RuntimeError("Copy-out destinations must be set before finish().")
+        if not self.prepared.placement.supports_copy_out_destinations():
+            return False
+        self.prepared.copy_out_destinations = destinations
+        return True
 
     def release_buffers(self) -> None:
         """Release raw unshard buffers after current-stream work is queued."""
