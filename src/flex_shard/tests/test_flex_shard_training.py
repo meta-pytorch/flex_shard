@@ -98,21 +98,21 @@ class _ParallelLinears(torch.nn.Module):
         return self.first(x) + self.second(x)
 
 
-class _ReusedWeight(torch.nn.Module):
+class _AccumulatingWeight(torch.nn.Module):
     def __init__(self, *, device: torch.device, dtype: torch.dtype) -> None:
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(8, 8, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Per-use grads 256 and 1 sum to 257 in fp32 but round to 256 in bf16."""
-        return ((256 * x) @ self.weight).float().sum() + (x @ self.weight).float().sum()
+        """Grads of 256 and then 1 accumulate to 257 in fp32 but 256 in bf16."""
+        return (x @ self.weight).float().sum()
 
 
-class _ReusedWeights(torch.nn.Module):
+class _AccumulatingWeights(torch.nn.Module):
     def __init__(self, *, device: torch.device, dtype: torch.dtype) -> None:
         super().__init__()
-        self.a = _ReusedWeight(device=device, dtype=dtype)
-        self.b = _ReusedWeight(device=device, dtype=dtype)
+        self.a = _AccumulatingWeight(device=device, dtype=dtype)
+        self.b = _AccumulatingWeight(device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.a(x) + self.b(x)
@@ -805,7 +805,7 @@ class TestFlexShardTraining(FSDPTest):
             )
 
     @skip_if_lt_x_gpu(2)
-    def test_reused_param_grads_accumulate_in_unsharded_grad_dtype(self):
+    def test_grads_accumulate_in_unsharded_grad_dtype(self):
         mesh = init_device_mesh(
             device_type.type,
             (self.world_size,),
@@ -813,13 +813,14 @@ class TestFlexShardTraining(FSDPTest):
         )
         bf16, fp32 = torch.bfloat16, torch.float32
         # Each case exercises one source of the unsharded accumulation dtype.
-        # The first backward runs without sync, so autograd casts each use's
-        # grad before summing them; a syncing backward defers that cast to the
-        # reduce-scatter copy-in, as FSDP2 does, and its zero grads only add.
+        # Grads of 256, from a backward without sync, and then 1, from a
+        # syncing one, accumulate to 257 only in fp32. As in FSDP2, the upcast
+        # is deferred: the backward without sync still holds the grad in the
+        # compute dtype when it reshards and widens it after.
         cases = (
-            ("storage_dtype", fp32, None, bf16, None, 257.0),
-            ("explicit_grad_dtype", bf16, fp32, None, None, 257.0),
-            ("reduce_dtype", bf16, fp32, None, bf16, 256.0),
+            ("storage_dtype", fp32, None, bf16, None, fp32, 257.0),
+            ("explicit_grad_dtype", bf16, fp32, None, None, fp32, 257.0),
+            ("reduce_dtype", bf16, fp32, None, bf16, bf16, 256.0),
         )
         for case in cases:
             (
@@ -828,11 +829,12 @@ class TestFlexShardTraining(FSDPTest):
                 grad_dtype,
                 param_dtype,
                 reduce_dtype,
+                accumulation_dtype,
                 grad_value,
             ) = case
             compute_dtype = param_dtype or dtype
             with self.subTest(name=name):
-                model = _ReusedWeight(device=device_type, dtype=dtype)
+                model = _AccumulatingWeight(device=device_type, dtype=dtype)
                 if grad_dtype is not None:
                     model.weight.grad_dtype = grad_dtype
                 flex_shard(
@@ -852,10 +854,29 @@ class TestFlexShardTraining(FSDPTest):
                 )
 
                 x = torch.ones(1, 8, dtype=compute_dtype, device=device_type)
-                model.set_requires_gradient_sync(False)
-                model(x).backward()
+                runtime = bucket_runtime.BucketRuntime
+                at_reshard = []
+
+                def record_reshard(bucket, reshard=runtime.reshard):
+                    at_reshard.append(
+                        [
+                            p.grad.dtype
+                            for p in bucket.unsharded_params
+                            if p.grad is not None
+                        ]
+                    )
+                    reshard(bucket)
+
+                with mock.patch.object(
+                    runtime, "reshard", autospec=True, side_effect=record_reshard
+                ) as reshards:
+                    model.set_requires_gradient_sync(False)
+                    model(256 * x).backward()
+                unsharded_param = reshards.call_args.args[0].unsharded_params[0]
+                self.assertEqual(at_reshard, [[compute_dtype]])
+                self.assertEqual(unsharded_param.grad.dtype, accumulation_dtype)
                 model.set_requires_gradient_sync(True)
-                model(0 * x).backward()
+                model(x).backward()
                 grad = model._parameters["weight"].grad
                 self.assertIsNotNone(grad)
                 self.assertEqual(grad.dtype, fp32)
@@ -880,17 +901,16 @@ class TestFlexShardTraining(FSDPTest):
             (self.world_size,),
             mesh_dim_names=("fsdp",),
         )
-        model = _ReusedWeights(device=device_type, dtype=torch.bfloat16)
+        model = _AccumulatingWeights(device=device_type, dtype=torch.bfloat16)
         model.b.weight.grad_dtype = torch.float32
         flex_shard_cuda(model, mesh)
 
         x = torch.ones(1, 8, dtype=torch.bfloat16, device=device_type)
-        # As above, the backward without sync sums each use's grad in the
-        # accumulation dtype, and the syncing one reduces.
+        # Grads of 256 and then 1: b accumulates them in fp32, a in bf16.
         model.set_requires_gradient_sync(False)
-        model(x).backward()
+        model(256 * x).backward()
         model.set_requires_gradient_sync(True)
-        model(0 * x).backward()
+        model(x).backward()
 
         # b's fp32 sum of 257 survives only if the shared reduction promotes
         # a's bf16 and b's fp32 gradients to fp32.

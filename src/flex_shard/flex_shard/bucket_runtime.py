@@ -686,15 +686,14 @@ class BucketRuntime:
     def _set_unsharded_grad_dtypes(self, *, defer_upcast: bool) -> None:
         """Defer or restore the upcast of grads accumulating in a wider dtype.
 
-        As in FSDP2 (pytorch/pytorch#198668), a param whose unsharded grad
-        dtype is wider than its compute dtype keeps the grads autograd produces
-        while deferred (``grad_dtype=None``): the reduce-scatter copy-in widens
-        them as it copies, and AccumulateGrad adds them in place to a wider kept
-        grad. That saves a cast kernel per param and the wider unsharded grads
-        until the copy-in. Only a param's first grad in a backward without sync
-        is cast, so the accumulation starts in the wider dtype. Restoring
-        upcasts a grad deferred but not reduced, e.g. if sync was turned off
-        during the backward.
+        As in FSDP2 (pytorch/pytorch#198668 and #199242), a param whose
+        unsharded grad dtype is wider than its compute dtype keeps the grads
+        autograd produces while deferred (``grad_dtype=None``), in every
+        backward: the reduce-scatter copy-in widens them as it copies, and
+        AccumulateGrad adds them in place to a wider kept grad. That saves a
+        cast kernel per param and the wider unsharded grads until the copy-in.
+        Restoring upcasts a new grad that is not reduced, once, after the
+        bucket reshards, so the accumulation across backwards stays wider.
         """
         for bucket_param, param in zip(
             self.bucket_params, self.unsharded_params or [], strict=False
@@ -710,11 +709,10 @@ class BucketRuntime:
                 or dtype.itemsize <= compute_dtype.itemsize
             ):
                 continue
-            grad = param.grad
             if defer_upcast:
-                if grad is not None or self.bucket_storage._requires_gradient_sync:
-                    param.grad_dtype = None
+                param.grad_dtype = None
                 continue
+            grad = param.grad
             if grad is not None and grad.dtype != dtype:
                 param.grad = grad.to(dtype)
             param.grad_dtype = dtype
