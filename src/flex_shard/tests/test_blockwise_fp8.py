@@ -194,7 +194,8 @@ class _DenseAllGatherReferencePlacement(Fp8BucketedBlockShard):
                 )
             foreach_copy_(copy_dsts, copy_srcs)
         full_params = []
-        for info in state.infos:
+        inner_tensors: list[torch.Tensor] = []
+        for index, info in enumerate(state.infos):
             dense_weight = dense_by_fqn[info.fqn]
             dense_weight.requires_grad_(info.requires_grad)
             fp8_data, recip_scale = _quantize_dense_weight_to_blockwise_fp8(
@@ -202,6 +203,14 @@ class _DenseAllGatherReferencePlacement(Fp8BucketedBlockShard):
                 self.block_size,
                 self.fp8_dtype,
             )
+            if prepared.inner_tensors is not None:
+                # Persistent unshard: refill the previous fp8 data and scales.
+                persistent_data = prepared.inner_tensors[2 * index]
+                persistent_scale = prepared.inner_tensors[2 * index + 1]
+                persistent_data.copy_(fp8_data)
+                persistent_scale.copy_(recip_scale)
+                fp8_data, recip_scale = persistent_data, persistent_scale
+            inner_tensors.extend((fp8_data, recip_scale))
             full_params.append(
                 self._make_blockwise_fp8_weight(
                     fp8_data,
@@ -210,7 +219,10 @@ class _DenseAllGatherReferencePlacement(Fp8BucketedBlockShard):
                     requires_grad=dense_weight.requires_grad,
                 )
             )
-        return PlacementUnshardResult(full_params=full_params)
+        return PlacementUnshardResult(
+            full_params=full_params,
+            inner_tensors=inner_tensors if prepared.persistent else [],
+        )
 
 
 def _make_blockwise_fp8_weight() -> BlockwiseFp8Weight:

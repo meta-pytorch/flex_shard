@@ -7,16 +7,15 @@
 """Persistent unsharded parameters (FSDP2-style ``resize_``)."""
 
 import copy
-from unittest import mock
 
 import torch
 import torch.nn as nn
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 from .. import BucketSpec, flex_shard, is_flex_shard_param
-from ..custom_placements.block_shard import BucketedBlockShard
+from ..custom_placements.block_shard import BlockShard, BucketedBlockShard
+from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..custom_placements.shard import per_param_placements, Shard
-from ..flex_shard.bucket_comm import AsyncUnshardResult
 from .common import single_rank_cuda_mesh
 
 
@@ -114,17 +113,30 @@ def _per_child_buckets(model: nn.Module, mesh, reshard_after_forward: bool):
     ]
 
 
-def _persistent_params(model: nn.Module) -> list[nn.Parameter]:
-    contexts = model._flex_shard_eager_comm_contexts
+def _buckets(model: nn.Module):
     return [
-        bucket_param.unsharded_param
-        for context in contexts.values()
+        bucket
+        for context in model._flex_shard_eager_comm_contexts.values()
         for bucket in context.buckets
-        for bucket_param in bucket.bucket_params
+    ]
+
+
+def _persistent_params(model: nn.Module) -> list[nn.Parameter]:
+    """Persistent params (created by each bucket's first unshard)."""
+    return [param for bucket in _buckets(model) for param in bucket.unsharded_params]
+
+
+def _inner_tensors(model: nn.Module) -> list[torch.Tensor]:
+    return [
+        inner for bucket in _buckets(model) for inner in bucket.unsharded_inner_tensors
     ]
 
 
 class TestPersistentUnshardedParams(TestCase):
+    def _assert_same_params(self, params, expected):
+        self.assertEqual(len(params), len(expected))
+        self.assertTrue(all(a is b for a, b in zip(params, expected, strict=True)))
+
     def _assert_grads_match(self, model, reference):
         for param, ref_param in zip(
             model.parameters(), reference.parameters(), strict=True
@@ -183,18 +195,22 @@ class TestPersistentUnshardedParams(TestCase):
                         model,
                         buckets=_per_child_buckets(model, mesh, reshard_after_forward),
                     )
-                    persistent = _persistent_params(model)
-                    for unsharded in persistent:
-                        self.assertEqual(unsharded.untyped_storage().size(), 0)
-
+                    persistent = None
                     for _step in range(2):
                         loss = model(torch.randn(4, 8, device="cuda")).sum()
+                        if persistent is None:
+                            # Created by the first unshard, then reused.
+                            persistent = _persistent_params(model)
+                        # Same objects (identity; their storage may be freed).
+                        self._assert_same_params(_persistent_params(model), persistent)
                         for unsharded in persistent:
                             self.assertEqual(
                                 unsharded.untyped_storage().size() == 0,
                                 reshard_after_forward,
                             )
                         loss.backward()
+                        for inner in _inner_tensors(model):
+                            self.assertEqual(inner.untyped_storage().size(), 0)
                         for module, unsharded in zip(model, persistent, strict=True):
                             self.assertEqual(unsharded.untyped_storage().size(), 0)
                             self.assertIsNone(unsharded.grad)
@@ -285,60 +301,74 @@ class TestPersistentUnshardedParams(TestCase):
                         optim.step()
                         ref_optim.step()
 
-    def test_copy_out_path_per_placement(self):
+    def test_persistent_placements(self):
+        mixed = MixedBucketPlacement({})
         cases = (
-            ("shard", lambda fqns: {fqn: (Shard(0),) for fqn in fqns}, True),
+            ("shard", lambda fqn: Shard(0)),
+            ("block_shard", lambda fqn: BlockShard(blocks_per_rank=(1,))),
             (
-                # Outputs are views of the gathered bucket: one batched copy.
                 "bucketed_block_shard",
-                lambda fqns: {
-                    fqn: (BucketedBlockShard(dims=(0,), blocks_per_rank=(1,)),)
-                    for fqn in fqns
-                },
-                False,
+                lambda fqn: BucketedBlockShard(dims=(0,), blocks_per_rank=(1,)),
+            ),
+            (
+                "mixed",
+                lambda fqn: (
+                    mixed.shard0
+                    if fqn.endswith("weight")
+                    else mixed.block_shard(blocks_per_rank=(1,))
+                ),
             ),
         )
-        for name, make_placements, expect_direct in cases:
+        for name, make_placement in cases:
             with self.subTest(placement=name):
-                with single_rank_cuda_mesh() as mesh:
-                    torch.manual_seed(0)
-                    model = nn.Sequential(nn.Linear(8, 16), nn.Linear(16, 8))
-                    reference = copy.deepcopy(model).cuda()
-                    flex_shard(
-                        model,
-                        buckets=[
-                            BucketSpec(
-                                [f"{idx}.*"],
-                                placement_fn=lambda named_params, mesh: make_placements(
-                                    [fqn for fqn, _ in named_params]
-                                ),
-                                mesh=mesh,
-                                # The backward re-gather refills storage that
-                                # autograd saved in forward.
-                                reshard_after_forward=True,
-                            )
-                            for idx in (0, 1)
-                        ],
+                self._check_persistent_placement(make_placement)
+
+    def _check_persistent_placement(self, make_placement):
+        with single_rank_cuda_mesh() as mesh:
+            torch.manual_seed(0)
+            model = nn.Sequential(nn.Linear(8, 16), nn.Linear(16, 8))
+            reference = copy.deepcopy(model).cuda()
+            flex_shard(
+                model,
+                buckets=[
+                    BucketSpec(
+                        [f"{idx}.*"],
+                        placement_fn=lambda named_params, mesh: {
+                            fqn: (make_placement(fqn),) for fqn, _ in named_params
+                        },
+                        mesh=mesh,
+                        # The backward re-gather refills inner tensors that back
+                        # params autograd saved in forward.
+                        reshard_after_forward=True,
                     )
-                    accepted: list[bool] = []
-                    original = AsyncUnshardResult.set_copy_out_destinations
-
-                    def spy(handle, destinations):
-                        result = original(handle, destinations)
-                        accepted.append(result)
-                        return result
-
-                    x = torch.randn(4, 8, device="cuda")
-                    with mock.patch.object(
-                        AsyncUnshardResult, "set_copy_out_destinations", spy
-                    ):
-                        model(x).sum().backward()
-                    reference(x).sum().backward()
-
-                    self._assert_grads_match(model, reference)
-                    # Two buckets, each unsharded in forward and re-gathered
-                    # for backward.
-                    self.assertEqual(accepted, [expect_direct] * 4)
+                    for idx in (0, 1)
+                ],
+            )
+            persistent = None
+            for _step in range(2):
+                x = torch.randn(4, 8, device="cuda")
+                for param in (*model.parameters(), *reference.parameters()):
+                    param.grad = None
+                model(x).sum().backward()
+                reference(x).sum().backward()
+                self._assert_grads_match(model, reference)
+                if persistent is None:
+                    persistent = _persistent_params(model)
+                # Same objects (identity; their storage may be freed).
+                self._assert_same_params(_persistent_params(model), persistent)
+                for inner in _inner_tensors(model):
+                    self.assertEqual(inner.untyped_storage().size(), 0)
+            # While unsharded, each persistent param is backed by an inner tensor.
+            inner_ptrs = set()
+            for bucket in _buckets(model):
+                bucket.pre_forward_persistent()
+                inner_ptrs.update(
+                    inner.untyped_storage().data_ptr()
+                    for inner in bucket.unsharded_inner_tensors
+                )
+                for param in bucket.unsharded_params:
+                    self.assertIn(param.untyped_storage().data_ptr(), inner_ptrs)
+                bucket.reshard_persistent()
 
     def test_persistent_param_inherits_attributes(self):
         with single_rank_cuda_mesh() as mesh:

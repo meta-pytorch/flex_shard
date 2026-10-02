@@ -369,6 +369,7 @@ class BlockShard(Placement):
             state.layout.padded_segment_numel,
         )
         full_params: list[torch.Tensor] = []
+        inner_tensors = prepared.inner_tensors
         with _record_copy_out_if_eager():
             for index, info in enumerate(state.infos):
                 offset = state.layout.param_offsets[index]
@@ -386,13 +387,18 @@ class BlockShard(Placement):
                     )
                     for rank in range(world_size)
                 ]
+                dim = self._normalize_dim(info.global_shape)
                 full_params.append(
-                    torch.cat(
-                        rank_shards,
-                        dim=self._normalize_dim(info.global_shape),
-                    )
+                    torch.cat(rank_shards, dim=dim, out=inner_tensors[index])
+                    if inner_tensors is not None
+                    else torch.cat(rank_shards, dim=dim)
                 )
-        return PlacementUnshardResult(full_params=full_params)
+        # The concatenated params are fresh tensors, so they are their own
+        # persistent storage.
+        return PlacementUnshardResult(
+            full_params=full_params,
+            inner_tensors=list(full_params) if prepared.persistent else [],
+        )
 
     def _pack_reduce_scatter_grad(
         self,
@@ -968,13 +974,31 @@ class BucketedBlockShard(Placement):
                 f"got {type(prepared.placement_state).__name__}"
             )
         gathered_bucket = prepared.buffers[1]
+        if prepared.persistent:
+            # The gathered bucket comes from the unshard stream; persistent
+            # storage lives on the current stream, so copy into it.
+            bucket = (
+                prepared.inner_tensors[0]
+                if prepared.inner_tensors is not None
+                else torch.empty_like(gathered_bucket)
+            )
+            with _record_copy_out_if_eager():
+                bucket.copy_(gathered_bucket)
+        else:
+            bucket = gathered_bucket
         full_params: list[torch.Tensor] = []
         for info in prepared.placement_state.infos:
             param_offset = self._param_layout(info).param_offset
             full_params.append(
-                gathered_bucket[param_offset : param_offset + info.global_numel].view(
+                bucket[param_offset : param_offset + info.global_numel].view(
                     info.global_shape
                 )
+            )
+        if prepared.persistent:
+            return PlacementUnshardResult(
+                full_params=full_params,
+                finish_buffers=[gathered_bucket],
+                inner_tensors=[bucket],
             )
         return PlacementUnshardResult(
             full_params=full_params,

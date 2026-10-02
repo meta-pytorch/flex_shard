@@ -41,15 +41,13 @@ class UnshardHandle:
         """Release buffers owned by an unconsumed unshard operation."""
         raise NotImplementedError
 
-    def set_copy_out_destinations(self, destinations: list[torch.Tensor]) -> bool:
-        """Ask finish() to copy full params into flat ``destinations``.
+    def set_persistent(self, inner_tensors: list[torch.Tensor] | None) -> None:
+        """Ask finish() for a persistent unshard.
 
-        See ``PlacementPreparedUnshard.copy_out_destinations``. Returns whether
-        the placement accepted them; if not, finish() returns fresh tensors and
-        the caller copies.
+        See ``PlacementPreparedUnshard``: ``inner_tensors`` is None on the first
+        persistent unshard, and the tensors to refill afterwards.
         """
-        _ = destinations
-        return False
+        raise NotImplementedError
 
 
 class ReduceGradHandle:
@@ -86,6 +84,9 @@ class UnshardLease:
 
     full_params: list[torch.Tensor]
     consumer_handoff: StreamHandoff | None
+    # Persistent unshard: storage backing ``full_params`` (see
+    # PlacementUnshardResult.inner_tensors).
+    inner_tensors: list[torch.Tensor] = field(default_factory=list)
 
     def has_consumer_buffers(self) -> bool:
         """Return whether this lease owns storage needed by a consumer."""
@@ -315,7 +316,9 @@ class AsyncUnshardResult(UnshardHandle):
         if finish_handoff is not None:
             finish_handoff.release_after_current_stream()
         consumer_handoff = self._make_buffer_handoff(consumer_buffers)
-        lease = UnshardLease(results, consumer_handoff)
+        lease = UnshardLease(
+            results, consumer_handoff, inner_tensors=self._result.inner_tensors
+        )
         self._lease_taken = True
         return lease
 
@@ -325,13 +328,11 @@ class AsyncUnshardResult(UnshardHandle):
         if self.event is not None:
             self.device_handle.current_stream(self._device).wait_event(self.event)
 
-    def set_copy_out_destinations(self, destinations: list[torch.Tensor]) -> bool:
+    def set_persistent(self, inner_tensors: list[torch.Tensor] | None) -> None:
         if self._lease_taken or self._result is not None:
-            raise RuntimeError("Copy-out destinations must be set before finish().")
-        if not self.prepared.placement.supports_copy_out_destinations():
-            return False
-        self.prepared.copy_out_destinations = destinations
-        return True
+            raise RuntimeError("set_persistent() must be called before finish().")
+        self.prepared.persistent = True
+        self.prepared.inner_tensors = inner_tensors
 
     def release_buffers(self) -> None:
         """Release raw unshard buffers after current-stream work is queued."""

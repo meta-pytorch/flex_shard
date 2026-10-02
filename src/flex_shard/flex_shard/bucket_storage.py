@@ -125,16 +125,16 @@ class BucketSpec:
             hooks that run in both the original forward and activation
             checkpoint recomputation.
         persistent_unsharded_params: Whether module code sees a persistent
-            unsharded ``nn.Parameter`` per managed parameter (FSDP2-style). Its
-            storage is allocated and filled on unshard and freed with
-            ``untyped_storage().resize_(0)`` on reshard; it is swapped into the
-            owning module's ``_parameters`` while unsharded, so attribute reads
-            and ``module.parameters()`` see it in forward and backward.
-            Gradients accumulate into it through autograd and are then
-            reduce-scattered into the local shard. Defaults to True (see
+            unsharded ``nn.Parameter`` per managed parameter (FSDP2-style). It
+            is created from the first unshard; the placement-owned storage
+            backing it is freed with ``untyped_storage().resize_(0)`` on reshard
+            and re-allocated and refilled in place on later unshards. It is
+            swapped into the owning module's ``_parameters`` while unsharded,
+            so attribute reads and ``module.parameters()`` see it in forward and
+            backward. Gradients accumulate into it through autograd and are
+            then reduce-scattered into the local shard. Defaults to True (see
             ``_default_persistent_unsharded_params``). False selects the legacy
-            property-getter path. Placements whose unshard output is a tensor
-            subclass (blockwise fp8) always use the legacy path.
+            property-getter path.
     """
 
     patterns: list[str]
@@ -299,13 +299,7 @@ class ShardedBucketStorage:
             module,
             reshard_after_forward=bucket_spec.reshard_after_forward,
             gradient_reduce_op=bucket_spec.gradient_reduce_op,
-            persistent_unsharded_params=(
-                bucket_spec.persistent_unsharded_params
-                and all(
-                    info.placement.supports_persistent_unsharded_params()
-                    for info in param_infos.values()
-                )
-            ),
+            persistent_unsharded_params=bucket_spec.persistent_unsharded_params,
         )
         bucket_storage.copy_params_from(named_params)
         bucket_storage.install_sharded_params(expected_param_device)

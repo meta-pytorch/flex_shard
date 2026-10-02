@@ -279,34 +279,6 @@ class Placement(ABC):
         """Finish the prepared unshard and return full parameters."""
         raise NotImplementedError
 
-    def supports_persistent_unsharded_params(self) -> bool:
-        """Return whether unshard outputs fit a dense persistent parameter.
-
-        Placements whose unshard produces a tensor subclass the module consumes
-        directly (e.g. blockwise-fp8 weights) return False; their buckets use
-        the legacy property-getter path.
-        """
-        return True
-
-    def supports_copy_out_destinations(self) -> bool:
-        """Return whether finish can copy into ``prepared.copy_out_destinations``.
-
-        Persistent unsharded parameters pass flat buffers over their storage as
-        destinations, so the unshard copy-out writes into them directly.
-        Placements that return False produce fresh tensors (or views), which
-        the runtime then copies.
-        """
-        return False
-
-    def unshard_storage_numel(self, info: ParamInfo, world_size: int) -> int:
-        """Elements in the flat copy-out destination for ``info``.
-
-        Defaults to the full parameter size. Placements whose copy-out writes a
-        padded buffer (e.g. ``Shard`` with uneven dim-0) return the padded size.
-        """
-        _ = world_size
-        return info.global_numel
-
     def prepare_reduce_grad(
         self,
         tensors: list[torch.Tensor],
@@ -333,16 +305,22 @@ class PlacementPreparedUnshard:
     ``finish_prepared_unshard()`` queues their final use.
     ``placement_state`` is private metadata passed back to the same placement's
     run/finish methods.
+
+    ``persistent`` asks finish to back the full parameters with storage the
+    caller keeps across unshards (FSDP2-style persistent unsharded
+    parameters). On the first persistent unshard ``inner_tensors`` is None: the
+    placement allocates fresh storage on the current stream, backs the full
+    params with it only, and returns it as ``PlacementUnshardResult.
+    inner_tensors``. On later unshards ``inner_tensors`` holds those tensors,
+    with storage re-allocated by the caller, and finish writes the new values
+    into them in the same layout.
     """
 
     placement: Placement
     buffers: list[torch.Tensor]
     placement_state: Any
-    # Flat buffers to copy into, one per param, when the placement supports
-    # it: 1-D tensors of ``unshard_storage_numel`` elements (aliasing persistent
-    # unsharded parameter storage). The placement carves each full parameter
-    # out of its buffer as it would out of a freshly allocated one.
-    copy_out_destinations: list[torch.Tensor] | None = None
+    persistent: bool = False
+    inner_tensors: list[torch.Tensor] | None = None
 
 
 @dataclass
@@ -360,6 +338,9 @@ class PlacementUnshardResult:
     buffers: list[torch.Tensor] = field(default_factory=list)
     finish_buffers: list[torch.Tensor] = field(default_factory=list)
     consumer_buffers: list[torch.Tensor] = field(default_factory=list)
+    # Persistent unshard: the storage roots backing ``full_params`` (FSDP2's
+    # unsharded inner tensors), which the caller frees and re-allocates.
+    inner_tensors: list[torch.Tensor] = field(default_factory=list)
 
 
 @dataclass

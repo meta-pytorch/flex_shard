@@ -188,11 +188,6 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
     FP8 data and scales to the configured ``weight_factory``.
     """
 
-    def supports_persistent_unsharded_params(self) -> bool:
-        # Unshard returns BlockwiseFp8Weight, which the fp8 linear consumes
-        # directly; a dense persistent parameter cannot hold it.
-        return False
-
     @dataclass(frozen=True)
     class _BlockRowParam:
         """Per-parameter block-row span used by the bucket partition planner."""
@@ -1192,10 +1187,16 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         fp8_nbytes = sum(metadata.rank_fp8_numels)
         scale_nbytes = sum(metadata.rank_scale_numels) * torch.float32.itemsize
         scale_byte_offset = _align_up(fp8_nbytes, _VEC_ALIGN_BYTES)
-        compact = torch.empty(
-            scale_byte_offset + scale_nbytes,
-            dtype=torch.uint8,
-            device=rank_rows.device,
+        # Persistent unshards keep ``compact`` (fp8 data + scales) as the
+        # storage backing the returned BlockwiseFp8Weights.
+        compact = (
+            prepared.inner_tensors[0]
+            if prepared.inner_tensors is not None
+            else torch.empty(
+                scale_byte_offset + scale_nbytes,
+                dtype=torch.uint8,
+                device=rank_rows.device,
+            )
         )
         fp8_bytes = compact[:fp8_nbytes]
         scale_bytes = compact[scale_byte_offset:]
@@ -1299,6 +1300,11 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             scale_offset += scale_numel
         if fp8_offset != fp8_flat.numel() or scale_offset != scale_flat.numel():
             raise AssertionError("Compacted FP8 bucket metadata is inconsistent.")
+        if prepared.persistent:
+            return PlacementUnshardResult(
+                full_params=full_params,
+                inner_tensors=[compact],
+            )
         return PlacementUnshardResult(
             full_params=full_params,
             consumer_buffers=[compact],
