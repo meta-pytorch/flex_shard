@@ -451,11 +451,15 @@ class TestFlexShardTraining(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_gradient_accumulation(self):
-        # Three microbatches, syncing each one or with no_sync() on the first
-        # two, resharding between them or keeping the params unsharded. Only
-        # the layer reshards after forward. The last microbatch skips the layer
-        # and the positional embeddings, so their kept grads are reduced in the
-        # end-of-backward callback.
+        # Three microbatches, in three modes:
+        # - "sync": every microbatch reduce-scatters.
+        # - "per_bucket": sync is off for every bucket but the layer's on the
+        #   first two microbatches, set through the per-bucket setters.
+        # - "keep": no_sync() on the first two microbatches, keeping every
+        #   bucket but the norm's unsharded between them.
+        # Only the layer reshards after forward. The last microbatch skips the
+        # layer and the positional embeddings, so their kept grads are reduced
+        # in the end-of-backward callback.
         mesh = init_device_mesh(
             device_type.type,
             (self.world_size,),
@@ -479,17 +483,17 @@ class TestFlexShardTraining(FSDPTest):
                 return module(x).sum()
             return module.output(module.norm(module.tok_embeddings(x))).sum()
 
-        for no_sync, reshard_after_backward in (
-            (False, True),
-            (True, True),
-            (True, False),
-        ):
+        for mode in ("sync", "per_bucket", "keep"):
             model = copy.deepcopy(base_model)
             reference = copy.deepcopy(base_model)
             buckets = transformer_bucket_specs(args.n_layers, mesh)
             buckets[2] = dataclasses.replace(buckets[2], reshard_after_forward=True)
             flex_shard(model, buckets=buckets)
-            model.set_reshard_after_backward(reshard_after_backward)
+            storages = model.sharded_bucket_storages
+            layer, norm = storages[2], storages[3]
+            if mode == "keep":
+                model.set_reshard_after_backward(False)
+                norm.set_reshard_after_backward(True)
             optim = make_test_sgd(model.parameters(), lr=0.1)
             ref_optim = make_test_sgd(reference.parameters(), lr=0.1)
 
@@ -510,12 +514,15 @@ class TestFlexShardTraining(FSDPTest):
             ):
                 for idx in range(len(inputs)):
                     last = idx == len(inputs) - 1
-                    if no_sync and reshard_after_backward and last:
-                        model.reshard()  # keeps the accumulated grads
+                    if mode == "per_bucket":
+                        if last:
+                            model.reshard()  # keeps the accumulated grads
+                        for storage in storages:
+                            storage.set_requires_gradient_sync(last or storage is layer)
                     with (
-                        contextlib.nullcontext()
-                        if last or not no_sync
-                        else model.no_sync()
+                        model.no_sync()
+                        if mode == "keep" and not last
+                        else contextlib.nullcontext()
                     ):
                         loss = microbatch_loss(model, idx)
                         ref_loss = microbatch_loss(reference, idx)
@@ -523,20 +530,23 @@ class TestFlexShardTraining(FSDPTest):
                         loss.backward()
                         ref_loss.backward()
 
-            if no_sync:
-                # One reduce-scatter per bucket per step.
-                reduced = Counter(
-                    call.args[0].debug_fqn for call in reduces.call_args_list
-                )
-                self.assertEqual(sorted(reduced.values()), [1] * len(buckets))
-            if not reshard_after_backward:
-                # Kept buckets all-gather once per step; the layer also
-                # re-gathers in each backward.
-                gathered = Counter(
-                    call.args[0].debug_fqn for call in unshards.call_args_list
-                )
-                self.assertEqual(sorted(gathered.values()), [1, 1, 1, 1, 3])
-                self.assertEqual(gathered["layers.0"], 3)
+            reduced = Counter(call.args[0].debug_fqn for call in reduces.call_args_list)
+            gathered = Counter(
+                call.args[0].debug_fqn for call in unshards.call_args_list
+            )
+            once = dict.fromkeys(
+                ["tok_embeddings", "pos_embeddings", "layers.0", "norm", "output"], 1
+            )
+            if mode == "per_bucket":
+                # The layer reduce-scatters in both microbatches that use it,
+                # the other buckets once per step.
+                self.assertEqual(reduced, {**once, "layers.0": 2})
+            if mode == "keep":
+                # One reduce-scatter per bucket per step. Kept buckets
+                # all-gather once per step; the layer also re-gathers in each
+                # backward and the norm in each forward.
+                self.assertEqual(reduced, once)
+                self.assertEqual(gathered, {**once, "layers.0": 3, "norm": 3})
             _average_reference_grads(reference)
             check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
 

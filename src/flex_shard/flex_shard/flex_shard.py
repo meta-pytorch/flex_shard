@@ -54,7 +54,10 @@ class FlexShardModule:
 
     @property
     def sharded_bucket_storages(self) -> list[ShardedBucketStorage]:
-        """All bucket storage objects, one per bucket."""
+        """All bucket storage objects, one per non-empty BucketSpec, in order.
+
+        Each takes per-bucket settings, e.g. ``set_requires_gradient_sync``.
+        """
         return getattr(self, _SHARDED_BUCKET_STORAGES_ATTR)
 
     def to_empty(self, *, device, recurse: bool = True):
@@ -154,9 +157,13 @@ class FlexShardModule:
         bucket's ``reduce_dtype`` when it is wider than the param dtype. The
         next backward with ``True`` reduce-scatters the accumulated gradients.
         Eager only: torch.compile raises ``NotImplementedError``.
+
+        To set one bucket, e.g. to keep reduce-scattering expert buckets whose
+        full gradients are large, call ``set_requires_gradient_sync`` on its
+        entry in ``sharded_bucket_storages``.
         """
         for bucket_storage in self._bucket_storages(recurse):
-            bucket_storage._requires_gradient_sync = requires_gradient_sync
+            bucket_storage.set_requires_gradient_sync(requires_gradient_sync)
 
     def set_reshard_after_backward(
         self,
@@ -172,14 +179,18 @@ class FlexShardModule:
         all-gathers and reduce-scatters once per optimizer step. Until then,
         ``module.parameters()`` returns their unsharded params. Unlike FSDP2, a
         syncing backward always reshards, since the optimizer step then
-        changes the local shards.
+        changes the local shards. Entries of ``sharded_bucket_storages`` take
+        the same setting per bucket.
         """
         for bucket_storage in self._bucket_storages(recurse):
-            bucket_storage._reshard_after_backward = reshard_after_backward
+            bucket_storage.set_reshard_after_backward(reshard_after_backward)
 
     @contextmanager
     def no_sync(self, *, recurse: bool = True) -> Iterator[None]:
-        """Skip gradient sync for backwards inside the context, like FSDP1's."""
+        """Skip gradient sync for backwards inside the context, like FSDP1's.
+
+        Each bucket's previous setting is restored on exit.
+        """
         bucket_storages = self._bucket_storages(recurse)
         previous = [storage._requires_gradient_sync for storage in bucket_storages]
         self.set_requires_gradient_sync(False, recurse=recurse)
@@ -189,7 +200,7 @@ class FlexShardModule:
             for storage, requires_gradient_sync in zip(
                 bucket_storages, previous, strict=True
             ):
-                storage._requires_gradient_sync = requires_gradient_sync
+                storage.set_requires_gradient_sync(requires_gradient_sync)
 
     def set_max_pending_reduce_grads(
         self,
