@@ -1190,8 +1190,8 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         # Persistent unshards keep ``compact`` (fp8 data + scales) as the
         # storage backing the returned BlockwiseFp8Weights.
         compact = (
-            prepared.inner_tensors[0]
-            if prepared.inner_tensors is not None
+            prepared.persistent_buffers[0]
+            if prepared.persistent_buffers is not None
             else torch.empty(
                 scale_byte_offset + scale_nbytes,
                 dtype=torch.uint8,
@@ -1303,7 +1303,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         if prepared.persistent:
             return PlacementUnshardResult(
                 full_params=full_params,
-                inner_tensors=[compact],
+                persistent_buffers=[compact],
             )
         return PlacementUnshardResult(
             full_params=full_params,

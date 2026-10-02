@@ -221,11 +221,11 @@ class Shard(Placement):
         infos: list[ParamInfo],
         world_size: int,
         layout: Shard._PaddedUnshardLayout,
-        inner_tensors: list[torch.Tensor] | None = None,
+        persistent_buffers: list[torch.Tensor] | None = None,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """Return full params and the padded buffers backing them.
 
-        ``inner_tensors`` are padded buffers from a previous persistent unshard
+        ``persistent_buffers`` are padded buffers from a previous persistent unshard
         to write into instead of allocating.
         """
         full_params: list[torch.Tensor] = []
@@ -235,8 +235,8 @@ class Shard(Placement):
             zip(infos, layout.padded_local_numels, strict=True)
         ):
             padded_full_param = (
-                inner_tensors[idx]
-                if inner_tensors is not None
+                persistent_buffers[idx]
+                if persistent_buffers is not None
                 else torch.empty(
                     world_size * padded_local_numel,
                     dtype=info.unsharded_dtype,
@@ -337,12 +337,12 @@ class Shard(Placement):
                 state.infos,
                 state.world_size,
                 state.padded_layout,
-                inner_tensors=prepared.inner_tensors,
+                persistent_buffers=prepared.persistent_buffers,
             )
 
         return PlacementUnshardResult(
             full_params=full_params,
-            inner_tensors=padded_full_params if prepared.persistent else [],
+            persistent_buffers=padded_full_params if prepared.persistent else [],
         )
 
     def _pack_reduce_scatter_grad(

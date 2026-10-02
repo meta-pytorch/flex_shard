@@ -29,8 +29,14 @@ if TYPE_CHECKING:
 class UnshardHandle:
     """Handle for a FlexShard bucket unshard operation."""
 
-    def finish(self) -> UnshardLease:
-        """Wait for the unshard and transfer its parameter lease once."""
+    def finish(
+        self, persistent_buffers: list[torch.Tensor] | None = None
+    ) -> UnshardLease:
+        """Wait for the unshard and transfer its parameter lease once.
+
+        For a persistent unshard, ``persistent_buffers`` are the buffers from
+        the first one to refill (see ``PlacementPreparedUnshard``).
+        """
         raise NotImplementedError
 
     def wait(self) -> None:
@@ -39,14 +45,6 @@ class UnshardHandle:
 
     def release_buffers(self) -> None:
         """Release buffers owned by an unconsumed unshard operation."""
-        raise NotImplementedError
-
-    def set_persistent(self, inner_tensors: list[torch.Tensor] | None) -> None:
-        """Ask finish() for a persistent unshard.
-
-        See ``PlacementPreparedUnshard``: ``inner_tensors`` is None on the first
-        persistent unshard, and the tensors to refill afterwards.
-        """
         raise NotImplementedError
 
 
@@ -85,8 +83,8 @@ class UnshardLease:
     full_params: list[torch.Tensor]
     consumer_handoff: StreamHandoff | None
     # Persistent unshard: storage backing ``full_params`` (see
-    # PlacementUnshardResult.inner_tensors).
-    inner_tensors: list[torch.Tensor] = field(default_factory=list)
+    # PlacementUnshardResult.persistent_buffers).
+    persistent_buffers: list[torch.Tensor] = field(default_factory=list)
 
     def has_consumer_buffers(self) -> bool:
         """Return whether this lease owns storage needed by a consumer."""
@@ -152,8 +150,13 @@ def begin_bucket_unshard(
     mesh: DeviceMesh,
     unshard_stream: torch.Stream,
     debug_fqn: str | None = None,
+    persistent: bool = False,
 ) -> UnshardHandle:
-    """Begin a bucket unshard and return a handle for full params."""
+    """Begin a bucket unshard and return a handle for full params.
+
+    ``persistent`` requests a persistent unshard (eager only; see
+    ``PlacementPreparedUnshard``).
+    """
     placement = _get_bucket_placement(infos, "unshard")
 
     if torch.compiler.is_compiling():
@@ -168,6 +171,7 @@ def begin_bucket_unshard(
     with device_handle.stream(unshard_stream):
         unshard_stream.wait_event(copy_in_done)
         prepared = placement.prepare_unshard_bucket(tensors, infos, mesh, debug_fqn)
+        prepared.persistent = persistent
         prepared.placement.run_prepared_unshard(prepared)
         event = device_handle.Event()
         event.record(unshard_stream)
@@ -263,7 +267,11 @@ class SyncUnshardResult(UnshardHandle):
     full_params: list[torch.Tensor]
     _lease_taken: bool = field(default=False, init=False)
 
-    def finish(self) -> UnshardLease:
+    def finish(
+        self, persistent_buffers: list[torch.Tensor] | None = None
+    ) -> UnshardLease:
+        if persistent_buffers is not None:
+            raise AssertionError("Persistent unshards are eager-only.")
         if self._lease_taken:
             raise RuntimeError("An unshard lease may only be taken once.")
         lease = UnshardLease(self.full_params, None)
@@ -292,11 +300,14 @@ class AsyncUnshardResult(UnshardHandle):
     def __post_init__(self) -> None:
         self._device = _first_tensor_device(self.prepared.buffers)
 
-    def finish(self) -> UnshardLease:
+    def finish(
+        self, persistent_buffers: list[torch.Tensor] | None = None
+    ) -> UnshardLease:
         if self._lease_taken:
             raise RuntimeError("An unshard lease may only be taken once.")
         self.wait()
         if self._result is None:
+            self.prepared.persistent_buffers = persistent_buffers
             self._result = self.prepared.placement.finish_prepared_unshard(
                 self.prepared
             )
@@ -317,7 +328,9 @@ class AsyncUnshardResult(UnshardHandle):
             finish_handoff.release_after_current_stream()
         consumer_handoff = self._make_buffer_handoff(consumer_buffers)
         lease = UnshardLease(
-            results, consumer_handoff, inner_tensors=self._result.inner_tensors
+            results,
+            consumer_handoff,
+            persistent_buffers=self._result.persistent_buffers,
         )
         self._lease_taken = True
         return lease
@@ -327,12 +340,6 @@ class AsyncUnshardResult(UnshardHandle):
             return
         if self.event is not None:
             self.device_handle.current_stream(self._device).wait_event(self.event)
-
-    def set_persistent(self, inner_tensors: list[torch.Tensor] | None) -> None:
-        if self._lease_taken or self._result is not None:
-            raise RuntimeError("set_persistent() must be called before finish().")
-        self.prepared.persistent = True
-        self.prepared.inner_tensors = inner_tensors
 
     def release_buffers(self) -> None:
         """Release raw unshard buffers after current-stream work is queued."""

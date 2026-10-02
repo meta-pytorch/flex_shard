@@ -369,7 +369,7 @@ class BlockShard(Placement):
             state.layout.padded_segment_numel,
         )
         full_params: list[torch.Tensor] = []
-        inner_tensors = prepared.inner_tensors
+        persistent_buffers = prepared.persistent_buffers
         with _record_copy_out_if_eager():
             for index, info in enumerate(state.infos):
                 offset = state.layout.param_offsets[index]
@@ -389,15 +389,15 @@ class BlockShard(Placement):
                 ]
                 dim = self._normalize_dim(info.global_shape)
                 full_params.append(
-                    torch.cat(rank_shards, dim=dim, out=inner_tensors[index])
-                    if inner_tensors is not None
+                    torch.cat(rank_shards, dim=dim, out=persistent_buffers[index])
+                    if persistent_buffers is not None
                     else torch.cat(rank_shards, dim=dim)
                 )
         # The concatenated params are fresh tensors, so they are their own
         # persistent storage.
         return PlacementUnshardResult(
             full_params=full_params,
-            inner_tensors=list(full_params) if prepared.persistent else [],
+            persistent_buffers=list(full_params) if prepared.persistent else [],
         )
 
     def _pack_reduce_scatter_grad(
@@ -978,8 +978,8 @@ class BucketedBlockShard(Placement):
             # The gathered bucket comes from the unshard stream; persistent
             # storage lives on the current stream, so copy into it.
             bucket = (
-                prepared.inner_tensors[0]
-                if prepared.inner_tensors is not None
+                prepared.persistent_buffers[0]
+                if prepared.persistent_buffers is not None
                 else torch.empty_like(gathered_bucket)
             )
             with _record_copy_out_if_eager():
@@ -998,7 +998,7 @@ class BucketedBlockShard(Placement):
             return PlacementUnshardResult(
                 full_params=full_params,
                 finish_buffers=[gathered_bucket],
-                inner_tensors=[bucket],
+                persistent_buffers=[bucket],
             )
         return PlacementUnshardResult(
             full_params=full_params,

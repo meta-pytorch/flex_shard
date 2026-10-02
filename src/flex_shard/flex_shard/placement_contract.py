@@ -306,21 +306,21 @@ class PlacementPreparedUnshard:
     ``placement_state`` is private metadata passed back to the same placement's
     run/finish methods.
 
-    ``persistent`` asks finish to back the full parameters with storage the
+    ``persistent`` asks finish to back the full parameters with buffers the
     caller keeps across unshards (FSDP2-style persistent unsharded
-    parameters). On the first persistent unshard ``inner_tensors`` is None: the
-    placement allocates fresh storage on the current stream, backs the full
-    params with it only, and returns it as ``PlacementUnshardResult.
-    inner_tensors``. On later unshards ``inner_tensors`` holds those tensors,
-    with storage re-allocated by the caller, and finish writes the new values
-    into them in the same layout.
+    parameters). On the first persistent unshard ``persistent_buffers`` is
+    None: the placement allocates fresh buffers on the current stream, backs
+    the full params with them only, and returns them as
+    ``PlacementUnshardResult.persistent_buffers``. On later unshards
+    ``persistent_buffers`` holds those buffers, with storage re-allocated by
+    the caller, and finish writes the new values into them in the same layout.
     """
 
     placement: Placement
     buffers: list[torch.Tensor]
     placement_state: Any
     persistent: bool = False
-    inner_tensors: list[torch.Tensor] | None = None
+    persistent_buffers: list[torch.Tensor] | None = None
 
 
 @dataclass
@@ -332,15 +332,18 @@ class PlacementUnshardResult:
     ``finish_buffers`` are tensors created during finish that may be released
     after its copy-out work. ``consumer_buffers`` are the minimal storage roots
     backing full-parameter views and must remain live through their consumer.
+    ``persistent_buffers`` (persistent unshards only) are the storage backing
+    ``full_params`` that the caller keeps across unshards: it frees their
+    storage on reshard and re-allocates it before the next unshard refills
+    them. They correspond to FSDP2's all-gather outputs and unsharded inner
+    tensors.
     """
 
     full_params: list[torch.Tensor]
     buffers: list[torch.Tensor] = field(default_factory=list)
     finish_buffers: list[torch.Tensor] = field(default_factory=list)
     consumer_buffers: list[torch.Tensor] = field(default_factory=list)
-    # Persistent unshard: the storage roots backing ``full_params`` (FSDP2's
-    # unsharded inner tensors), which the caller frees and re-allocates.
-    inner_tensors: list[torch.Tensor] = field(default_factory=list)
+    persistent_buffers: list[torch.Tensor] = field(default_factory=list)
 
 
 @dataclass

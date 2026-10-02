@@ -54,15 +54,6 @@ class ParamOwnerRef:
 
     module: nn.Module
     param_name: str
-    # Local shard captured at runtime install for persistent-param buckets,
-    # whose module slot holds the unsharded parameter while unsharded.
-    sharded_param: nn.Parameter | None = None
-
-    def get_sharded_param(self) -> nn.Parameter:
-        """Return the local-shard parameter, even while the slot is swapped."""
-        if self.sharded_param is not None:
-            return self.sharded_param
-        return self.module._parameters[self.param_name]
 
     @classmethod
     def resolve(cls, root_module: nn.Module, fqn: str) -> ParamOwnerRef:
@@ -88,8 +79,9 @@ class ParamOwnerRef:
 class BucketParam:
     """Per-parameter bucket runtime state.
 
-    param_owner locates the live nn.Parameter for local shard reads and grad
-    writes. unsharded_param_slot is the hook-to-getter handoff for the current
+    param_owner locates the module slot that holds the local shard (and, for
+    persistent-param buckets while unsharded, the unsharded param).
+    sharded_param is the local shard used for unshard input and grad writes. unsharded_param_slot is the hook-to-getter handoff for the current
     unsharded parameter (legacy buckets) and carries its dtype/device policy.
     param_info carries immutable bucket storage and placement metadata for collectives.
     Keeping them together preserves bucket order and avoids repeated FQN
@@ -99,6 +91,9 @@ class BucketParam:
     param_owner: ParamOwnerRef
     unsharded_param_slot: UnshardedParamSlot
     param_info: ParamInfo
+    # The local-shard parameter, captured at runtime install (after any
+    # to_empty); persistent-param buckets swap the module slot away from it.
+    sharded_param: nn.Parameter
 
 
 def _in_backward() -> bool:
@@ -148,7 +143,7 @@ class PendingReduceGradLaunch:
 
     bucket: BucketRuntime
     prepared: PreparedReduceGrad
-    param_owners: list[ParamOwnerRef]
+    sharded_params: list[nn.Parameter]
 
 
 @dataclass
@@ -172,7 +167,6 @@ class BucketCommContext:
     reduce_grad_callback_queued: bool = False
     raf_saved_unshard_cache: dict[int, UnshardLease] = field(default_factory=dict)
     raf_saved_unshard_cache_callback_queued: bool = False
-    persistent_post_backward_flush_queued: bool = False
     _forward_bucket_indices: dict[int, int] | None = None
     _recompute_prefetch_buckets: list[BucketRuntime] | None = None
     _recompute_prefetch_bucket_indices: dict[int, int] | None = None
@@ -328,13 +322,24 @@ class BucketCommContext:
         return context
 
     def queue_reduce_grad_wait(self) -> None:
-        """Queue a post-backward wait for reduce-grad work."""
+        """Queue the end-of-backward callback (once per backward).
+
+        It finishes persistent-param buckets left partial, launches deferred
+        reduce-grads, and waits on all reduce-grad work.
+        """
         if self.reduce_grad_callback_queued:
             return
         self.reduce_grad_callback_queued = True
 
         def _wait_for_reduce_grad() -> None:
             try:
+                # Persistent-param buckets whose post-accumulate-grad trigger
+                # never completed (params unused in forward) reduce here.
+                for bucket in self.buckets:
+                    if bucket.persistent and (
+                        bucket.is_unsharded or bucket.grad_ready_indices
+                    ):
+                        bucket.post_backward_persistent()
                 self.flush_pending_reduce_grad_launches(max_to_flush=None)
                 self.wait_and_clear_reduce_grad_states(debug_fqn=None)
             finally:
@@ -345,35 +350,6 @@ class BucketCommContext:
                     self.reduce_grad_callback_queued = False
 
         torch.autograd.Variable._execution_engine.queue_callback(_wait_for_reduce_grad)
-
-    def queue_persistent_post_backward_flush(self) -> None:
-        """Queue the end-of-backward pass for persistent-param buckets.
-
-        It reduce-scatters and reshards buckets whose post-accumulate-grad
-        trigger never completed in this backward (params unused in forward, or
-        no grads at all), then waits on the reduce-grads it launched. Queued
-        from the first pre-backward hook, so it runs before the reduce-grad
-        wait callback.
-        """
-        if self.persistent_post_backward_flush_queued:
-            return
-        self.persistent_post_backward_flush_queued = True
-
-        def _flush_persistent_buckets() -> None:
-            try:
-                for bucket in self.buckets:
-                    if bucket.persistent and (
-                        bucket.is_unsharded or bucket.grad_ready_indices
-                    ):
-                        bucket.post_backward_persistent()
-                self.flush_pending_reduce_grad_launches(max_to_flush=None)
-                self.wait_and_clear_reduce_grad_states(debug_fqn=None)
-            finally:
-                self.persistent_post_backward_flush_queued = False
-
-        torch.autograd.Variable._execution_engine.queue_callback(
-            _flush_persistent_buckets
-        )
 
     def queue_raf_saved_unshard_cache_clear(self) -> None:
         """Queue cleanup for RAF saved-tensor backward unshard values."""
@@ -499,7 +475,7 @@ class BucketCommContext:
                 sharded_grads = result.finish()
                 result.record_sharded_grads(
                     _accumulate_sharded_grads(
-                        pending.param_owners,
+                        pending.sharded_params,
                         sharded_grads,
                     ),
                     self.reduce_grad_stream,
@@ -511,7 +487,7 @@ class BucketCommContext:
         bucket: BucketRuntime,
         grads: list[torch.Tensor],
         infos: list[ParamInfo],
-        param_owners: list[ParamOwnerRef],
+        sharded_params: list[nn.Parameter],
     ) -> None:
         """Pack reduce-grad input and delay launch until after next unshard."""
         if not grads:
@@ -531,7 +507,7 @@ class BucketCommContext:
             PendingReduceGradLaunch(
                 bucket=bucket,
                 prepared=prepared,
-                param_owners=param_owners,
+                sharded_params=sharded_params,
             )
         )
         self.queue_reduce_grad_wait()
@@ -666,11 +642,11 @@ class BucketRuntime:
     is_unsharded: bool = False
     grad_ready_indices: set[int] = field(default_factory=set)
     # Persistent unsharded params, created from the first persistent unshard,
-    # and the placement-owned storage backing them (FSDP2's unsharded inner
-    # tensors) with its allocated size in bytes.
+    # and the placement's persistent buffers backing them with their allocated
+    # storage size in bytes.
     unsharded_params: list[nn.Parameter] | None = None
-    unsharded_inner_tensors: list[torch.Tensor] = field(default_factory=list)
-    unsharded_inner_nbytes: list[int] = field(default_factory=list)
+    persistent_buffers: list[torch.Tensor] = field(default_factory=list)
+    persistent_buffer_nbytes: list[int] = field(default_factory=list)
 
     @property
     def persistent(self) -> bool:
@@ -695,14 +671,6 @@ class BucketRuntime:
             context = BucketCommContext.get(bucket_storage._module, comm_device)
             if context is None:
                 context = BucketCommContext.create(bucket_storage._module, comm_device)
-        if bucket_storage._persistent_unsharded_params:
-            # Persistent buckets swap their module slots, so capture the
-            # local shards for reads and grad writes.
-            for bucket_param in bucket_params:
-                param_owner = bucket_param.param_owner
-                param_owner.sharded_param = param_owner.module._parameters[
-                    param_owner.param_name
-                ]
         return cls(
             bucket_storage=bucket_storage,
             bucket_params=bucket_params,
@@ -729,6 +697,9 @@ class BucketRuntime:
                             param_owner=param_owner,
                             unsharded_param_slot=unsharded_param_slot,
                             param_info=info,
+                            sharded_param=param_owner.module._parameters[
+                                param_owner.param_name
+                            ],
                         )
                     )
         return bucket_params
@@ -750,15 +721,14 @@ class BucketRuntime:
         return [bucket_param.param_info for bucket_param in self.bucket_params]
 
     @property
-    def param_owners(self) -> list[ParamOwnerRef]:
-        return [bucket_param.param_owner for bucket_param in self.bucket_params]
+    def sharded_params(self) -> list[nn.Parameter]:
+        return [bucket_param.sharded_param for bucket_param in self.bucket_params]
 
     def _local_shards(self, *, use_autograd: bool) -> list[torch.Tensor]:
         local_shards: list[torch.Tensor] = []
         for bucket_param in self.bucket_params:
-            param_owner = bucket_param.param_owner
             unsharded_param_slot = bucket_param.unsharded_param_slot
-            param = param_owner.get_sharded_param()
+            param = bucket_param.sharded_param
             # detach() shares the parameter version counter, which versioned
             # placement caches need for optimizer-update invalidation.
             local_shard = param if use_autograd else param.detach()
@@ -895,6 +865,7 @@ class BucketRuntime:
             self.bucket_storage._mesh,
             self.context.unshard_stream,
             debug_fqn=self.debug_fqn,
+            persistent=self.persistent and not torch.compiler.is_compiling(),
         )
 
     def recompute_unshard_for_saved_tensor(self) -> UnshardLease:
@@ -983,7 +954,7 @@ class BucketRuntime:
         self,
         grads: list[torch.Tensor],
         infos: list[ParamInfo],
-        param_owners: list[ParamOwnerRef],
+        sharded_params: list[nn.Parameter],
     ) -> None:
         """Reduce full-parameter grads and accumulate local sharded grads."""
         if not grads:
@@ -1005,7 +976,7 @@ class BucketRuntime:
                     sharded_grads = result.finish()
                     result.record_sharded_grads(
                         _accumulate_sharded_grads(
-                            param_owners,
+                            sharded_params,
                             sharded_grads,
                         ),
                         self.context.reduce_grad_stream,
@@ -1017,7 +988,7 @@ class BucketRuntime:
         self,
         grads: list[torch.Tensor],
         infos: list[ParamInfo],
-        param_owners: list[ParamOwnerRef],
+        sharded_params: list[nn.Parameter],
     ) -> None:
         """Launch or defer a pre-packed bucket reduce-grad request."""
         if self.context.should_defer_reduce_grad_for_backward_prefetch(self):
@@ -1025,10 +996,10 @@ class BucketRuntime:
                 self,
                 grads,
                 infos,
-                param_owners,
+                sharded_params,
             )
         else:
-            self.reduce_grads(grads, infos, param_owners)
+            self.reduce_grads(grads, infos, sharded_params)
 
     # ------------------------------------------------------------------
     # Persistent unsharded parameters, eager branch
@@ -1044,41 +1015,41 @@ class BucketRuntime:
         """Finish ``result`` as a persistent unshard (FSDP2-style).
 
         The first one creates the persistent params from the placement's full
-        params and keeps the inner tensors backing them. Later ones re-allocate
-        those inner tensors and the placement refills them in place, without
+        params and keeps the persistent buffers backing them. Later ones re-allocate
+        those persistent buffers and the placement refills them in place, without
         bumping the params' version counters (autograd may have saved them in
         forward before a reshard).
         """
         first = self.unsharded_params is None
         if first:
-            result.set_persistent(None)
             preserve_versions = contextlib.nullcontext()
         else:
-            for inner_tensor, nbytes in zip(
-                self.unsharded_inner_tensors, self.unsharded_inner_nbytes, strict=True
+            for persistent_buffer, nbytes in zip(
+                self.persistent_buffers, self.persistent_buffer_nbytes, strict=True
             ):
-                _alloc_storage(inner_tensor, nbytes)
-            result.set_persistent(self.unsharded_inner_tensors)
+                _alloc_storage(persistent_buffer, nbytes)
             preserve_versions = torch.autograd._unsafe_preserve_version_counter(
                 tuple(self.unsharded_params)
             )
         with torch.no_grad(), preserve_versions:
-            unshard_lease = result.finish()
+            unshard_lease = result.finish(
+                persistent_buffers=None if first else self.persistent_buffers
+            )
         full_params = unshard_lease.take_full_params()
-        inner_tensors = unshard_lease.inner_tensors
+        persistent_buffers = unshard_lease.persistent_buffers
         unshard_lease.release()
         if first:
-            self._create_unsharded_params(full_params, inner_tensors)
+            self._create_unsharded_params(full_params, persistent_buffers)
         self.is_unsharded = True
 
     def _create_unsharded_params(
         self,
         full_params: list[torch.Tensor],
-        inner_tensors: list[torch.Tensor],
+        persistent_buffers: list[torch.Tensor],
     ) -> None:
-        if not inner_tensors:
+        if not persistent_buffers:
             raise AssertionError(
-                f"Placement {self.infos[0].placement!r} returned no inner tensors "
+                f"Placement {self.infos[0].placement!r} returned no persistent buffers "
                 "for a persistent unshard."
             )
         unsharded_params: list[nn.Parameter] = []
@@ -1091,9 +1062,10 @@ class BucketRuntime:
                 setattr(unsharded_param, name, value)
             unsharded_params.append(unsharded_param)
         self.unsharded_params = unsharded_params
-        self.unsharded_inner_tensors = list(inner_tensors)
-        self.unsharded_inner_nbytes = [
-            inner_tensor.untyped_storage().size() for inner_tensor in inner_tensors
+        self.persistent_buffers = list(persistent_buffers)
+        self.persistent_buffer_nbytes = [
+            persistent_buffer.untyped_storage().size()
+            for persistent_buffer in persistent_buffers
         ]
         for idx, unsharded_param in enumerate(unsharded_params):
             if not unsharded_param.requires_grad:
@@ -1117,12 +1089,12 @@ class BucketRuntime:
         for bucket_param in self.bucket_params:
             param_owner = bucket_param.param_owner
             param_owner.module._parameters[param_owner.param_name] = (
-                param_owner.get_sharded_param()
+                bucket_param.sharded_param
             )
         # Consumers of the storage were queued on this stream, which also
         # allocated it, so the caching allocator orders the reuse.
-        for inner_tensor in self.unsharded_inner_tensors:
-            _free_storage(inner_tensor)
+        for persistent_buffer in self.persistent_buffers:
+            _free_storage(persistent_buffer)
         self.is_unsharded = False
 
     def take_pending_backward(self) -> UnshardHandle | None:
@@ -1191,7 +1163,7 @@ class BucketRuntime:
 
     def pre_backward_hook(self, grad: torch.Tensor) -> torch.Tensor:
         """Re-unshard before this bucket's module runs backward (output grad hook)."""
-        self.context.queue_persistent_post_backward_flush()
+        self.context.queue_reduce_grad_wait()
         if not self.is_unsharded:
             result = self.take_pending_backward()
             if result is None:
@@ -1216,7 +1188,7 @@ class BucketRuntime:
         """Reduce-scatter accumulated full grads into the shards and reshard."""
         grads: list[torch.Tensor] = []
         infos: list[ParamInfo] = []
-        param_owners: list[ParamOwnerRef] = []
+        sharded_params: list[nn.Parameter] = []
         for bucket_param, unsharded_param in zip(
             self.bucket_params, self.unsharded_params or [], strict=False
         ):
@@ -1224,13 +1196,13 @@ class BucketRuntime:
                 continue
             grads.append(unsharded_param.grad)
             infos.append(bucket_param.param_info)
-            param_owners.append(bucket_param.param_owner)
+            sharded_params.append(bucket_param.sharded_param)
             unsharded_param.grad = None
         self.grad_ready_indices.clear()
         if self.is_unsharded:
             self.reshard_persistent()
         if grads:
-            self.schedule_reduce_grad_tensors(grads, infos, param_owners)
+            self.schedule_reduce_grad_tensors(grads, infos, sharded_params)
 
     # ------------------------------------------------------------------
     # Persistent unsharded parameters, compile branch
@@ -1401,7 +1373,7 @@ class _BucketUnshard(torch.autograd.Function):
             )
             grads: list[torch.Tensor] = []
             valid_infos: list[ParamInfo] = []
-            valid_param_owners: list[ParamOwnerRef] = []
+            valid_sharded_params: list[nn.Parameter] = []
             valid_indices: list[int] = []
             for idx, (grad, bucket_param) in enumerate(
                 zip(
@@ -1416,7 +1388,7 @@ class _BucketUnshard(torch.autograd.Function):
                     valid_indices.append(idx)
                 grads.append(grad)
                 valid_infos.append(bucket_param.param_info)
-                valid_param_owners.append(bucket_param.param_owner)
+                valid_sharded_params.append(bucket_param.sharded_param)
 
             if grads and is_compiling:
                 if input_grads is None:
@@ -1444,7 +1416,7 @@ class _BucketUnshard(torch.autograd.Function):
                 bucket.schedule_reduce_grad_tensors(
                     grads,
                     valid_infos,
-                    valid_param_owners,
+                    valid_sharded_params,
                 )
 
             if not is_compiling and bucket.bucket_storage._reshard_after_forward:
@@ -1483,13 +1455,12 @@ def _match_param_grad_layout(
 
 
 def _accumulate_sharded_grads(
-    param_owners: list[ParamOwnerRef],
+    sharded_params: list[nn.Parameter],
     sharded_grads: list[torch.Tensor],
 ) -> list[torch.Tensor]:
     """Cast sharded grads to local param dtype/layout and accumulate into .grad."""
     stored_grads: list[torch.Tensor] = []
-    for param_owner, grad in zip(param_owners, sharded_grads, strict=True):
-        param = param_owner.get_sharded_param()
+    for param, grad in zip(sharded_params, sharded_grads, strict=True):
         grad = _match_param_grad_layout(grad, param)
         stored_grads.append(grad)
         if param.grad is None:

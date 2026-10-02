@@ -126,9 +126,9 @@ def _persistent_params(model: nn.Module) -> list[nn.Parameter]:
     return [param for bucket in _buckets(model) for param in bucket.unsharded_params]
 
 
-def _inner_tensors(model: nn.Module) -> list[torch.Tensor]:
+def _persistent_buffers(model: nn.Module) -> list[torch.Tensor]:
     return [
-        inner for bucket in _buckets(model) for inner in bucket.unsharded_inner_tensors
+        buffer for bucket in _buckets(model) for buffer in bucket.persistent_buffers
     ]
 
 
@@ -209,8 +209,8 @@ class TestPersistentUnshardedParams(TestCase):
                                 reshard_after_forward,
                             )
                         loss.backward()
-                        for inner in _inner_tensors(model):
-                            self.assertEqual(inner.untyped_storage().size(), 0)
+                        for buffer in _persistent_buffers(model):
+                            self.assertEqual(buffer.untyped_storage().size(), 0)
                         for module, unsharded in zip(model, persistent, strict=True):
                             self.assertEqual(unsharded.untyped_storage().size(), 0)
                             self.assertIsNone(unsharded.grad)
@@ -337,7 +337,7 @@ class TestPersistentUnshardedParams(TestCase):
                             fqn: (make_placement(fqn),) for fqn, _ in named_params
                         },
                         mesh=mesh,
-                        # The backward re-gather refills inner tensors that back
+                        # The backward re-gather refills persistent buffers that back
                         # params autograd saved in forward.
                         reshard_after_forward=True,
                     )
@@ -356,18 +356,18 @@ class TestPersistentUnshardedParams(TestCase):
                     persistent = _persistent_params(model)
                 # Same objects (identity; their storage may be freed).
                 self._assert_same_params(_persistent_params(model), persistent)
-                for inner in _inner_tensors(model):
-                    self.assertEqual(inner.untyped_storage().size(), 0)
-            # While unsharded, each persistent param is backed by an inner tensor.
-            inner_ptrs = set()
+                for buffer in _persistent_buffers(model):
+                    self.assertEqual(buffer.untyped_storage().size(), 0)
+            # While unsharded, each persistent param is backed by a persistent buffer.
+            buffer_ptrs = set()
             for bucket in _buckets(model):
                 bucket.pre_forward_persistent()
-                inner_ptrs.update(
-                    inner.untyped_storage().data_ptr()
-                    for inner in bucket.unsharded_inner_tensors
+                buffer_ptrs.update(
+                    buffer.untyped_storage().data_ptr()
+                    for buffer in bucket.persistent_buffers
                 )
                 for param in bucket.unsharded_params:
-                    self.assertIn(param.untyped_storage().data_ptr(), inner_ptrs)
+                    self.assertIn(param.untyped_storage().data_ptr(), buffer_ptrs)
                 bucket.reshard_persistent()
 
     def test_persistent_param_inherits_attributes(self):
