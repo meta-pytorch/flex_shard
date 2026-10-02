@@ -52,7 +52,10 @@ class FlexShardModule:
 
     @property
     def sharded_bucket_storages(self) -> list[ShardedBucketStorage]:
-        """All bucket storage objects, one per bucket."""
+        """All bucket storage objects, one per non-empty BucketSpec, in order.
+
+        Each takes per-bucket settings, e.g. ``set_requires_gradient_sync``.
+        """
         return getattr(self, _SHARDED_BUCKET_STORAGES_ATTR)
 
     def to_empty(self, *, device, recurse: bool = True):
@@ -117,9 +120,19 @@ class FlexShardModule:
         forward until its backward; call this when that backward will not run.
         Until then, ``module.parameters()`` returns their unsharded params, so
         zero grads through the optimizer rather than ``module.zero_grad()``.
+        Grads accumulated without sync are kept, except after a backward that
+        raised on this rank, since they mix with its partial grads.
         """
         for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
             context.reset()
+
+    def _bucket_storages(self, recurse: bool) -> list[ShardedBucketStorage]:
+        modules = self.modules() if recurse else [self]
+        return [
+            bucket_storage
+            for module in modules
+            for bucket_storage in getattr(module, _SHARDED_BUCKET_STORAGES_ATTR, [])
+        ]
 
     def set_gradient_reduce_op(
         self,
@@ -128,13 +141,56 @@ class FlexShardModule:
         recurse: bool = True,
     ) -> None:
         """Set gradient reduction semantics for this module's FlexShard buckets."""
-        modules = self.modules() if recurse else [self]
-        for module in modules:
-            bucket_storages = getattr(module, _SHARDED_BUCKET_STORAGES_ATTR, None)
-            if bucket_storages is None:
-                continue
-            for bucket_storage in bucket_storages:
-                bucket_storage.set_gradient_reduce_op(op)
+        for bucket_storage in self._bucket_storages(recurse):
+            bucket_storage.set_gradient_reduce_op(op)
+
+    def set_requires_gradient_sync(
+        self,
+        requires_gradient_sync: bool,
+        *,
+        recurse: bool = True,
+    ) -> None:
+        """Set whether backward reduce-scatters gradients, like FSDP2's.
+
+        With ``False``, backward keeps each bucket's full gradients on its
+        unsharded params and later backwards accumulate into them, in the
+        bucket's ``reduce_dtype`` when it is wider than the param dtype. The
+        next backward with ``True`` reduce-scatters the accumulated gradients,
+        also for buckets it does not use. A backward that raises drops the
+        gradients accumulated so far on that rank, since they mix with its
+        partial ones.
+        It applies to the backwards after the call, e.g.
+        ``model.set_requires_gradient_sync(is_last_microbatch)`` before each
+        microbatch; like FSDP2, there is no ``no_sync()`` context manager.
+        Eager only: torch.compile raises ``NotImplementedError``.
+
+        To set one bucket, e.g. to keep reduce-scattering expert buckets whose
+        full gradients are large, call ``set_requires_gradient_sync`` on its
+        entry in ``sharded_bucket_storages``.
+        """
+        for bucket_storage in self._bucket_storages(recurse):
+            bucket_storage.set_requires_gradient_sync(requires_gradient_sync)
+
+    def set_reshard_after_backward(
+        self,
+        reshard_after_backward: bool,
+        *,
+        recurse: bool = True,
+    ) -> None:
+        """Set whether a backward without gradient sync reshards, like FSDP2's.
+
+        With ``False``, buckets stay unsharded after a backward that skips the
+        reduce-scatter, so the next forward skips the all-gather: with sync
+        off for all but the last microbatch and without
+        reshard-after-forward, each bucket all-gathers and reduce-scatters
+        once per optimizer step. Until then,
+        ``module.parameters()`` returns their unsharded params. Unlike FSDP2, a
+        syncing backward always reshards, since the optimizer step then
+        changes the local shards. Entries of ``sharded_bucket_storages`` take
+        the same setting per bucket.
+        """
+        for bucket_storage in self._bucket_storages(recurse):
+            bucket_storage.set_reshard_after_backward(reshard_after_backward)
 
     def set_max_pending_reduce_grads(
         self,

@@ -5,6 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+import dataclasses
+from collections import Counter
 from unittest import mock
 
 import torch
@@ -28,6 +30,7 @@ from ..custom_placements.block_shard import (
     make_bucketed_block_placement_fn,
 )
 from ..custom_placements.shard import per_param_placements, Shard
+from ..flex_shard import bucket_runtime
 from .common import (
     check_flex_shard_parity,
     expected_shard,
@@ -80,14 +83,25 @@ def _init_params_deterministically(model: torch.nn.Module) -> None:
 
 
 class _RankRoutedExperts(torch.nn.Module):
-    """Each rank routes to one expert, like experts that got tokens on one rank."""
+    """Each rank routes to one expert, like experts that got tokens on one rank.
+
+    The side branch runs on every rank, but only rank 0's output uses it.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.experts = torch.nn.ModuleList(torch.nn.Linear(8, 8) for _ in range(2))
+        self.side = torch.nn.Linear(8, 8)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.experts[dist.get_rank()](x)
+    def forward(
+        self, x: torch.Tensor, use_side: bool = True, shift: int = 0
+    ) -> torch.Tensor:
+        out = self.experts[(dist.get_rank() + shift) % 2](x)
+        if use_side:
+            side = self.side(x)
+            if dist.get_rank() == 0:
+                out = out + side
+        return out
 
 
 def _average_reference_grads(model: torch.nn.Module) -> None:
@@ -447,51 +461,107 @@ class TestFlexShardTraining(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_gradient_accumulation(self):
+        # Three microbatches, in three modes:
+        # - "sync": every microbatch reduce-scatters.
+        # - "per_bucket": sync is off for every bucket but the layer's on the
+        #   first two microbatches, set through the per-bucket setters.
+        # - "keep": sync off for the model on the first two microbatches,
+        #   keeping every bucket but the norm's unsharded between them.
+        # Only the layer reshards after forward. The last microbatch skips the
+        # layer and the positional embeddings, so their kept grads are reduced
+        # in the end-of-backward callback.
         mesh = init_device_mesh(
             device_type.type,
             (self.world_size,),
             mesh_dim_names=("fsdp",),
         )
 
-        args, model = make_transformer_model(
+        args, base_model = make_transformer_model(
             device=device_type.type,
             vocab_size=15,
         )
-        _init_params_deterministically(model)
-        reference = copy.deepcopy(model)
-        flex_shard(
-            model,
-            buckets=transformer_bucket_specs(
-                args.n_layers,
-                mesh,
-                reshard_after_forward=False,
-            ),
-        )
-
+        _init_params_deterministically(base_model)
         torch.manual_seed(42 + self.rank + 1)
         inputs = [
-            transformer_inputs(args, batch_size=3, device=device_type),
-            transformer_inputs(args, batch_size=2, device=device_type),
+            transformer_inputs(args, batch_size=batch_size, device=device_type)
+            for batch_size in (3, 2, 2)
         ]
-        optim = make_test_sgd(model.parameters(), lr=0.1)
-        ref_optim = make_test_sgd(reference.parameters(), lr=0.1)
 
-        optim.zero_grad(set_to_none=True)
-        ref_optim.zero_grad(set_to_none=True)
-        for x in inputs:
-            loss = model(x).sum()
-            ref_loss = reference(x).sum()
-            self.assertEqual(loss, ref_loss)
-            loss.backward()
-            ref_loss.backward()
+        def microbatch_loss(module, idx):
+            x = inputs[idx]
+            if idx < len(inputs) - 1:
+                return module(x).sum()
+            return module.output(module.norm(module.tok_embeddings(x))).sum()
 
-        _average_reference_grads(reference)
-        check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
+        for mode in ("sync", "per_bucket", "keep"):
+            model = copy.deepcopy(base_model)
+            reference = copy.deepcopy(base_model)
+            buckets = transformer_bucket_specs(args.n_layers, mesh)
+            buckets[2] = dataclasses.replace(buckets[2], reshard_after_forward=True)
+            flex_shard(model, buckets=buckets)
+            storages = model.sharded_bucket_storages
+            layer, norm = storages[2], storages[3]
+            if mode == "keep":
+                model.set_reshard_after_backward(False)
+                norm.set_reshard_after_backward(True)
+            optim = make_test_sgd(model.parameters(), lr=0.1)
+            ref_optim = make_test_sgd(reference.parameters(), lr=0.1)
 
-        optim.step()
-        ref_optim.step()
+            runtime = bucket_runtime.BucketRuntime
+            with (
+                mock.patch.object(
+                    runtime,
+                    "begin_unshard",
+                    autospec=True,
+                    side_effect=runtime.begin_unshard,
+                ) as unshards,
+                mock.patch.object(
+                    runtime,
+                    "reduce_grads",
+                    autospec=True,
+                    side_effect=runtime.reduce_grads,
+                ) as reduces,
+            ):
+                for idx in range(len(inputs)):
+                    last = idx == len(inputs) - 1
+                    if mode == "per_bucket":
+                        if last:
+                            model.reshard()  # keeps the accumulated grads
+                        for storage in storages:
+                            storage.set_requires_gradient_sync(last or storage is layer)
+                    if mode == "keep":
+                        model.set_requires_gradient_sync(last)
+                    loss = microbatch_loss(model, idx)
+                    ref_loss = microbatch_loss(reference, idx)
+                    self.assertEqual(loss, ref_loss)
+                    loss.backward()
+                    ref_loss.backward()
 
-        check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
+            reduced = Counter(call.args[0].debug_fqn for call in reduces.call_args_list)
+            gathered = Counter(
+                call.args[0].debug_fqn for call in unshards.call_args_list
+            )
+            once = dict.fromkeys(
+                ["tok_embeddings", "pos_embeddings", "layers.0", "norm", "output"], 1
+            )
+            if mode == "per_bucket":
+                # The layer reduce-scatters in both microbatches that use it,
+                # the other buckets once per step.
+                self.assertEqual(reduced, {**once, "layers.0": 2})
+            if mode == "keep":
+                # One reduce-scatter per bucket per step. Kept buckets
+                # all-gather once per step; the layer also re-gathers in each
+                # backward and the norm in each forward.
+                self.assertEqual(reduced, once)
+                self.assertEqual(gathered, {**once, "layers.0": 3, "norm": 3})
+            _average_reference_grads(reference)
+            check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
+
+            optim.step()
+            ref_optim.step()
+            check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
+            # The syncing backward resharded, so forward sees the stepped shards.
+            self.assertEqual(model(inputs[0]).sum(), reference(inputs[0]).sum())
 
     @skip_if_lt_x_gpu(2)
     def test_mixed_precision_policy(self):
@@ -529,6 +599,17 @@ class TestFlexShardTraining(FSDPTest):
 
         torch.manual_seed(42 + self.rank + 1)
         x = transformer_inputs(args, batch_size=2, device=device_type)
+        # A microbatch without sync first: the kept bf16 param accumulates its
+        # grads in the fp32 reduce dtype until the syncing backward.
+        model.set_reshard_after_backward(False)
+        model.set_requires_gradient_sync(False)
+        model.tok_embeddings(x).float().sum().backward()
+        model.set_requires_gradient_sync(True)
+        reference.tok_embeddings(x).float().sum().backward()
+        unsharded_param = model.tok_embeddings.weight
+        self.assertEqual(unsharded_param.dtype, torch.bfloat16)
+        self.assertEqual(unsharded_param.grad.dtype, torch.float32)
+
         output = model.tok_embeddings(x)
         ref_output = reference.tok_embeddings(x)
         self.assertEqual(output.dtype, torch.bfloat16)
@@ -536,6 +617,7 @@ class TestFlexShardTraining(FSDPTest):
 
         output.float().sum().backward()
         ref_output.float().sum().backward()
+        self.assertIsNone(unsharded_param.grad)
 
         grad = model.tok_embeddings._parameters["weight"].grad
         self.assertIsNotNone(grad)
@@ -552,23 +634,40 @@ class TestFlexShardTraining(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_rank_dependent_unused_params(self):
-        # Ranks leave different params of a bucket without grads; every rank
-        # still reduce-scatters all of them, with zeros for its unused ones.
+        # Ranks leave different params of a bucket, or a whole bucket's
+        # outputs, without grads; every rank still reduce-scatters every
+        # bucket, with zeros for its unused params. Three microbatches: the
+        # first without sync (keeping fp32 grads on rank 0 only), the second
+        # skipping the side bucket, so the pending sync makes it reduce on
+        # every rank, and routing each rank to the other expert, so kept fp32
+        # and fresh bf16 grads mix, and the third syncing with the side
+        # bucket's outputs unused on rank 1.
         mesh = init_device_mesh(
             device_type.type,
             (self.world_size,),
             mesh_dim_names=("fsdp",),
         )
         torch.manual_seed(0)
-        model = _RankRoutedExperts().to(device_type)
+        model = _RankRoutedExperts().to(device_type, torch.bfloat16)
         reference = copy.deepcopy(model)
         flex_shard(
             model,
-            buckets=[BucketSpec(["*"], placement_fn=per_param_placements, mesh=mesh)],
+            buckets=[
+                BucketSpec(
+                    [pattern],
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    mp_policy=MixedPrecisionPolicy(reduce_dtype=torch.float32),
+                    reshard_after_forward=False,
+                )
+                for pattern in ("experts.*", "side.*")
+            ],
         )
-        x = torch.randn(4, 8, device=device_type)
-        model(x).sum().backward()
-        reference(x).sum().backward()
+        x = torch.randn(4, 8, device=device_type, dtype=torch.bfloat16)
+        for idx, (use_side, shift) in enumerate(((True, 0), (False, 1), (True, 0))):
+            model.set_requires_gradient_sync(idx > 0)
+            model(x, use_side=use_side, shift=shift).sum().backward()
+            reference(x, use_side=use_side, shift=shift).sum().backward()
         for param in reference.parameters():
             if param.grad is None:
                 param.grad = torch.zeros_like(param)
@@ -615,6 +714,14 @@ class TestFlexShardTraining(FSDPTest):
 
         optim.zero_grad(set_to_none=True)
         ref_optim.zero_grad(set_to_none=True)
+        # A microbatch without sync first, keeping the params unsharded after
+        # it: the next forward skips the all-gather and still reshards after
+        # forward, and the recompute in backward re-gathers.
+        model.set_reshard_after_backward(False)
+        model.set_requires_gradient_sync(False)
+        model(x).sum().backward()
+        model.set_requires_gradient_sync(True)
+        reference(x).sum().backward()
         loss = model(x).sum()
         ref_loss = reference(x).sum()
         self.assertEqual(loss, ref_loss)

@@ -249,6 +249,22 @@ through backward, trading memory for fewer all-gathers. Such a bucket stays
 unsharded after a forward until its backward; call `model.reshard()` when that
 backward will not run, as with FSDP2's `FSDPModule.reshard()`.
 
+For gradient accumulation, call `model.set_requires_gradient_sync(is_last)`
+before each microbatch, as with FSDP2; there is no `no_sync()` context
+manager. Backwards without sync skip the reduce-scatter and keep full
+gradients on the unsharded parameters, accumulating in the bucket's
+`reduce_dtype` when it is wider, and the next syncing backward reduce-scatters
+them. `model.set_reshard_after_backward(False)` also keeps the parameters
+unsharded between those microbatches, so only the first one all-gathers when
+`reshard_after_forward=False`. Unlike FSDP2, a syncing backward always
+reshards, so the optimizer step never leaves stale unsharded parameters. Both
+are eager-only. Like FSDP2's per-module setters, both also exist per bucket,
+on the entries of `model.sharded_bucket_storages` (one per non-empty
+`BucketSpec`, in order). For example, a model can keep reduce-scattering expert
+buckets whose full gradients would be large. A backward that raises drops the
+gradients accumulated so far on that rank, since they mix with its partial
+ones.
+
 A regular FlexShard `state_dict()` contains rank-local shards. It is not a
 gathered model checkpoint. Existing FSDP2 checkpoint code needs an explicit
 compatibility check or conversion, even when the parameter split agrees.
@@ -261,6 +277,11 @@ compatibility check or conversion, even when the parameter split agrees.
   different submeshes, as in the MoE example. CPU offload is not supported.
 - Every parameter must match exactly one bucket. The examples' `Shard(0)`
   placement does not support scalar parameters.
+- Every rank must run the same graph. A bucket's parameters may get gradients
+  on some ranks only (the others reduce zeros), but a bucket whose outputs
+  only some ranks' losses use can reduce at a different point of backward on
+  each rank, or, with `reshard_after_forward=True`, re-gather only on those
+  ranks, so the collectives mismatch.
 - Numerical and graph comparisons here concern the small examples and the
   stated configuration; they are not general FSDP2 or SimpleFSDP benchmarks.
 

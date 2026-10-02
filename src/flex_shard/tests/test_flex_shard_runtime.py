@@ -253,7 +253,8 @@ class TestFlexShardEagerRuntime(TestCase):
                 reference.layers[1].weight.requires_grad_(False)
             if step == 2:
                 # A backward that raises drops FlexShard's final callback; the
-                # next forward recovers.
+                # next forward, or reshard(), recovers and drops its partial
+                # grads.
                 def fail(grad):
                     raise RuntimeError("injected backward failure")
 
@@ -263,6 +264,8 @@ class TestFlexShardEagerRuntime(TestCase):
                 with self.assertRaisesRegex(RuntimeError, "injected backward failure"):
                     model(x).sum().backward()
                 handle.remove()
+                if not reshard_after_forward:
+                    model.reshard()
             optim.zero_grad()
             ref_optim.zero_grad()
             loss = model(x).sum()
@@ -390,6 +393,10 @@ class TestFlexShardEagerRuntime(TestCase):
 
             for param in model.parameters():
                 self.assertIsNotNone(param.grad)
+
+            model.set_requires_gradient_sync(False)
+            with self.assertRaisesRegex(Exception, "eager-only"):
+                compiled_model(transformer_inputs(args, device="cuda"))
 
     def test_torch_compile_traces_per_bucket_collectives(self):
         with single_rank_cuda_mesh() as mesh:
