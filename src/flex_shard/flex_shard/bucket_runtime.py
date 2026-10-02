@@ -863,8 +863,8 @@ class BucketRuntime:
         """
         if not self.bucket_storage._requires_gradient_sync:
             raise NotImplementedError(
-                "FlexShard set_requires_gradient_sync(False) / no_sync() is "
-                "eager-only; torch.compile reduce-scatters in the traced backward."
+                "FlexShard set_requires_gradient_sync(False) is eager-only; "
+                "torch.compile reduce-scatters in the traced backward."
             )
         full_params = _BucketUnshard.apply(self, *self._local_shards(use_autograd=True))
         self._swap_in_params(list(full_params))

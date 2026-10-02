@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import contextlib
 import copy
 import dataclasses
 from collections import Counter
@@ -455,8 +454,8 @@ class TestFlexShardTraining(FSDPTest):
         # - "sync": every microbatch reduce-scatters.
         # - "per_bucket": sync is off for every bucket but the layer's on the
         #   first two microbatches, set through the per-bucket setters.
-        # - "keep": no_sync() on the first two microbatches, keeping every
-        #   bucket but the norm's unsharded between them.
+        # - "keep": sync off for the model on the first two microbatches,
+        #   keeping every bucket but the norm's unsharded between them.
         # Only the layer reshards after forward. The last microbatch skips the
         # layer and the positional embeddings, so their kept grads are reduced
         # in the end-of-backward callback.
@@ -519,16 +518,13 @@ class TestFlexShardTraining(FSDPTest):
                             model.reshard()  # keeps the accumulated grads
                         for storage in storages:
                             storage.set_requires_gradient_sync(last or storage is layer)
-                    with (
-                        model.no_sync()
-                        if mode == "keep" and not last
-                        else contextlib.nullcontext()
-                    ):
-                        loss = microbatch_loss(model, idx)
-                        ref_loss = microbatch_loss(reference, idx)
-                        self.assertEqual(loss, ref_loss)
-                        loss.backward()
-                        ref_loss.backward()
+                    if mode == "keep":
+                        model.set_requires_gradient_sync(last)
+                    loss = microbatch_loss(model, idx)
+                    ref_loss = microbatch_loss(reference, idx)
+                    self.assertEqual(loss, ref_loss)
+                    loss.backward()
+                    ref_loss.backward()
 
             reduced = Counter(call.args[0].debug_fqn for call in reduces.call_args_list)
             gathered = Counter(
@@ -592,11 +588,12 @@ class TestFlexShardTraining(FSDPTest):
 
         torch.manual_seed(42 + self.rank + 1)
         x = transformer_inputs(args, batch_size=2, device=device_type)
-        # A no_sync() microbatch first: the kept bf16 param accumulates its
+        # A microbatch without sync first: the kept bf16 param accumulates its
         # grads in the fp32 reduce dtype until the syncing backward.
         model.set_reshard_after_backward(False)
-        with model.no_sync():
-            model.tok_embeddings(x).float().sum().backward()
+        model.set_requires_gradient_sync(False)
+        model.tok_embeddings(x).float().sum().backward()
+        model.set_requires_gradient_sync(True)
         reference.tok_embeddings(x).float().sum().backward()
         unsharded_param = model.tok_embeddings.weight
         self.assertEqual(unsharded_param.dtype, torch.bfloat16)
@@ -628,7 +625,7 @@ class TestFlexShardTraining(FSDPTest):
     def test_rank_dependent_unused_params(self):
         # Ranks leave different params of a bucket without grads; every rank
         # still reduce-scatters all of them, with zeros for its unused ones,
-        # also after a no_sync() microbatch kept its used ones' grads in fp32.
+        # also after a microbatch without sync kept its used ones' grads in fp32.
         mesh = init_device_mesh(
             device_type.type,
             (self.world_size,),
@@ -649,8 +646,9 @@ class TestFlexShardTraining(FSDPTest):
             ],
         )
         x = torch.randn(4, 8, device=device_type, dtype=torch.bfloat16)
-        with model.no_sync():
-            model(x).sum().backward()
+        model.set_requires_gradient_sync(False)
+        model(x).sum().backward()
+        model.set_requires_gradient_sync(True)
         model(x).sum().backward()
         for _ in range(2):
             reference(x).sum().backward()

@@ -249,9 +249,10 @@ through backward, trading memory for fewer all-gathers. Such a bucket stays
 unsharded after a forward until its backward; call `model.reshard()` when that
 backward will not run, as with FSDP2's `FSDPModule.reshard()`.
 
-For gradient accumulation, `model.no_sync()` (or FSDP2's
-`model.set_requires_gradient_sync(False)`) skips the reduce-scatter. Backward
-keeps full gradients on the unsharded parameters, accumulating in the bucket's
+For gradient accumulation, call `model.set_requires_gradient_sync(is_last)`
+before each microbatch, as with FSDP2; there is no `no_sync()` context
+manager. Backwards without sync skip the reduce-scatter and keep full
+gradients on the unsharded parameters, accumulating in the bucket's
 `reduce_dtype` when it is wider, and the next syncing backward reduce-scatters
 them. `model.set_reshard_after_backward(False)` also keeps the parameters
 unsharded between those microbatches, so only the first one all-gathers when

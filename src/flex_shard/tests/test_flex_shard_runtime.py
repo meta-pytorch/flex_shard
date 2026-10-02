@@ -391,7 +391,8 @@ class TestFlexShardEagerRuntime(TestCase):
             for param in model.parameters():
                 self.assertIsNotNone(param.grad)
 
-            with model.no_sync(), self.assertRaisesRegex(Exception, "eager-only"):
+            model.set_requires_gradient_sync(False)
+            with self.assertRaisesRegex(Exception, "eager-only"):
                 compiled_model(transformer_inputs(args, device="cuda"))
 
     def test_torch_compile_traces_per_bucket_collectives(self):
