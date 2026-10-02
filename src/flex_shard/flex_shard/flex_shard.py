@@ -115,13 +115,11 @@ class FlexShardModule:
 
         Buckets with ``reshard_after_forward=False`` stay unsharded after a
         forward until its backward; call this when that backward will not run.
+        Until then, ``module.parameters()`` returns their unsharded params, so
+        zero grads through the optimizer rather than ``module.zero_grad()``.
         """
         for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
-            context.take_pending_unshard(None)
-            for bucket in context.buckets:
-                if bucket.is_unsharded:
-                    bucket.reshard()
-                bucket.reset_backward_state()
+            context.reset()
 
     def set_gradient_reduce_op(
         self,

@@ -535,8 +535,9 @@ class BucketedBlockShard(Placement):
     they must be ``(0,)``, ``(0, 1)``, etc. ``blocks_per_rank`` assigns each rank
     a number of contiguous bucket-global blocks. The placement plans the whole
     bucket as one param-major logical buffer, then shards that buffer into
-    rank-local ranges so the all-gather output is directly viewable as full
-    parameters.
+    rank-local ranges so the all-gather output is laid out as the full
+    parameters. In eager mode it is copied into one persistent bucket buffer
+    that the full parameters view; during graph capture they view it directly.
     """
 
     @dataclass(frozen=True)

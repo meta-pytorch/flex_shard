@@ -14,8 +14,9 @@ gathered fp8 weight is **bit-identical** to "all-gather bf16, then
 block-quantize".
 
 The master weight stays dense bf16/fp32-sharded with no fp8 padding in
-persistent storage. FP8 data, scales, and tail padding exist only in the
-unshard collective buffers.
+sharded storage. The gathered FP8 data and scales are compacted into one buffer
+that backs the unsharded weights; in eager mode the bucket runtime keeps it as
+a persistent buffer, freed on reshard and refilled on the next unshard.
 """
 
 from __future__ import annotations
@@ -64,7 +65,13 @@ _VEC_ALIGN_BYTES = 16
 
 
 class BlockwiseFp8WeightFactory(Protocol):
-    """Construct a consumer-specific tensor from gathered FP8 operands."""
+    """Construct a consumer-specific tensor from gathered FP8 operands.
+
+    The result must view ``fp8_data`` and ``recip_scale`` (a tensor subclass
+    may hold them as inner tensors) rather than copy them: eager unshards
+    refill those buffers in place, and the weight built on the first unshard is
+    reused afterwards.
+    """
 
     def __call__(
         self,

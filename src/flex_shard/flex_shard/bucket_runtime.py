@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from dataclasses import dataclass, field, replace
 from types import ModuleType
@@ -14,7 +15,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import _get_device_handle
-from torch.utils._pytree import tree_flatten, tree_leaves, tree_unflatten
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
+from torch.utils._pytree import tree_leaves
 
 from .bucket_comm import (
     begin_bucket_unshard,
@@ -93,6 +95,38 @@ def _free_storage(tensor: torch.Tensor) -> None:
     storage = tensor.untyped_storage()
     if storage.size() != 0:
         storage.resize_(0)
+
+
+def _tensor_leaves(value: Any) -> list[torch.Tensor]:
+    """Tensors in a pytree, including dataclass fields (as FSDP2 collects them)."""
+    tensors: list[torch.Tensor] = []
+    for leaf in tree_leaves(value):
+        if isinstance(leaf, torch.Tensor):
+            tensors.append(leaf)
+        elif dataclasses.is_dataclass(leaf) and not isinstance(leaf, type):
+            tensors.extend(
+                _tensor_leaves(
+                    [getattr(leaf, f.name) for f in dataclasses.fields(leaf)]
+                )
+            )
+    return tensors
+
+
+def _storage_ptr(tensor: torch.Tensor) -> int | None:
+    try:
+        return tensor.untyped_storage().data_ptr()
+    except (RuntimeError, NotImplementedError):  # e.g. wrapper subclasses
+        return None
+
+
+def _inner_tensors(tensor: torch.Tensor) -> list[torch.Tensor]:
+    """The plain tensors holding a (possibly wrapper-subclass) tensor's data."""
+    if is_traceable_wrapper_subclass(tensor):
+        attrs, _ = tensor.__tensor_flatten__()
+        return [
+            inner for attr in attrs for inner in _inner_tensors(getattr(tensor, attr))
+        ]
+    return [tensor]
 
 
 @dataclass
@@ -225,9 +259,8 @@ class BucketCommContext:
     def queue_post_backward_callback(self) -> None:
         """Queue the end-of-backward callback (once per backward).
 
-        It finishes buckets still unsharded or partially reduced (params unused
-        in backward, or no post-backward trigger), waits on all reduce-grad
-        work, and releases an unused prefetch.
+        It finishes buckets still unsharded (no post-backward trigger fired),
+        waits on all reduce-grad work, and releases an unused prefetch.
         """
         if self.post_backward_callback_queued:
             return
@@ -236,7 +269,7 @@ class BucketCommContext:
         def _post_backward_callback() -> None:
             try:
                 for bucket in self.buckets:
-                    if bucket.is_unsharded or bucket.grad_ready_indices:
+                    if bucket.is_unsharded:
                         bucket.post_backward()
                     bucket.reset_backward_state()
                 self.wait_and_clear_reduce_grad_states(debug_fqn=None)
@@ -249,6 +282,22 @@ class BucketCommContext:
         torch.autograd.Variable._execution_engine.queue_callback(
             _post_backward_callback
         )
+
+    def reset(self) -> None:
+        """Reshard every bucket and clear per-backward state.
+
+        Used by ``FlexShardModule.reshard()`` and after a backward that raised
+        before its final callback ran (autograd drops queued callbacks then).
+        """
+        self.post_backward_callback_queued = False
+        self.take_pending_unshard(None)
+        self.wait_and_clear_reduce_grad_states(debug_fqn=None)
+        for bucket in self.buckets:
+            for param in bucket.unsharded_params or []:
+                param.grad = None
+            if bucket.is_unsharded:
+                bucket.reshard()
+            bucket.reset_backward_state()
 
     def wait_and_clear_reduce_grad_states(
         self,
@@ -316,8 +365,8 @@ class BucketRuntime:
     unsharded params with ``untyped_storage().resize_(0)``; later unshards
     re-allocate and refill them in place. Grads accumulate into the unsharded
     params through autograd and are reduce-scattered into the local shards once
-    the bucket's backward is done: when the hooked module's input grads are
-    ready (as in FSDP2) or every grad has accumulated, whichever comes first.
+    the hooked module's backward is done (its input grads are ready, as in
+    FSDP2), or at the end of backward.
 
     Compile: ``_BucketUnshard`` outputs are swapped into ``_parameters`` for the
     forward, so Dynamo traces one all-gather and one reduce-scatter per bucket.
@@ -330,10 +379,8 @@ class BucketRuntime:
     # Position in the context's learned forward and post-forward orders.
     forward_index: int | None = None
     post_forward_index: int | None = None
-    # Whether the unsharded params hold data and are swapped into their
-    # modules, and which params' grads have accumulated in this backward.
+    # Whether the unsharded params hold data and are swapped into their modules.
     is_unsharded: bool = False
-    grad_ready_indices: set[int] = field(default_factory=set)
     # Forward calls since the last backward whose outputs need backward, how
     # many carried a post-backward trigger on their inputs, and how many of
     # those triggers ran; and whether each in-progress call carries one.
@@ -347,8 +394,6 @@ class BucketRuntime:
     unsharded_params: list[nn.Parameter] | None = None
     persistent_buffers: list[torch.Tensor] = field(default_factory=list)
     persistent_buffer_nbytes: list[int] = field(default_factory=list)
-    # Indices of the unsharded params with a post-accumulate-grad hook.
-    grad_hooked: set[int] = field(default_factory=set)
 
     @classmethod
     def from_bucket_storage(
@@ -388,12 +433,6 @@ class BucketRuntime:
     @property
     def sharded_params(self) -> list[nn.Parameter]:
         return [bucket_param.sharded_param for bucket_param in self.bucket_params]
-
-    @property
-    def num_grad_params(self) -> int:
-        if self.unsharded_params is None:
-            return 0
-        return sum(1 for param in self.unsharded_params if param.requires_grad)
 
     def _local_shards(self, *, use_autograd: bool) -> list[torch.Tensor]:
         # detach() shares the parameter version counter, which versioned
@@ -531,7 +570,17 @@ class BucketRuntime:
                 with torch.autograd._unsafe_preserve_version_counter(
                     tuple(self.persistent_buffers)
                 ):
-                    result.finish(persistent_buffers=self.persistent_buffers)
+                    refill = result.finish(persistent_buffers=self.persistent_buffers)
+                if len(refill.persistent_buffers) != len(
+                    self.persistent_buffers
+                ) or any(
+                    a is not b
+                    for a, b in zip(refill.persistent_buffers, self.persistent_buffers)
+                ):
+                    raise AssertionError(
+                        f"Placement {self.infos[0].placement!r} did not refill the "
+                        "persistent buffers it was given."
+                    )
             self._sync_requires_grad()
         self.is_unsharded = True
 
@@ -545,10 +594,22 @@ class BucketRuntime:
                 f"Placement {self.infos[0].placement!r} returned no persistent "
                 "buffers for a persistent unshard."
             )
+        buffer_storages = {_storage_ptr(buffer) for buffer in persistent_buffers}
         unsharded_params: list[nn.Parameter] = []
         for bucket_param, full_param in zip(
             self.bucket_params, full_params, strict=True
         ):
+            # Refills write into the persistent buffers, so the params (or a
+            # tensor subclass's inner tensors) must view them.
+            if any(
+                inner.numel() and _storage_ptr(inner) not in buffer_storages
+                for inner in _inner_tensors(full_param)
+            ):
+                raise AssertionError(
+                    f"Placement {bucket_param.param_info.placement!r} returned full "
+                    f"param {bucket_param.param_info.fqn!r}, which does not view its "
+                    "persistent buffers, so refills would not reach it."
+                )
             unsharded_param = nn.Parameter(
                 full_param, requires_grad=bucket_param.sharded_param.requires_grad
             )
@@ -564,19 +625,12 @@ class BucketRuntime:
 
     def _sync_requires_grad(self) -> None:
         """Follow the local shards' ``requires_grad``, as FSDP2 does per unshard."""
-        for idx, (bucket_param, unsharded_param) in enumerate(
-            zip(self.bucket_params, self.unsharded_params, strict=True)
+        for bucket_param, unsharded_param in zip(
+            self.bucket_params, self.unsharded_params, strict=True
         ):
             requires_grad = bucket_param.sharded_param.requires_grad
             if unsharded_param.requires_grad != requires_grad:
                 unsharded_param.requires_grad_(requires_grad)
-            if requires_grad and idx not in self.grad_hooked:
-
-                def hook(_param: torch.Tensor, idx: int = idx) -> None:
-                    self.on_grad_accumulated(idx)
-
-                unsharded_param.register_post_accumulate_grad_hook(hook)
-                self.grad_hooked.add(idx)
 
     def _swap_in_params(self, params: list[torch.Tensor]) -> None:
         """Expose ``params`` through their modules' ``_parameters``."""
@@ -608,41 +662,41 @@ class BucketRuntime:
         """Post-backward trigger from the hooked module's input grads.
 
         Like FSDP2's ``RegisterPostBackwardFunction``, it reduces and reshards
-        once the module's backward is done, even if some params got no grad
-        (e.g. an unrouted expert's). It fires only when every forward call since
-        the last backward carried a trigger and all of them ran, so no other
-        call's backward still needs the params.
+        once the module's backward is done, after every op that reads its
+        params (frozen ones included), even if some params got no grad. It fires
+        only when every forward call since the last backward carried a trigger
+        and all of them ran, so no other call's backward still needs the params.
         """
         self.input_triggers_run += 1
         if self.backward_calls == self.input_triggers == self.input_triggers_run:
             self.post_backward()
 
-    def on_grad_accumulated(self, idx: int) -> None:
-        """Post-accumulate-grad hook; reduce once every grad has accumulated.
-
-        Within one backward, autograd sums all uses of a leaf before running its
-        AccumulateGrad once, so this fires once per param even if the module
-        ran forward several times.
-        """
-        self.grad_ready_indices.add(idx)
-        if len(self.grad_ready_indices) == self.num_grad_params:
-            self.post_backward()
-
     def post_backward(self) -> None:
-        """Reduce-scatter accumulated full grads into the shards and reshard."""
+        """Reduce-scatter this backward's grads into the shards and reshard.
+
+        Every trainable param joins the reduce-scatter, with zeros if it got no
+        grad (e.g. an expert that saw no tokens on this rank), so every rank
+        issues the same collective, once per bucket per backward.
+        """
         grads: list[torch.Tensor] = []
         infos: list[ParamInfo] = []
         sharded_params: list[nn.Parameter] = []
         for bucket_param, unsharded_param in zip(
             self.bucket_params, self.unsharded_params or [], strict=False
         ):
-            if unsharded_param.grad is None:
+            if not unsharded_param.requires_grad:
                 continue
-            grads.append(unsharded_param.grad)
+            grad = unsharded_param.grad
+            if grad is None:
+                grad = torch.zeros(
+                    unsharded_param.shape,
+                    dtype=unsharded_param.dtype,
+                    device=unsharded_param.device,
+                )
+            grads.append(grad)
             infos.append(bucket_param.param_info)
             sharded_params.append(bucket_param.sharded_param)
             unsharded_param.grad = None
-        self.grad_ready_indices.clear()
         if self.is_unsharded:
             self.reshard()
         if grads:
@@ -657,47 +711,53 @@ class BucketRuntime:
         mod: nn.Module,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
+    ) -> None:
         if torch.compiler.is_compiling():
             self._pre_forward_compile()
-            return None
+            return
         if _in_backward():
             # Activation-checkpoint recompute: the pre-backward hook usually
             # re-gathered already; otherwise this consumes its prefetch.
             self.call_has_trigger.append(False)
             self.unshard()
-            return None
+            return
+        if self.context.post_backward_callback_queued:
+            # The previous backward raised before its final callback ran.
+            self.context.reset()
         if self.forward_index is None:
             self.forward_index = len(self.context.forward_order)
             self.context.forward_order.append(self)
         self.unshard()
         self.context.prefetch(self.context.next_forward_bucket(self))
-        inputs = self._register_post_backward_trigger(args, kwargs)
-        self.call_has_trigger.append(inputs is not None)
-        return inputs
+        self.call_has_trigger.append(self._register_input_grad_hook(args, kwargs))
 
-    def _register_post_backward_trigger(
+    def _register_input_grad_hook(
         self,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
-        """Route the forward's grad-requiring inputs through ``_PostBackwardTrigger``."""
+    ) -> bool:
+        """Call ``on_input_grads`` once this forward's input grads are computed.
+
+        A multi-grad hook on the inputs does what FSDP2's
+        ``RegisterPostBackwardFunction`` does without wrapping them. Forwards
+        without grad-requiring inputs, or with leaf ones (whose hooks would
+        outlive this graph), get no trigger.
+        """
         if not torch.is_grad_enabled():
-            return None
-        flat_inputs, spec = tree_flatten((args, kwargs))
-        indices = [
-            idx
-            for idx, value in enumerate(flat_inputs)
-            if isinstance(value, torch.Tensor) and value.requires_grad
-        ]
-        if not indices:
-            return None
-        outputs = _PostBackwardTrigger.apply(
-            self, *(flat_inputs[idx] for idx in indices)
+            return False
+        inputs = list(
+            {
+                id(tensor): tensor
+                for tensor in _tensor_leaves((args, kwargs))
+                if tensor.requires_grad
+            }.values()
         )
-        for idx, output in zip(indices, outputs, strict=True):
-            flat_inputs[idx] = output
-        return tree_unflatten(flat_inputs, spec)
+        if not inputs or any(tensor.grad_fn is None for tensor in inputs):
+            return False
+        torch.autograd.graph.register_multi_grad_hook(
+            inputs, lambda grads: self.on_input_grads()
+        )
+        return True
 
     def post_forward_hook(self, mod: nn.Module, args: Any, output: Any) -> None:
         if torch.compiler.is_compiling():
@@ -711,29 +771,36 @@ class BucketRuntime:
         if self.post_forward_index is None:
             self.post_forward_index = len(self.context.post_forward_order)
             self.context.post_forward_order.append(self)
-        grad_outputs = (
-            [
-                value
-                for value in tree_leaves(output)
-                if isinstance(value, torch.Tensor) and value.requires_grad
-            ]
-            if output is not None and torch.is_grad_enabled()
-            else []
-        )
-        if not grad_outputs:
+        tensors = _tensor_leaves(output)
+        grad_outputs = [tensor for tensor in tensors if tensor.requires_grad]
+        if (
+            output is None
+            or not torch.is_grad_enabled()
+            or (tensors and not grad_outputs)
+        ):
             # No backward will reach these params through this forward.
             self.reshard()
             return
         self.backward_calls += 1
+        if not grad_outputs:
+            # Outputs without visible tensors: no pre-backward hook can re-gather,
+            # so keep the params until post-backward.
+            return
         self.input_triggers += has_trigger
         for value in grad_outputs:
             # Hook a view output's base: an in-place op on the view replaces the
             # view's autograd node, which would drop a hook registered on it.
+            # Leaves (e.g. a returned param) get none: their hooks would persist.
             base = value._base
-            hooked = base if base is not None and base.requires_grad else value
-            hooked.register_hook(self.pre_backward_hook)
+            if base is not None and base.grad_fn is not None:
+                base.register_hook(self.pre_backward_hook)
+            elif value.grad_fn is not None:
+                value.register_hook(self.pre_backward_hook)
         if self.bucket_storage._reshard_after_forward:
-            self.reshard()
+            persistent = {_storage_ptr(buffer) for buffer in self.persistent_buffers}
+            # An output viewing the persistent storage would see it freed.
+            if not any(_storage_ptr(value) in persistent for value in grad_outputs):
+                self.reshard()
 
     def _pre_forward_compile(self) -> None:
         """Trace the bucket unshard and expose its outputs via ``_parameters``.
@@ -745,26 +812,6 @@ class BucketRuntime:
         """
         full_params = _BucketUnshard.apply(self, *self._local_shards(use_autograd=True))
         self._swap_in_params(list(full_params))
-
-
-class _PostBackwardTrigger(torch.autograd.Function):
-    """Identity on a bucket module's grad-requiring inputs whose backward runs
-    once the module's backward produced their grads (FSDP2's
-    ``RegisterPostBackwardFunction``)."""
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        bucket: BucketRuntime,
-        *inputs: torch.Tensor,
-    ) -> tuple[torch.Tensor, ...]:
-        ctx.bucket = bucket
-        return inputs
-
-    @staticmethod
-    def backward(ctx: Any, *grads: torch.Tensor) -> tuple[Any, ...]:
-        ctx.bucket.on_input_grads()
-        return (None, *grads)
 
 
 class _BucketUnshard(torch.autograd.Function):

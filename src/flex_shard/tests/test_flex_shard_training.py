@@ -79,6 +79,17 @@ def _init_params_deterministically(model: torch.nn.Module) -> None:
             param.copy_(values.div(max(param.numel(), 1)).add_(idx))
 
 
+class _RankRoutedExperts(torch.nn.Module):
+    """Each rank routes to one expert, like experts that got tokens on one rank."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.experts = torch.nn.ModuleList(torch.nn.Linear(8, 8) for _ in range(2))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.experts[dist.get_rank()](x)
+
+
 def _average_reference_grads(model: torch.nn.Module) -> None:
     for param in model.parameters():
         if param.grad is not None:
@@ -155,7 +166,14 @@ class TestFlexShardTraining(FSDPTest):
         )
         model.set_max_pending_reduce_grads(1)
 
-        x = torch.ones((2, width), dtype=torch.bfloat16, device=device_type.type)
+        # Grad-requiring inputs let each layer's input-grad trigger reduce
+        # mid-backward, one bucket after the other.
+        x = torch.ones(
+            (2, width),
+            dtype=torch.bfloat16,
+            device=device_type.type,
+            requires_grad=True,
+        )
         output = sum(layer((index + 1) * x) for index, layer in enumerate(model))
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -531,6 +549,31 @@ class TestFlexShardTraining(FSDPTest):
             world_size=self.world_size,
         )
         self.assertEqual(grad, expected_grad)
+
+    @skip_if_lt_x_gpu(2)
+    def test_rank_dependent_unused_params(self):
+        # Ranks leave different params of a bucket without grads; every rank
+        # still reduce-scatters all of them, with zeros for its unused ones.
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+        torch.manual_seed(0)
+        model = _RankRoutedExperts().to(device_type)
+        reference = copy.deepcopy(model)
+        flex_shard(
+            model,
+            buckets=[BucketSpec(["*"], placement_fn=per_param_placements, mesh=mesh)],
+        )
+        x = torch.randn(4, 8, device=device_type)
+        model(x).sum().backward()
+        reference(x).sum().backward()
+        for param in reference.parameters():
+            if param.grad is None:
+                param.grad = torch.zeros_like(param)
+        _average_reference_grads(reference)
+        check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
 
     @skip_if_lt_x_gpu(2)
     def test_reshard_after_forward_with_activation_checkpointing(self):
