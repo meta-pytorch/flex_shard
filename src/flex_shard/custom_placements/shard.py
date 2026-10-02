@@ -221,20 +221,33 @@ class Shard(Placement):
         infos: list[ParamInfo],
         world_size: int,
         layout: Shard._PaddedUnshardLayout,
+        destinations: list[torch.Tensor] | None = None,
     ) -> list[torch.Tensor]:
         full_params: list[torch.Tensor] = []
         split_out: list[torch.Tensor] = []
-        for info, padded_local_numel in zip(
-            infos,
-            layout.padded_local_numels,
-            strict=True,
+        for idx, (info, padded_local_numel) in enumerate(
+            zip(infos, layout.padded_local_numels, strict=True)
         ):
-            padded_full_param = torch.empty(
-                world_size * padded_local_numel,
-                dtype=info.unsharded_dtype,
-                device=gathered.device,
-            )
-            full_param = padded_full_param[: info.global_numel].view(info.global_shape)
+            if destinations is not None:
+                # Write into the persistent parameter's (padded) storage.
+                destination = destinations[idx]
+                padded_full_param = torch.empty(
+                    0, dtype=info.unsharded_dtype, device=gathered.device
+                ).set_(
+                    destination.untyped_storage(),
+                    destination.storage_offset(),
+                    (world_size * padded_local_numel,),
+                )
+                full_param = destination
+            else:
+                padded_full_param = torch.empty(
+                    world_size * padded_local_numel,
+                    dtype=info.unsharded_dtype,
+                    device=gathered.device,
+                )
+                full_param = padded_full_param[: info.global_numel].view(
+                    info.global_shape
+                )
             full_params.append(full_param)
             split_out.append(padded_full_param.view(world_size, padded_local_numel))
 
@@ -326,9 +339,19 @@ class Shard(Placement):
                 state.infos,
                 state.world_size,
                 state.padded_layout,
+                destinations=prepared.copy_out_destinations,
             )
 
         return PlacementUnshardResult(full_params=full_params)
+
+    @override
+    def supports_copy_out_destinations(self) -> bool:
+        return self.dim == 0
+
+    @override
+    def unshard_storage_numel(self, info: ParamInfo, world_size: int) -> int:
+        # The copy-out writes each rank's padded slice contiguously.
+        return world_size * (info.storage_nbytes // info.dtype.itemsize)
 
     def _pack_reduce_scatter_grad(
         self,
