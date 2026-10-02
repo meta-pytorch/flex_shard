@@ -16,7 +16,7 @@ from torch.testing._internal.common_fsdp import FSDPTest, get_devtype
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torchao.utils import is_sm_at_least_90
 
-from .. import BucketSpec, flex_shard
+from .. import BucketSpec, flex_shard, MixedPrecisionPolicy
 from ..custom_placements import (
     fp8_bucketed_block_shard as fp8_bucketed_block_shard_module,
 )
@@ -25,7 +25,8 @@ from ..custom_placements.fp8_bucketed_block_shard import (
     Fp8BucketedBlockShard,
 )
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
-from ..flex_shard.bucket_storage import ParamInfo
+from ..flex_shard.bucket_storage import ParamInfo, ShardedBucketStorage
+from .common import single_rank_cpu_mesh
 
 
 device_type = torch.device(get_devtype())
@@ -388,6 +389,58 @@ class TestFp8AllGatherLayout(TestCase):
             torch.equal(recip_scale.view(reference_scale.shape), reference_scale)
         )
         self.assertFalse(torch.equal(recip_scale.view(fp32_scale.shape), fp32_scale))
+
+    def test_mixed_fp8_member_with_param_dtype_overrides_is_one_group(self) -> None:
+        """FP8 members quantize each param from its own dtype in one subgroup."""
+        with (
+            single_rank_cpu_mesh() as mesh,
+            patch.object(
+                Fp8BucketedBlockShard,
+                "_local_packed_cache_context",
+                return_value=(torch.device("cpu"), None),
+            ),
+        ):
+            weight_factory = _RecordingWeightFactory()
+            mixed = MixedBucketPlacement({})
+            fp8 = mixed.fp8_bucketed_block_shard(
+                Fp8BucketedBlockShard(
+                    world_size=1,
+                    weight_factory=weight_factory,
+                    block_size=4,
+                )
+            )
+            named_params = [
+                ("w0", nn.Parameter(torch.randn(8, 8))),
+                ("w1", nn.Parameter(torch.randn(6, 8))),
+                ("w2", nn.Parameter(torch.randn(4, 8))),
+            ]
+            param_infos, _ = ShardedBucketStorage.create_param_infos(
+                named_params,
+                mesh,
+                {fqn: (fp8,) for fqn, _ in named_params},
+                MixedPrecisionPolicy(
+                    param_dtype=torch.bfloat16,
+                    param_dtype_overrides={"w1": torch.float32},
+                ),
+            )
+            infos = list(param_infos.values())
+            params = dict(named_params)
+            prepared = mixed.prepare_unshard_bucket(
+                [params[info.fqn].detach() for info in infos], infos, mesh, None
+            )
+            self.assertEqual(
+                [
+                    [infos[index].fqn for index in group.indices]
+                    for group in prepared.placement_state.groups
+                ],
+                [["w0", "w2", "w1"]],
+            )
+            mixed.run_prepared_unshard(prepared)
+            mixed.finish_prepared_unshard(prepared)
+            self.assertEqual(
+                [call.orig_dtype for call in weight_factory.calls],
+                [torch.bfloat16, torch.bfloat16, torch.float32],
+            )
 
     def test_fp8_cache_phase_detects_checkpoint_recompute(self) -> None:
         from torch.utils.checkpoint import checkpoint

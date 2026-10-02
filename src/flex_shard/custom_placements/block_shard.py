@@ -912,6 +912,10 @@ class BucketedBlockShard(Placement):
     ) -> PlacementPreparedUnshard:
         dtype = _unsharded_dtype(infos[0])
         device = tensors[0].device
+        if any(_unsharded_dtype(info) != dtype for info in infos):
+            raise ValueError(
+                "BucketedBlockShard requires one unsharded dtype per bucket."
+            )
         with _record_copy_in_if_eager():
             send_buf = self._make_local_bucket_view(tensors, infos)
             copy_in_scratch: list[torch.Tensor] = []
