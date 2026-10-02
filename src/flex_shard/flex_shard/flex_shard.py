@@ -94,6 +94,10 @@ class FlexShardModule:
                 )
             bucket_storage.install_sharded_params(bucket_storage.byte_storage.device)
 
+        # Installed runtime hooks still hold the replaced local-shard params.
+        for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
+            for bucket in context.buckets:
+                bucket.reset_sharded_params()
         self._install_runtime_if_materialized()
 
     def _install_runtime_if_materialized(self) -> None:

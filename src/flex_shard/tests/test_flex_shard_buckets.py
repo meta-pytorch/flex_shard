@@ -520,9 +520,7 @@ class TestMixedBucketComposition(TestCase):
 
             self.assertEqual(result.full_params, local_params)
             uint8_groups = [
-                buffer
-                for buffer in result.finish_buffers
-                if buffer.dtype == torch.uint8
+                buffer for buffer in result.buffers if buffer.dtype == torch.uint8
             ]
             self.assertEqual(len(uint8_groups), 1)
             self.assertEqual(

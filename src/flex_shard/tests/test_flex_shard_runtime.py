@@ -34,6 +34,7 @@ class TestFlexShardEagerRuntime(TestCase):
                         bucket_fqn=None,
                     ),
                     param_info=Mock(),
+                    sharded_param=module.weight,
                 )
             ],
             context=Mock(),
