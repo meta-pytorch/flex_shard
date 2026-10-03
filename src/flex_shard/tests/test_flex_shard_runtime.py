@@ -178,6 +178,69 @@ class TestFlexShardEagerRuntime(TestCase):
                     self.assertIsNotNone(param.grad)
                 self.assertEqual(output_weight.grad.dtype, torch.bfloat16)
 
+    def test_meta_to_empty_keeps_tied_weights_shared(self):
+        # to_empty() from meta gives each slot of a shared parameter its own new
+        # parameter; FlexShard re-installs one sharded parameter in every slot.
+        with single_rank_cuda_mesh() as mesh:
+            with torch.device("meta"):
+                args, model = make_transformer_model(weight_tying=True)
+            flex_shard_cuda(model, mesh)
+            for _ in range(2):
+                model.to_empty(device="cuda")
+                self.assertIs(model.output.weight, model.tok_embeddings.weight)
+                for param in model.parameters():
+                    nn.init.uniform_(param, -0.1, 0.1)
+                    param.grad = None
+                model(transformer_inputs(args, device="cuda")).sum().backward()
+                self.assertIs(model.output.weight, model.tok_embeddings.weight)
+                self.assertIsNotNone(model.tok_embeddings.weight.grad)
+
+    def test_torch_compile_tied_weights(self):
+        # Under compile, _BucketUnshard's outputs swap into every slot of a
+        # shared parameter, so the tied output layer reads the gathered weight.
+        # The tied bucket is hooked on the root, around the per-layer buckets.
+        with single_rank_cuda_mesh() as mesh:
+            torch.manual_seed(0)
+            args, model = make_transformer_model(
+                device="cuda", n_layers=2, weight_tying=True
+            )
+            reference = copy.deepcopy(model)
+            spec = dict(
+                placement_fn=per_param_placements,
+                mesh=mesh,
+                reshard_after_forward=False,
+            )
+            flex_shard_cuda(
+                model,
+                mesh,
+                buckets=[
+                    BucketSpec(
+                        [
+                            "tok_embeddings.*",
+                            "pos_embeddings.*",
+                            "norm.*",
+                            "output.*",
+                        ],
+                        **spec,
+                    ),
+                    *(
+                        BucketSpec([f"layers.{idx}.*"], **spec)
+                        for idx in range(args.n_layers)
+                    ),
+                ],
+            )
+            compiled_model = torch.compile(model, backend="eager", fullgraph=True)
+            x = transformer_inputs(args, device="cuda")
+            loss = compiled_model(x).sum()
+            ref_loss = reference(x).sum()
+            self.assertEqual(loss, ref_loss)
+            loss.backward()
+            ref_loss.backward()
+            self.assertIs(model.output.weight, model.tok_embeddings.weight)
+            self.assertEqual(
+                model.tok_embeddings.weight.grad, reference.tok_embeddings.weight.grad
+            )
+
     def test_persistent_unsharded_params(self):
         for reshard_after_forward in (False, True):
             with (

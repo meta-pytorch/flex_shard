@@ -116,6 +116,7 @@ def make_transformer_model(
     max_seq_len: int = 8,
     dim: int = 8,
     n_heads: int = 2,
+    weight_tying: bool = False,
 ) -> tuple[ModelArgs, Transformer]:
     """Build the small internal Transformer used across FlexShard tests."""
     args = ModelArgs(
@@ -126,7 +127,7 @@ def make_transformer_model(
         n_heads=n_heads,
         dropout_p=0.0,
         use_attn_mask=True,
-        weight_tying=False,
+        weight_tying=weight_tying,
         checkpoint_activations=False,
     )
     model = Transformer(args)

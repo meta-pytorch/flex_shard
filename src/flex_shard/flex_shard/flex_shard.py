@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import cast, TYPE_CHECKING
 
 import torch
@@ -29,6 +29,7 @@ from .sharded_param import is_flex_shard_param
 from .utils import (
     _get_device_from_mesh,
     _get_managed_named_params,
+    _get_shared_param_names,
     _validate_bucket_uniform_dtype_and_placement,
     _validate_eager_params,
     _validate_flex_shard_mesh,
@@ -371,6 +372,8 @@ class PreparedFlexShardInputs:
     device: torch.device
     param_placements: dict[str, tuple[Placement, ...]]
     bucket_assignments: BucketParamFQNsByIndex
+    # Shared parameters: first name -> other names, all in the same bucket.
+    shared_param_names: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _materialize_bucket_storages(
@@ -397,6 +400,7 @@ def _materialize_bucket_storages(
                 bucket_spec.mesh,
                 inputs.device,
                 bucket_spec,
+                inputs.shared_param_names,
             )
         )
 
@@ -517,7 +521,10 @@ def _prepare_flex_shard_inputs(
     )
 
     param_fqns = [fqn for fqn, _ in named_params]
-    bucket_assignments = _assign_params_to_buckets(param_fqns, buckets)
+    shared_param_names = _get_shared_param_names(module)
+    bucket_assignments = _assign_params_to_buckets(
+        param_fqns, buckets, shared_param_names
+    )
     _validate_param_dtype_overrides(named_params, bucket_assignments, buckets)
     param_placements = _resolve_bucket_param_placements(
         named_params,
@@ -536,4 +543,5 @@ def _prepare_flex_shard_inputs(
         device=device,
         param_placements=param_placements,
         bucket_assignments=bucket_assignments,
+        shared_param_names=shared_param_names,
     )
