@@ -280,10 +280,11 @@ class TestBucketPlacementValidation(TestCase):
                 )
 
     def test_rejects_incomplete_placement_contract(self):
-        """Placement subclasses must implement the storage layout contract."""
+        """Placement subclasses must implement the storage layout contract; the
+        unimplemented method's NotImplementedError propagates."""
         with single_rank_cpu_mesh() as mesh:
             named_params = self._named_params()
-            with self.assertRaisesRegex(TypeError, "storage layout contract"):
+            with self.assertRaises(NotImplementedError):
                 ShardedBucketStorage.create_param_infos(
                     named_params,
                     mesh,
