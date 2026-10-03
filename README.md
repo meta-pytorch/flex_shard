@@ -74,6 +74,14 @@ The expert bucket for block `i` selects `layers.{i}.experts.*` and uses
 bucket on `dp_mesh`. Along with the four root buckets, this gives eight
 buckets. After all-gather, each expert-FSDP group can evaluate all four experts.
 
+The expert stacks shard along the expert dimension here because two ranks split
+four experts evenly. When an expert-FSDP mesh has more ranks than a stack has
+local experts, `Shard(0)` leaves some ranks without rows and pads the others.
+FSDP2 recipes such as torchtitan's then shard each expert's matrix rows instead
+(`torchtitan/distributed/fsdp.py`, `linear_param_shard_placements`). In
+FlexShard, give that expert bucket
+`placement_fn=make_shard_placement_fn(1)`, from `flex_shard.custom_placements`.
+
 [`examples/train_adamw.py`](examples/train_adamw.py) builds these buckets and
 constructs AdamW after sharding:
 
