@@ -145,6 +145,26 @@ class PendingReduceGrad:
     result: ReduceGradHandle
 
 
+class GradientReductionHandle:
+    """Returned by ``FlexShardModule.finalize_backward(async_op=True)``.
+
+    ``wait()`` makes the current stream wait for the reduce-scatters, so the
+    local-shard grads are ready for the optimizer, and releases their buffers.
+    """
+
+    def __init__(self, contexts: list[BucketCommContext]) -> None:
+        self._contexts = contexts
+        for context in contexts:
+            context.pending_finalization = self
+
+    def wait(self) -> None:
+        for context in self._contexts:
+            if context.pending_finalization is self:
+                context.wait_and_clear_reduce_grad_states(debug_fqn=None)
+                context.pending_finalization = None
+        self._contexts = []
+
+
 @dataclass
 class BucketCommContext:
     """Streams and scheduling state shared by buckets on one root module/device."""
@@ -165,6 +185,9 @@ class BucketCommContext:
     reduce_grad_states: list[PendingReduceGrad] = field(default_factory=list)
     retired_reduce_grad_states: list[PendingReduceGrad] = field(default_factory=list)
     post_backward_callback_queued: bool = False
+    # See FlexShardModule.set_manual_backward_finalization and finalize_backward.
+    manual_backward_finalization: bool = False
+    pending_finalization: GradientReductionHandle | None = None
 
     @classmethod
     def get(
@@ -260,22 +283,21 @@ class BucketCommContext:
     def queue_post_backward_callback(self) -> None:
         """Queue the end-of-backward callback (once per backward).
 
-        It finishes buckets still unsharded (no post-backward trigger fired)
-        and, in a syncing backward, buckets a backward without sync finished
-        since their last reduce-scatter, waits on all reduce-grad work, and
-        releases an unused prefetch.
+        It finishes the buckets the backward left (``finish_buckets``), waits
+        on all reduce-grad work, and releases an unused prefetch. With manual
+        backward finalization, or outside a backward (``finalize_backward``),
+        nothing is queued.
         """
-        if self.post_backward_callback_queued:
+        if (
+            self.post_backward_callback_queued
+            or self.manual_backward_finalization
+            or not _in_backward()
+        ):
             return
         self.post_backward_callback_queued = True
 
         def _post_backward_callback() -> None:
-            for bucket in self.buckets:
-                if bucket.is_unsharded or (
-                    bucket.needs_sync and bucket.bucket_storage._requires_gradient_sync
-                ):
-                    bucket.post_backward()
-                bucket.reset_backward_state()
+            self.finish_buckets()
             self.wait_and_clear_reduce_grad_states(debug_fqn=None)
             self.take_pending_unshard(None)
             self.post_backward_callback_queued = False
@@ -283,6 +305,32 @@ class BucketCommContext:
         torch.autograd.Variable._execution_engine.queue_callback(
             _post_backward_callback
         )
+
+    def finish_buckets(self) -> None:
+        """Finish the buckets backwards left: buckets still unsharded (no
+        post-backward trigger fired) and, with gradient sync on, buckets whose
+        grads a backward without sync accumulated since their last
+        reduce-scatter. Then reset the per-backward trigger counts."""
+        for bucket in self.buckets:
+            if bucket.is_unsharded or (
+                bucket.needs_sync and bucket.bucket_storage._requires_gradient_sync
+            ):
+                bucket.post_backward()
+            bucket.reset_backward_state()
+
+    def start_finalize_backward(self) -> None:
+        """``FlexShardModule.finalize_backward`` without the wait: issue the
+        remaining reduce-scatters and reshard on the calling thread."""
+        if self.pending_finalization is not None:
+            raise RuntimeError(
+                "FlexShard: wait on the previous finalize_backward() handle before "
+                "finalizing backward again."
+            )
+        if _in_backward():
+            raise RuntimeError("FlexShard: finalize_backward() cannot run in backward.")
+        self.check_no_raised_backward()
+        self.finish_buckets()
+        self.take_pending_unshard(None)
 
     def check_no_raised_backward(self) -> None:
         """Raise if a backward raised before its final callback ran.
@@ -304,6 +352,7 @@ class BucketCommContext:
         self.check_no_raised_backward()
         self.take_pending_unshard(None)
         self.wait_and_clear_reduce_grad_states(debug_fqn=None)
+        self.pending_finalization = None
         for bucket in self.buckets:
             if bucket.is_unsharded:
                 bucket.reshard()
@@ -838,6 +887,11 @@ class BucketRuntime:
             self.unshard()
             return
         self.context.check_no_raised_backward()
+        if self.context.pending_finalization is not None:
+            raise RuntimeError(
+                "FlexShard: wait on the finalize_backward() handle before the next "
+                "forward."
+            )
         if self.forward_index is None:
             self.forward_index = len(self.context.forward_order)
             self.context.forward_order.append(self)
