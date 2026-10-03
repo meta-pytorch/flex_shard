@@ -45,7 +45,10 @@ def get_flex_shard_global_layouts(module: nn.Module) -> dict[str, GlobalLayout]:
                 ) from e
             if info.outer_layout is not None:
                 layout = compose_global_layouts(info.outer_layout, layout)
-            layouts[name] = layout
+            # ``state_dict()`` lists every name of a shared parameter, each as
+            # its own detached tensor, so each name needs the layout.
+            for alias in (fqn, *info.alias_fqns):
+                layouts[f"{prefix}.{alias}" if prefix else alias] = layout
     return layouts
 
 

@@ -33,6 +33,7 @@ from ..custom_placements.block_shard import (
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..custom_placements.shard import per_param_placements, Shard
 from ..flex_shard import bucket_runtime
+from ..flex_shard.checkpoint import get_flex_shard_global_layouts
 from .common import (
     check_flex_shard_parity,
     expected_shard,
@@ -1171,6 +1172,75 @@ class TestFlexShardTraining(FSDPTest):
                 _average_reference_grads(reference)
                 check_flex_shard_parity(
                     self, reference, model, self.rank, self.world_size
+                )
+
+    @skip_if_lt_x_gpu(2)
+    def test_tied_weights_in_one_bucket(self):
+        # Registered tying (output.weight is tok_embeddings.weight), which FSDP2
+        # supports within one FSDP group. One bucket holds every name of the
+        # shared parameter, so FlexShard hooks it on the root, around the
+        # per-layer buckets: both names swap together, both uses read the
+        # gathered weight, and the grads of both reduce once, with
+        # reshard-after-forward on or off. Each step runs a backward without
+        # sync first.
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+        for reshard_after_forward in (False, True):
+            with self.subTest(reshard_after_forward=reshard_after_forward):
+                torch.manual_seed(0)
+                args, model = make_transformer_model(
+                    device=device_type.type, n_layers=2, weight_tying=True
+                )
+                self.assertIs(model.output.weight, model.tok_embeddings.weight)
+                reference = copy.deepcopy(model)
+                spec = dict(
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    reshard_after_forward=reshard_after_forward,
+                )
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            [
+                                "tok_embeddings.*",
+                                "pos_embeddings.*",
+                                "norm.*",
+                                "output.*",
+                            ],
+                            **spec,
+                        ),
+                        *(
+                            BucketSpec([f"layers.{idx}.*"], **spec)
+                            for idx in range(args.n_layers)
+                        ),
+                    ],
+                )
+                self.assertIs(model.output.weight, model.tok_embeddings.weight)
+                optim = make_test_sgd(model.parameters(), lr=0.1)
+                ref_optim = make_test_sgd(reference.parameters(), lr=0.1)
+                torch.manual_seed(1 + self.rank)
+                for _ in range(2):
+                    x = transformer_inputs(args, batch_size=2, device=device_type)
+                    for sync in (False, True):
+                        model.set_requires_gradient_sync(sync)
+                        model(x).sum().backward()
+                        reference(x).sum().backward()
+                    _average_reference_grads(reference)
+                    check_flex_shard_parity(
+                        self, reference, model, self.rank, self.world_size
+                    )
+                    optim.step()
+                    ref_optim.step()
+                    optim.zero_grad(set_to_none=True)
+                    ref_optim.zero_grad(set_to_none=True)
+                self.assertIs(model.output.weight, model.tok_embeddings.weight)
+                layouts = get_flex_shard_global_layouts(model)
+                self.assertIs(
+                    layouts["output.weight"], layouts["tok_embeddings.weight"]
                 )
 
 

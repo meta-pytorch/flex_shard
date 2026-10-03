@@ -166,24 +166,29 @@ def _get_managed_named_params(
 ) -> list[tuple[str, nn.Parameter]]:
     """
     Collect parameters managed by this root-level flex_shard() call.
+
+    A parameter registered under several names (e.g. tied embedding and output
+    weights) is listed once, under its first name; ``_get_param_aliases``
+    returns its other names.
     """
     managed_params: list[tuple[str, nn.Parameter]] = []
-
-    seen_params: dict[int, str] = {}
-
-    # Use remove_duplicate=False so shared parameters are rejected instead of
-    # leaving one alias unmanaged.
+    seen_params: set[int] = set()
     for fqn, param in module.named_parameters(remove_duplicate=False):
-        param_id = id(param)
-        if param_id in seen_params:
-            raise ValueError(
-                "FlexShard eager mode does not support shared parameters; "
-                f"{fqn!r} shares storage with {seen_params[param_id]!r}."
-            )
-        seen_params[param_id] = fqn
-        managed_params.append((fqn, param))
-
+        if id(param) not in seen_params:
+            seen_params.add(id(param))
+            managed_params.append((fqn, param))
     return managed_params
+
+
+def _get_param_aliases(module: nn.Module) -> dict[str, list[str]]:
+    """Map each shared parameter's first name to its other names."""
+    first_names: dict[int, str] = {}
+    aliases: dict[str, list[str]] = {}
+    for fqn, param in module.named_parameters(remove_duplicate=False):
+        first_name = first_names.setdefault(id(param), fqn)
+        if first_name != fqn:
+            aliases.setdefault(first_name, []).append(fqn)
+    return aliases
 
 
 def _validate_flex_shard_mesh(mesh: DeviceMesh) -> None:
