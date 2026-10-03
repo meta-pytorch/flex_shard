@@ -170,6 +170,29 @@ class FlexShardModule:
         handle.wait()
         return None
 
+    def unshard(self) -> None:
+        """Unshard every bucket now and keep it unsharded, like FSDP2's
+        ``FSDPModule.unshard()``, synchronously.
+
+        For callers that run submodules' computation directly, bypassing the
+        forward hooks that gather buckets, e.g. Megatron-LM's EP overlap
+        schedule. Buckets whose hooks never run then stay unsharded, with their
+        grads, until the end of a backward or ``finalize_backward`` finishes
+        them, following the sync and reshard settings, or ``reshard()``. Call
+        it outside backward and after waiting on any ``finalize_backward``
+        handle. Eager only.
+        """
+        if _in_backward():
+            raise RuntimeError("FlexShard: unshard() cannot run in backward.")
+        for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
+            context.check_no_raised_backward()
+            if context.pending_finalization is not None:
+                raise RuntimeError(
+                    "FlexShard: wait on the finalize_backward() handle before unshard()."
+                )
+            for bucket in context.buckets:
+                bucket.unshard()
+
     def finish_deferred_backward(self, param: nn.Parameter) -> None:
         """Finish the backward of the bucket that holds ``param`` and defers its
         post-backward (``BucketSpec.defer_post_backward``).
