@@ -178,6 +178,80 @@ class _FusedWgradLinear(torch.nn.Module):
         return _FusedWgradLinearFn.apply(x, self.weight) + self.bias
 
 
+class _DelayedWgradLinearFn(torch.autograd.Function):
+    """``x @ weight.t()`` whose backward leaves the weight grad to
+    ``backward_dw()``, like TransformerEngine's ``delay_wgrad_compute``."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, pending: list):
+        ctx.save_for_backward(x, weight)
+        ctx.weight_ref = weakref.ref(weight)
+        ctx.pending = pending
+        return x @ weight.t()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        x, weight = ctx.saved_tensors
+        ctx.pending.append((ctx.weight_ref, x, grad_output))
+        return grad_output @ weight, None, None
+
+
+class _RunDelayedWgrad(torch.autograd.Function):
+    """Identity whose backward runs after the next layer's backward and calls
+    ``callback``, as Megatron-LM's MoE layer runs the experts' delayed weight
+    grads in the token dispatch's backward."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, callback) -> torch.Tensor:
+        ctx.callback = callback
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        ctx.callback()
+        return grad_output, None
+
+
+class _DelayedWgradLinear(torch.nn.Module):
+    """A linear layer whose weight grad waits for ``backward_dw()``, which adds
+    it to the weight's grad, and an ordinary bias."""
+
+    def __init__(self, *, device: torch.device) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(8, 8, device=device))
+        self.bias = torch.nn.Parameter(torch.randn(8, device=device))
+        self.pending: list = []
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _DelayedWgradLinearFn.apply(x, self.weight, self.pending) + self.bias
+
+    def backward_dw(self) -> None:
+        for weight_ref, x, grad_output in self.pending:
+            weight, wgrad = weight_ref(), grad_output.t() @ x
+            weight.grad = wgrad if weight.grad is None else weight.grad + wgrad
+        self.pending.clear()
+
+
+class _DelayedWgradModel(torch.nn.Module):
+    """``out(relu(layer(inp(x))))``: ``layer``'s delayed weight grad is computed
+    after ``layer``'s backward, which then calls ``on_wgrad``."""
+
+    def __init__(self, *, device: torch.device) -> None:
+        super().__init__()
+        self.inp = torch.nn.Linear(8, 8, device=device)
+        self.layer = _DelayedWgradLinear(device=device)
+        self.out = torch.nn.Linear(8, 6, device=device)
+        self.on_wgrad = lambda: None
+
+    def _backward_dw(self) -> None:
+        self.layer.backward_dw()
+        self.on_wgrad()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = _RunDelayedWgrad.apply(self.inp(x), self._backward_dw)
+        return self.out(torch.relu(self.layer(x)))
+
+
 def _init_params_deterministically(model: torch.nn.Module) -> None:
     with torch.no_grad():
         for idx, param in enumerate(model.parameters()):
@@ -666,6 +740,58 @@ class TestFlexShardTraining(FSDPTest):
                             expected, rank=self.rank, world_size=self.world_size
                         ),
                     )
+
+    @skip_if_lt_x_gpu(2)
+    def test_defer_post_backward(self):
+        # A weight grad computed after its layer's backward, as with
+        # TransformerEngine's delay_wgrad_compute: the layer's bucket defers its
+        # post-backward, which would otherwise reduce-scatter before that grad
+        # exists, until finish_deferred_backward. Once with sync and
+        # reshard-after-forward, once with a backward without sync first.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        for reshard_after_forward, no_sync in ((True, False), (False, True)):
+            with self.subTest(reshard_after_forward=reshard_after_forward):
+                torch.manual_seed(0)
+                model = _DelayedWgradModel(device=device_type)
+                reference = copy.deepcopy(model)
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            [f"{name}.*"],
+                            placement_fn=per_param_placements,
+                            mesh=mesh,
+                            reshard_after_forward=reshard_after_forward,
+                            defer_post_backward=name == "layer",
+                        )
+                        for name in ("inp", "layer", "out")
+                    ],
+                )
+                model.on_wgrad = lambda model=model: model.finish_deferred_backward(
+                    model.layer.weight
+                )
+                with self.assertRaisesRegex(ValueError, "does not defer"):
+                    model.finish_deferred_backward(model.out.weight)
+                torch.manual_seed(1 + self.rank)
+                for step in range(2 if no_sync else 1):
+                    model.set_requires_gradient_sync(step == int(no_sync))
+                    x = torch.randn(4, 8, device=device_type)
+                    model(x).sum().backward()
+                    reference(x).sum().backward()
+                for param, ref_param in zip(model.parameters(), reference.parameters()):
+                    expected = ref_param.grad.clone()
+                    dist.all_reduce(expected, op=dist.ReduceOp.AVG)
+                    self.assertEqual(
+                        param.grad,
+                        expected_shard(
+                            expected, rank=self.rank, world_size=self.world_size
+                        ),
+                    )
+        # A syncing backward that ends with the bucket unfinished raises instead
+        # of reduce-scattering without the late weight grad.
+        model.on_wgrad = lambda: None
+        with self.assertRaisesRegex(RuntimeError, "finish_deferred_backward"):
+            model(torch.randn(4, 8, device=device_type)).sum().backward()
 
     @skip_if_lt_x_gpu(2)
     def test_gradient_accumulation(self):

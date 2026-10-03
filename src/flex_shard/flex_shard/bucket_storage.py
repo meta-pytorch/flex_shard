@@ -194,6 +194,14 @@ class BucketSpec:
         post_reduce_hook: Optional callable run with the same pairs once a
             syncing backward has taken their grads for the reduce-scatter, e.g.
             to release references to those grads. Eager only.
+        defer_post_backward: Whether this bucket's post-backward (the
+            reduce-scatter with gradient sync on, then reshard) waits for
+            ``FlexShardModule.finish_deferred_backward`` instead of running once
+            its module's backward is done. For kernels that compute weight
+            grads after that backward, e.g. TransformerEngine's
+            ``delay_wgrad_compute``, whose ``backward_dw()`` runs later. A
+            syncing backward that runs the module's backward but ends with the
+            bucket unfinished raises. Eager only.
     """
 
     patterns: list[str]
@@ -206,6 +214,7 @@ class BucketSpec:
     reshard_after_forward: bool = True
     pre_backward_hook: BucketHook | None = None
     post_reduce_hook: BucketHook | None = None
+    defer_post_backward: bool = False
 
 
 @dataclass(frozen=True)
@@ -315,6 +324,7 @@ class ShardedBucketStorage:
         pre_backward_hook: BucketHook | None = None,
         post_reduce_hook: BucketHook | None = None,
         gradient_divide_factor: float | None = None,
+        defer_post_backward: bool = False,
     ) -> None:
         if byte_storage.dtype != torch.uint8:
             raise ValueError(f"Expected uint8 storage, got {byte_storage.dtype}")
@@ -326,6 +336,7 @@ class ShardedBucketStorage:
         self._reshard_after_forward = reshard_after_forward
         self._pre_backward_hook = pre_backward_hook
         self._post_reduce_hook = post_reduce_hook
+        self._defer_post_backward = defer_post_backward
         # See set_requires_gradient_sync and set_reshard_after_backward.
         self._requires_gradient_sync = True
         self._reshard_after_backward = True
@@ -377,6 +388,7 @@ class ShardedBucketStorage:
             pre_backward_hook=bucket_spec.pre_backward_hook,
             post_reduce_hook=bucket_spec.post_reduce_hook,
             gradient_divide_factor=bucket_spec.gradient_divide_factor,
+            defer_post_backward=bucket_spec.defer_post_backward,
         )
         bucket_storage.copy_params_from(named_params)
         bucket_storage.install_sharded_params(expected_param_device)
