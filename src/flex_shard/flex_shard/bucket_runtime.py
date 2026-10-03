@@ -115,10 +115,9 @@ def _tensor_leaves(value: Any) -> list[torch.Tensor]:
 
 
 def _storage_ptr(tensor: torch.Tensor) -> int | None:
-    try:
-        return tensor.untyped_storage().data_ptr()
-    except (RuntimeError, NotImplementedError):  # e.g. wrapper subclasses
+    if is_traceable_wrapper_subclass(tensor):  # no storage of its own
         return None
+    return tensor.untyped_storage().data_ptr()
 
 
 def _inner_tensors(tensor: torch.Tensor) -> list[torch.Tensor]:
@@ -271,45 +270,41 @@ class BucketCommContext:
         self.post_backward_callback_queued = True
 
         def _post_backward_callback() -> None:
-            try:
-                for bucket in self.buckets:
-                    if bucket.is_unsharded or (
-                        bucket.needs_sync
-                        and bucket.bucket_storage._requires_gradient_sync
-                    ):
-                        bucket.post_backward()
-                    bucket.reset_backward_state()
-                self.wait_and_clear_reduce_grad_states(debug_fqn=None)
-            finally:
-                try:
-                    self.take_pending_unshard(None)
-                finally:
-                    self.post_backward_callback_queued = False
+            for bucket in self.buckets:
+                if bucket.is_unsharded or (
+                    bucket.needs_sync and bucket.bucket_storage._requires_gradient_sync
+                ):
+                    bucket.post_backward()
+                bucket.reset_backward_state()
+            self.wait_and_clear_reduce_grad_states(debug_fqn=None)
+            self.take_pending_unshard(None)
+            self.post_backward_callback_queued = False
 
         torch.autograd.Variable._execution_engine.queue_callback(
             _post_backward_callback
         )
 
-    def reset(self) -> None:
-        """Reshard every bucket and clear per-backward state.
+    def check_no_raised_backward(self) -> None:
+        """Raise if a backward raised before its final callback ran.
 
-        Used by ``FlexShardModule.reshard()`` and after a backward that raised
-        before its final callback ran (autograd drops queued callbacks then).
-        Only after such a backward are the unsharded params' grads dropped,
-        since they are partial; otherwise they may be grads accumulated
-        without sync.
+        Autograd drops queued callbacks when a backward raises, which leaves
+        partial gradients and unfinished state. FlexShard does not recover
+        from errors: training has to stop.
         """
-        backward_raised = self.post_backward_callback_queued
-        self.post_backward_callback_queued = False
+        if self.post_backward_callback_queued:
+            raise RuntimeError(
+                "FlexShard: a previous backward raised before finishing, which "
+                "leaves FlexShard's state undefined; restart training."
+            )
+
+    def reset(self) -> None:
+        """Reshard every bucket and clear per-backward state, for
+        ``FlexShardModule.reshard()``. Unsharded params keep their grads, which
+        may be accumulated without sync."""
+        self.check_no_raised_backward()
         self.take_pending_unshard(None)
         self.wait_and_clear_reduce_grad_states(debug_fqn=None)
         for bucket in self.buckets:
-            if backward_raised:
-                for param in bucket.unsharded_params or []:
-                    param.grad = None
-                bucket._run_post_reduce_hook()
-                bucket.needs_sync = False
-                bucket._set_unsharded_grad_dtypes(defer_upcast=False)
             if bucket.is_unsharded:
                 bucket.reshard()
             bucket.reset_backward_state()
@@ -841,9 +836,7 @@ class BucketRuntime:
             self.call_has_trigger.append(False)
             self.unshard()
             return
-        if self.context.post_backward_callback_queued:
-            # The previous backward raised before its final callback ran.
-            self.context.reset()
+        self.context.check_no_raised_backward()
         if self.forward_index is None:
             self.forward_index = len(self.context.forward_order)
             self.context.forward_order.append(self)
