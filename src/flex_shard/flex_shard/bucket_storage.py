@@ -39,6 +39,9 @@ PlacementFn = Callable[
     dict[str, tuple["Placement", ...]],
 ]
 
+# Called with a bucket's ``(fqn, unsharded param)`` pairs.
+BucketHook = Callable[[list[tuple[str, nn.Parameter]]], None]
+
 GradientReduceOp = Literal[dist.ReduceOp.AVG, dist.ReduceOp.SUM]
 
 
@@ -181,6 +184,17 @@ class BucketSpec:
             parameters after forward and re-gather them before backward. This
             defaults to True. Under ``torch.compile`` the traced graph owns
             buffer lifetimes instead.
+        pre_backward_hook: Optional callable run with this bucket's
+            ``(fqn, unsharded param)`` pairs in its pre-backward hook, after
+            they are unsharded and before its backward runs; it may run more
+            than once per backward. For example, kernels that add weight grads
+            into a buffer in place and give autograd none (TransformerEngine's
+            ``fuse_wgrad_accumulation`` reads ``param.main_grad``) need the
+            grads allocated and exposed there first. Eager only.
+        post_reduce_hook: Optional callable run with the same pairs once a
+            syncing backward has taken their grads for the reduce-scatter, or
+            a backward that raised dropped them, e.g. to release references
+            to those grads. Eager only.
     """
 
     patterns: list[str]
@@ -190,6 +204,8 @@ class BucketSpec:
     offload_policy: OffloadPolicy | None = None
     gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG
     reshard_after_forward: bool = True
+    pre_backward_hook: BucketHook | None = None
+    post_reduce_hook: BucketHook | None = None
 
 
 @dataclass(frozen=True)
@@ -294,6 +310,8 @@ class ShardedBucketStorage:
         module: nn.Module,
         reshard_after_forward: bool = True,
         gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG,
+        pre_backward_hook: BucketHook | None = None,
+        post_reduce_hook: BucketHook | None = None,
     ) -> None:
         if byte_storage.dtype != torch.uint8:
             raise ValueError(f"Expected uint8 storage, got {byte_storage.dtype}")
@@ -303,6 +321,8 @@ class ShardedBucketStorage:
         self._total_bytes = total_bytes
         self._module = module
         self._reshard_after_forward = reshard_after_forward
+        self._pre_backward_hook = pre_backward_hook
+        self._post_reduce_hook = post_reduce_hook
         # See set_requires_gradient_sync and set_reshard_after_backward.
         self._requires_gradient_sync = True
         self._reshard_after_backward = True
@@ -348,6 +368,8 @@ class ShardedBucketStorage:
             module,
             reshard_after_forward=bucket_spec.reshard_after_forward,
             gradient_reduce_op=bucket_spec.gradient_reduce_op,
+            pre_backward_hook=bucket_spec.pre_backward_hook,
+            post_reduce_hook=bucket_spec.post_reduce_hook,
         )
         bucket_storage.copy_params_from(named_params)
         bucket_storage.install_sharded_params(expected_param_device)
