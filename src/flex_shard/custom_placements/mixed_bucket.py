@@ -245,6 +245,7 @@ class _MixedFp8BucketedBlockShard(
             weight_factory=placement.weight_factory,
             block_size=placement.block_size,
             fp8_dtype=placement.fp8_dtype,
+            quantizer=placement.quantizer,
         )
         self._mixed_bucket = mixed_bucket
         self._collective_placement = placement
