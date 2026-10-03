@@ -8,18 +8,13 @@ from __future__ import annotations
 
 import importlib.util
 from collections.abc import Sequence
-from typing import Any, TYPE_CHECKING, TypeAlias
+from typing import Any, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 
-try:
-    from ..flex_shard.placement_contract import GradientReduceOp
-except ImportError:
-    GradientReduceOp: TypeAlias = str
-
 if TYPE_CHECKING:
-    from ..flex_shard.placement_contract import GradientReduction
+    from ..flex_shard.placement_contract import GradientReduceOp, GradientReduction
 
 
 def foreach_copy_(
