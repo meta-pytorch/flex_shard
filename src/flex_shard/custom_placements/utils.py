@@ -8,15 +8,13 @@ from __future__ import annotations
 
 import importlib.util
 from collections.abc import Sequence
-from typing import Any, TypeAlias
+from typing import Any, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 
-try:
+if TYPE_CHECKING:
     from ..flex_shard.bucket_storage import GradientReduceOp
-except ImportError:
-    GradientReduceOp: TypeAlias = str
 
 
 def foreach_copy_(

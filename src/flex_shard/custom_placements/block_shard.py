@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING, TypeAlias
+from typing import Any, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from typing_extensions import override
 
+from ..flex_shard.bucket_storage import gradient_reduce_op_from_infos, GradientReduceOp
 from ..flex_shard.placement_contract import (
     BucketParamStorageLayout,
     BucketStorageLayout,
@@ -25,37 +26,18 @@ from ..flex_shard.placement_contract import (
     PlacementReduceGradResult,
     PlacementUnshardResult,
 )
-from ..flex_shard.utils import _record_comm_if_eager, _record_function_if_eager
+from ..flex_shard.utils import (
+    _record_comm_if_eager,
+    _record_copy_in_if_eager,
+    _record_copy_out_if_eager,
+    _record_function_if_eager,
+)
 from .utils import (
     _to_dist_reduce_op,
     copy_tensor_to_dtype,
     foreach_copy_,
     pack_tensors_into_flat_buffer_with_scratch,
 )
-
-try:
-    from ..flex_shard.bucket_storage import (
-        gradient_reduce_op_from_infos,
-        GradientReduceOp,
-    )
-except ImportError:
-    GradientReduceOp: TypeAlias = str
-
-    def gradient_reduce_op_from_infos(infos: list[ParamInfo]) -> GradientReduceOp:
-        _ = infos
-        return "avg"
-
-
-try:
-    from ..flex_shard.utils import _record_copy_in_if_eager, _record_copy_out_if_eager
-except ImportError:
-
-    def _record_copy_in_if_eager():
-        return _record_function_if_eager("FlexShard::copy_in", None)
-
-    def _record_copy_out_if_eager():
-        return _record_function_if_eager("FlexShard::copy_out", None)
-
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
