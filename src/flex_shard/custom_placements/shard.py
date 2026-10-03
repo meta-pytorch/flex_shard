@@ -31,7 +31,7 @@ from ..flex_shard.utils import (
     _record_copy_out_if_eager,
     _record_function_if_eager,
 )
-from .utils import chunk_cat_mixed_dtype, copy_tensor_to_dtype
+from .utils import copy_tensor_to_dtype
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -366,9 +366,12 @@ class Shard(Placement):
         input_numel = sum(s.numel() for s in padded_sizes)
         send_buf = torch.empty(input_numel, dtype=dtype, device=device)
         send_buf_2d = send_buf.view(world_size, -1)
-        # Grads may differ in dtype (per-parameter grad_dtype); the copy-in
-        # casts them to the reduce dtype.
-        chunk_cat_mixed_dtype(tensors, self.dim, world_size, send_buf_2d)
+        # Grads may differ in dtype (per-parameter grad_dtype). The copy-in
+        # casts each to the reduce dtype as it copies, one fused kernel for
+        # CUDA bf16 + fp32 (fsdp::chunk_cat_mixed_dtype, pytorch/pytorch#194434).
+        torch.ops.fsdp.chunk_cat_mixed_dtype(
+            tensors, dim=self.dim, num_chunks=world_size, out=send_buf_2d
+        )
         return send_buf, Shard._ReduceGradLayout(padded_sizes)
 
     def _unpack_reduce_scatter_grad(
