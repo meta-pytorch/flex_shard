@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 import fnmatch
-from collections.abc import Callable
+import functools
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, TYPE_CHECKING
 
@@ -62,13 +63,71 @@ class MixedPrecisionPolicy:
     Args:
         param_dtype: Dtype for forward compute. Placements should materialize
             unsharded parameters in this dtype. If None, use storage dtype.
-        reduce_dtype: Dtype for gradient reduction. Placements should pack
-            bucket gradient reduction buffers in this dtype. If None, use
-            param_dtype (or storage dtype if param_dtype is also None).
+        reduce_dtype: Dtype for autograd accumulation and gradient
+            reduction. Eager casts each full-parameter gradient to this dtype
+            before it accumulates on the unsharded parameter; torch.compile
+            casts the accumulated gradient before reduction. If None, each parameter accumulates in its ``grad_dtype`` (its
+            dtype unless explicitly set), independent of param_dtype, and
+            each bucket reduces in the promoted accumulation dtype of its
+            parameters trainable at wrap time, widened in each backward by
+            those trainable then. A parameter with ``grad_dtype`` explicitly
+            None accumulates in whatever dtype its gradients arrive in, which
+            can widen its bucket's reduce dtype. Every rank must produce the
+            same gradient dtypes, or ranks reduce in different dtypes and the
+            collective can hang. Where the parameter is unused, its zero
+            gradient has the forward dtype (param_dtype, else its dtype); set
+            reduce_dtype if its gradients can arrive in another dtype. This only sets the
+            accumulation and communication dtype: the reduced sharded
+            gradient is then cast to the parameter's ``grad_dtype`` when
+            stored in ``.grad``, and ``grad_dtype=None`` skips that cast.
+            flex_shard() keeps an explicit ``grad_dtype`` setting.
+        param_dtype_overrides: Sparse mapping from root-relative parameter FQN
+            to a parameter dtype override. Parameters absent from the mapping
+            use param_dtype. Override values must be param_dtype or the
+            parameter's original dtype. Every key must name a parameter assigned
+            to a bucket that uses this policy (or an equal one).
     """
 
     param_dtype: torch.dtype | None = None
     reduce_dtype: torch.dtype | None = None
+    param_dtype_overrides: Mapping[str, torch.dtype] | None = field(
+        default=None,
+        kw_only=True,
+    )
+
+    def _resolve_param_dtype(
+        self,
+        fqn: str,
+        param: nn.Parameter,
+    ) -> torch.dtype | None:
+        if self.param_dtype_overrides is None or fqn not in self.param_dtype_overrides:
+            return self.param_dtype
+        param_dtype = self.param_dtype_overrides[fqn]
+        if not isinstance(param_dtype, torch.dtype):
+            raise ValueError(
+                "MixedPrecisionPolicy.param_dtype_overrides values must be "
+                f"torch.dtype, but {fqn!r} maps to {type(param_dtype)}."
+            )
+        if param_dtype not in (self.param_dtype, param.dtype):
+            raise ValueError(
+                "MixedPrecisionPolicy.param_dtype_overrides values must be "
+                "param_dtype or the parameter's original dtype, but "
+                f"{fqn!r} maps to {param_dtype} for a parameter with dtype "
+                f"{param.dtype} and param_dtype {self.param_dtype}."
+            )
+        return param_dtype
+
+    def _group_by_unsharded_dtype(
+        self,
+        named_params: list[tuple[str, nn.Parameter]],
+    ) -> list[tuple[str, nn.Parameter]]:
+        if not self.param_dtype_overrides:
+            return named_params
+        groups: dict[torch.dtype, list[tuple[str, nn.Parameter]]] = {}
+        for fqn, param in named_params:
+            dtype = self._resolve_param_dtype(fqn, param) or param.dtype
+            groups.setdefault(dtype, []).append((fqn, param))
+        return [named_param for group in groups.values() for named_param in group]
 
 
 @dataclass(frozen=True)
@@ -176,6 +235,9 @@ class ParamInfo:
     # Python attributes of the original parameter (e.g. framework tags), copied
     # onto its persistent unsharded parameter.
     param_attrs: dict[str, Any] = field(default_factory=dict)
+    has_explicit_grad_dtype: bool = False
+    grad_dtype_override: torch.dtype | None = None
+    bucket_reduce_dtype: torch.dtype | None = None  # promoted over the bucket
 
     @property
     def placement(self) -> Placement:
@@ -188,9 +250,25 @@ class ParamInfo:
         return self.param_dtype or self.dtype
 
     @property
+    def unsharded_grad_dtype(self) -> torch.dtype | None:
+        """Dtype for autograd accumulation of the full-parameter gradient.
+
+        None accepts gradients in any dtype.
+        """
+        if self.reduce_dtype is not None:
+            return self.reduce_dtype
+        if self.has_explicit_grad_dtype:
+            return self.grad_dtype_override
+        return self.dtype
+
+    @property
     def grad_reduce_dtype(self) -> torch.dtype:
         """Dtype used to communicate this parameter's gradient."""
-        return self.reduce_dtype or self.param_dtype or self.dtype
+        return (
+            self.bucket_reduce_dtype
+            or self.unsharded_grad_dtype
+            or self.unsharded_dtype
+        )
 
 
 class ShardedBucketStorage:
@@ -249,7 +327,6 @@ class ShardedBucketStorage:
             bucket_spec.mp_policy,
             bucket_spec.gradient_reduce_op,
         )
-
         if bucket_spec.offload_policy is not None:
             byte_storage = torch.empty(
                 total_bytes,
@@ -294,6 +371,12 @@ class ShardedBucketStorage:
         if not named_params:
             return {}, 0
 
+        # Mixed buckets alias one contiguous storage span per (placement, dtype)
+        # subgroup, so equal unsharded dtypes must be adjacent in the layout.
+        # ParamInfo order must match layout order: FP8 pack plans index infos
+        # by position.
+        if mp_policy is not None:
+            named_params = mp_policy._group_by_unsharded_dtype(named_params)
         first_fqn = named_params[0][0]
         placement = _get_single_placement(param_placements[first_fqn])
         bucket_layout = placement.bucket_storage_layout(
@@ -302,20 +385,39 @@ class ShardedBucketStorage:
             mesh,
         )
         if bucket_layout is not None:
-            return cls._create_param_infos_from_bucket_layout(
+            param_infos, total_bytes = cls._create_param_infos_from_bucket_layout(
                 named_params,
                 param_placements,
                 bucket_layout,
                 mp_policy,
                 gradient_reduce_op,
             )
-        return cls._create_param_infos_from_local_layouts(
-            named_params,
-            mesh,
-            param_placements,
-            mp_policy,
-            gradient_reduce_op,
-        )
+        else:
+            param_infos, total_bytes = cls._create_param_infos_from_local_layouts(
+                named_params,
+                mesh,
+                param_placements,
+                mp_policy,
+                gradient_reduce_op,
+            )
+
+        # One collective per bucket needs one dtype. Like FSDP2, promote over
+        # trainable grads only. Grads with no fixed dtype normally arrive in
+        # the unsharded dtype; backward only widens this over the grads that
+        # actually arrive.
+        trainable_grad_dtypes = [
+            info.unsharded_grad_dtype or info.unsharded_dtype
+            for info in param_infos.values()
+            if info.requires_grad
+        ]
+        if trainable_grad_dtypes:
+            bucket_reduce_dtype = functools.reduce(
+                torch.promote_types,
+                trainable_grad_dtypes,
+            )
+            for info in param_infos.values():
+                info.bucket_reduce_dtype = bucket_reduce_dtype
+        return param_infos, total_bytes
 
     @classmethod
     def _create_param_infos_from_local_layouts(
@@ -484,12 +586,17 @@ class ShardedBucketStorage:
         mp_policy: MixedPrecisionPolicy | None = None,
         gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG,
     ) -> ParamInfo:
+        has_explicit_grad_dtype = param._has_grad_dtype_override
         return ParamInfo(
             fqn=fqn,
             global_shape=param.shape,
             global_stride=tuple(make_contiguous_strides_for(param.shape)),
             dtype=param.dtype,
-            param_dtype=mp_policy.param_dtype if mp_policy is not None else None,
+            param_dtype=(
+                mp_policy._resolve_param_dtype(fqn, param)
+                if mp_policy is not None
+                else None
+            ),
             reduce_dtype=mp_policy.reduce_dtype if mp_policy is not None else None,
             gradient_reduce_op=gradient_reduce_op,
             requires_grad=param.requires_grad,
@@ -502,6 +609,8 @@ class ShardedBucketStorage:
             bucket_layout=bucket_layout,
             outer_layout=get_global_layout(param),
             param_attrs=dict(vars(param)),
+            has_explicit_grad_dtype=has_explicit_grad_dtype,
+            grad_dtype_override=param.grad_dtype if has_explicit_grad_dtype else None,
         )
 
     def copy_params_from(
@@ -533,6 +642,8 @@ class ShardedBucketStorage:
                 info,
             )
             new_param = nn.Parameter(typed_view, requires_grad=info.requires_grad)
+            if info.has_explicit_grad_dtype:
+                new_param.grad_dtype = info.grad_dtype_override
             if new_param.device != expected_device:
                 raise AssertionError(
                     f"Expected sharded parameter {fqn!r} on "

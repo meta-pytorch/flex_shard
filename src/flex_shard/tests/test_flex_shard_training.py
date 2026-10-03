@@ -29,11 +29,13 @@ from ..custom_placements.block_shard import (
     BucketedBlockShard,
     make_bucketed_block_placement_fn,
 )
+from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..custom_placements.shard import per_param_placements, Shard
 from ..flex_shard import bucket_runtime
 from .common import (
     check_flex_shard_parity,
     expected_shard,
+    flex_shard_cuda,
     make_test_sgd,
     make_transformer_model,
     transformer_bucket_specs,
@@ -69,6 +71,53 @@ class _UnevenMLPStack(torch.nn.Module):
         for layer in self.layers:
             x = layer(x)
         return x
+
+
+class _MixedPrecisionWeights(torch.nn.Module):
+    def __init__(self, *, device: torch.device) -> None:
+        super().__init__()
+        self.low_weight = torch.nn.Parameter(torch.randn(8, 8, device=device))
+        # Interleaved so the bf16 params are not adjacent in declaration order.
+        self.full_weight = torch.nn.Parameter(torch.randn(8, 8, device=device))
+        self.low_weight2 = torch.nn.Parameter(torch.randn(8, 8, device=device))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # matmul rejects mismatched dtypes, so this checks each unsharded dtype.
+        low_x = x.bfloat16()
+        low = low_x @ self.low_weight + 2 * (low_x @ self.low_weight2)
+        return low.float() + x @ self.full_weight
+
+
+class _ParallelLinears(torch.nn.Module):
+    def __init__(self, width: int, *, device: torch.device) -> None:
+        super().__init__()
+        self.first = torch.nn.Linear(width, width, bias=False, device=device)
+        self.second = torch.nn.Linear(width, width, bias=False, device=device)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.first(x) + self.second(x)
+
+
+class _ReusedWeight(torch.nn.Module):
+    def __init__(self, *, device: torch.device, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.zeros(8, 8, device=device, dtype=dtype)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-use grads 256 and 1 sum to 257 in fp32 but round to 256 in bf16."""
+        return ((256 * x) @ self.weight).float().sum() + (x @ self.weight).float().sum()
+
+
+class _ReusedWeights(torch.nn.Module):
+    def __init__(self, *, device: torch.device, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.a = _ReusedWeight(device=device, dtype=dtype)
+        self.b = _ReusedWeight(device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.a(x) + self.b(x)
 
 
 def _init_params_deterministically(model: torch.nn.Module) -> None:
@@ -153,18 +202,17 @@ class TestFlexShardTraining(FSDPTest):
             (self.world_size,),
             mesh_dim_names=("fsdp",),
         )
-        width = 1024
+        width = 512
         model = torch.nn.ModuleList(
-            [
-                torch.nn.Linear(width, width, bias=False, device=device_type.type)
-                for _ in range(2)
-            ]
+            [_ParallelLinears(width, device=device_type) for _ in range(2)]
         )
-        # Give packed FP32 reductions a distinct allocation size from BF16 grads.
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
         )
+        # 1 MiB FP32 grads stay in the caching allocator's small pool, so the
+        # 2 MiB packed buckets are the only large-pool blocks and the second
+        # pack reuses the first pack's freed block.
         flex_shard(
             model,
             buckets=[
@@ -226,10 +274,11 @@ class TestFlexShardTraining(FSDPTest):
         ):
             output.float().sum().backward()
 
-        for index, param in enumerate(model.parameters()):
-            grad = param.grad
-            assert grad is not None
-            self.assertEqual(grad, torch.full_like(grad, 2 * (index + 1)))
+        for index, layer in enumerate(model):
+            for param in layer.parameters():
+                grad = param.grad
+                assert grad is not None
+                self.assertEqual(grad, torch.full_like(grad, 2 * (index + 1)))
         self.assertEqual(len(packed_ptrs), len(model))
         self.assertEqual(packed_ptrs[0], packed_ptrs[1])
 
@@ -639,8 +688,8 @@ class TestFlexShardTraining(FSDPTest):
         # bucket, with zeros for its unused params. Three microbatches: the
         # first without sync (keeping fp32 grads on rank 0 only), the second
         # skipping the side bucket, so the pending sync makes it reduce on
-        # every rank, and routing each rank to the other expert, so kept fp32
-        # and fresh bf16 grads mix, and the third syncing with the side
+        # every rank, and routing each rank to the other expert, so kept and
+        # fresh grads add up, and the third syncing with the side
         # bucket's outputs unused on rank 1.
         mesh = init_device_mesh(
             device_type.type,
@@ -673,6 +722,193 @@ class TestFlexShardTraining(FSDPTest):
                 param.grad = torch.zeros_like(param)
         _average_reference_grads(reference)
         check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
+
+    @skip_if_lt_x_gpu(2)
+    def test_per_param_mixed_precision_policy(self):
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+        torch.manual_seed(42)
+        model = _MixedPrecisionWeights(device=device_type)
+        reference = copy.deepcopy(model)
+        reference.low_weight = torch.nn.Parameter(reference.low_weight.bfloat16())
+        reference.low_weight2 = torch.nn.Parameter(reference.low_weight2.bfloat16())
+        mixed_placement = MixedBucketPlacement({})
+
+        def mixed_placement_fn(named_params, mesh):
+            del mesh
+            return {fqn: (mixed_placement.shard0,) for fqn, _ in named_params}
+
+        flex_shard(
+            model,
+            buckets=[
+                BucketSpec(
+                    ["*"],
+                    placement_fn=mixed_placement_fn,
+                    mesh=mesh,
+                    mp_policy=MixedPrecisionPolicy(
+                        param_dtype=torch.bfloat16,
+                        param_dtype_overrides={"full_weight": torch.float32},
+                    ),
+                    reshard_after_forward=False,
+                )
+            ],
+        )
+
+        torch.manual_seed(43 + self.rank)
+        x = torch.randn(4, 8, device=device_type)
+        with (
+            mock.patch.object(
+                dist,
+                "all_gather_into_tensor",
+                wraps=dist.all_gather_into_tensor,
+            ) as all_gather,
+            mock.patch.object(
+                dist,
+                "reduce_scatter_tensor",
+                wraps=dist.reduce_scatter_tensor,
+            ) as reduce_scatter,
+        ):
+            output = model(x)
+            output.sum().backward()
+
+        reference_output = reference(x)
+        reference_output.sum().backward()
+        self.assertEqual(output, reference_output)
+        self.assertEqual(all_gather.call_count, 1)
+        self.assertEqual(reduce_scatter.call_count, 1)
+
+        model_params = dict(model.named_parameters())
+        for fqn, reference_param in reference.named_parameters():
+            grad = model_params[fqn].grad
+            expected_grad = reference_param.grad.float()
+            dist.all_reduce(expected_grad, op=dist.ReduceOp.AVG)
+            self.assertEqual(
+                grad,
+                expected_shard(
+                    expected_grad,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                ),
+            )
+
+    @skip_if_lt_x_gpu(2)
+    def test_reused_param_grads_accumulate_in_unsharded_grad_dtype(self):
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+        bf16, fp32 = torch.bfloat16, torch.float32
+        # Each case exercises one source of the unsharded accumulation dtype.
+        cases = (
+            ("storage_dtype", fp32, None, bf16, None, 257.0),
+            ("explicit_grad_dtype", bf16, fp32, None, None, 257.0),
+            ("reduce_dtype", bf16, fp32, None, bf16, 256.0),
+        )
+        for case in cases:
+            (
+                name,
+                dtype,
+                grad_dtype,
+                param_dtype,
+                reduce_dtype,
+                grad_value,
+            ) = case
+            compute_dtype = param_dtype or dtype
+            with self.subTest(name=name):
+                model = _ReusedWeight(device=device_type, dtype=dtype)
+                if grad_dtype is not None:
+                    model.weight.grad_dtype = grad_dtype
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            ["*"],
+                            placement_fn=per_param_placements,
+                            mesh=mesh,
+                            mp_policy=MixedPrecisionPolicy(
+                                param_dtype=param_dtype,
+                                reduce_dtype=reduce_dtype,
+                            ),
+                            reshard_after_forward=False,
+                        )
+                    ],
+                )
+
+                x = torch.ones(1, 8, dtype=compute_dtype, device=device_type)
+                model(x).backward()
+                grad = model._parameters["weight"].grad
+                self.assertIsNotNone(grad)
+                self.assertEqual(grad.dtype, fp32)
+                self.assertEqual(
+                    grad,
+                    expected_shard(
+                        torch.full(
+                            (8, 8),
+                            grad_value,
+                            dtype=fp32,
+                            device=device_type,
+                        ),
+                        rank=self.rank,
+                        world_size=self.world_size,
+                    ),
+                )
+
+    @skip_if_lt_x_gpu(2)
+    def test_bucket_reduces_in_promoted_grad_dtype(self):
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+        model = _ReusedWeights(device=device_type, dtype=torch.bfloat16)
+        model.b.weight.grad_dtype = torch.float32
+        flex_shard_cuda(model, mesh)
+
+        x = torch.ones(1, 8, dtype=torch.bfloat16, device=device_type)
+        model(x).backward()
+
+        # b's fp32 sum of 257 survives only if the shared reduction promotes
+        # a's bf16 and b's fp32 gradients to fp32.
+        for module, grad_value, grad_dtype in (
+            (model.a, 256.0, torch.bfloat16),
+            (model.b, 257.0, torch.float32),
+        ):
+            grad = module._parameters["weight"].grad
+            self.assertIsNotNone(grad)
+            self.assertEqual(grad.dtype, grad_dtype)
+            self.assertEqual(grad, torch.full_like(grad, grad_value))
+
+    @skip_if_lt_x_gpu(2)
+    def test_kept_grads_accumulate_in_param_grad_dtype(self):
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+        model = _ReusedWeights(device=device_type, dtype=torch.bfloat16)
+        model.b.weight.grad_dtype = torch.float32
+        flex_shard_cuda(model, mesh)
+        model.set_reshard_after_backward(False)
+        x = torch.ones(1, 8, dtype=torch.bfloat16, device=device_type)
+
+        model.set_requires_gradient_sync(False)
+        model(x).backward()
+        # Like FSDP2, a's kept grad stays in its bf16 grad dtype, not the
+        # bucket's fp32 reduce dtype promoted by b's grad_dtype.
+        self.assertEqual(model.a._parameters["weight"].grad.dtype, torch.bfloat16)
+        model.set_requires_gradient_sync(True)
+        model(x).backward()
+        for module, grad_value, grad_dtype in (
+            (model.a, 512.0, torch.bfloat16),
+            (model.b, 514.0, torch.float32),
+        ):
+            grad = module._parameters["weight"].grad
+            self.assertEqual(grad.dtype, grad_dtype)
+            self.assertEqual(grad, torch.full_like(grad, grad_value))
 
     @skip_if_lt_x_gpu(2)
     def test_reshard_after_forward_with_activation_checkpointing(self):

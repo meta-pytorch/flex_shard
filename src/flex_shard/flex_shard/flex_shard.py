@@ -22,6 +22,7 @@ from .bucket_storage import (
     BucketParamFQNsByIndex,
     BucketSpec,
     GradientReduceOp,
+    MixedPrecisionPolicy,
     ShardedBucketStorage,
 )
 from .sharded_param import is_flex_shard_param
@@ -153,10 +154,11 @@ class FlexShardModule:
         """Set whether backward reduce-scatters gradients, like FSDP2's.
 
         With ``False``, backward keeps each bucket's full gradients on its
-        unsharded params and later backwards accumulate into them, in the
-        bucket's ``reduce_dtype`` when it is wider than the param dtype. The
-        next backward with ``True`` reduce-scatters the accumulated gradients,
-        also for buckets it does not use. A backward that raises drops the
+        unsharded params and later backwards accumulate into them, in
+        ``MixedPrecisionPolicy.reduce_dtype`` if set and otherwise as each
+        param's ``grad_dtype`` specifies (its dtype if unset). The next
+        backward with ``True`` reduce-scatters the accumulated gradients, also
+        for buckets it does not use. A backward that raises drops the
         gradients accumulated so far on that rank, since they mix with its
         partial ones.
         It applies to the backwards after the call, e.g.
@@ -425,6 +427,42 @@ def _resolve_bucket_param_placements(
     return param_placements
 
 
+def _validate_param_dtype_overrides(
+    named_params: list[tuple[str, nn.Parameter]],
+    bucket_assignments: BucketParamFQNsByIndex,
+    buckets: list[BucketSpec],
+) -> None:
+    # Builders often share one policy across buckets, so an override may name a
+    # param in any bucket whose policy is equal.
+    policy_groups: list[tuple[MixedPrecisionPolicy, list[int], set[str]]] = []
+    for bucket_idx, (bucket, bucket_fqns) in enumerate(
+        zip(buckets, bucket_assignments, strict=True)
+    ):
+        mp_policy = bucket.mp_policy
+        if mp_policy is None or mp_policy.param_dtype_overrides is None:
+            continue
+        for policy, bucket_indices, fqns in policy_groups:
+            if policy == mp_policy:
+                bucket_indices.append(bucket_idx)
+                fqns.update(bucket_fqns)
+                break
+        else:
+            policy_groups.append((mp_policy, [bucket_idx], set(bucket_fqns)))
+
+    param_dict = dict(named_params)
+    for mp_policy, bucket_indices, fqns in policy_groups:
+        overrides = mp_policy.param_dtype_overrides or {}
+        unknown_fqns = set(overrides) - fqns
+        if unknown_fqns:
+            raise ValueError(
+                f"param_dtype_overrides for buckets {bucket_indices} contains "
+                "FQNs not assigned to any bucket using that policy: "
+                f"{sorted(map(str, unknown_fqns))}."
+            )
+        for fqn in overrides:
+            mp_policy._resolve_param_dtype(fqn, param_dict[fqn])
+
+
 def _prepare_flex_shard_inputs(
     module: nn.Module,
     buckets: list[BucketSpec],
@@ -480,6 +518,7 @@ def _prepare_flex_shard_inputs(
 
     param_fqns = [fqn for fqn, _ in named_params]
     bucket_assignments = _assign_params_to_buckets(param_fqns, buckets)
+    _validate_param_dtype_overrides(named_params, bucket_assignments, buckets)
     param_placements = _resolve_bucket_param_placements(
         named_params,
         bucket_assignments,
