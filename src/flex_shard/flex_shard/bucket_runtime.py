@@ -305,6 +305,7 @@ class BucketCommContext:
             if backward_raised:
                 for param in bucket.unsharded_params or []:
                     param.grad = None
+                bucket._run_post_reduce_hook()
                 bucket.needs_sync = False
                 bucket._set_unsharded_grad_dtypes(defer_upcast=False)
             if bucket.is_unsharded:
@@ -681,6 +682,8 @@ class BucketRuntime:
         self.context.queue_post_backward_callback()
         self.unshard()
         self._set_unsharded_grad_dtypes(defer_upcast=True)
+        if self.bucket_storage._pre_backward_hook is not None:
+            self.bucket_storage._pre_backward_hook(self._named_unsharded_params())
         self.context.prefetch(self.context.next_backward_bucket(self))
 
     def _set_unsharded_grad_dtypes(self, *, defer_upcast: bool) -> None:
@@ -716,6 +719,20 @@ class BucketRuntime:
             if grad is not None and grad.dtype != dtype:
                 param.grad = grad.to(dtype)
             param.grad_dtype = dtype
+
+    def _named_unsharded_params(self) -> list[tuple[str, nn.Parameter]]:
+        return [
+            (bucket_param.param_info.fqn, param)
+            for bucket_param, param in zip(
+                self.bucket_params, self.unsharded_params or [], strict=False
+            )
+        ]
+
+    def _run_post_reduce_hook(self) -> None:
+        """Run ``BucketSpec.post_reduce_hook`` once the unsharded grads are gone."""
+        hook = self.bucket_storage._post_reduce_hook
+        if hook is not None and self.unsharded_params is not None:
+            hook(self._named_unsharded_params())
 
     def on_input_grads(self) -> None:
         """Post-backward trigger from the hooked module's input grads.
@@ -770,6 +787,7 @@ class BucketRuntime:
             zero_dtypes.append(unsharded_param.grad_dtype or unsharded_param.dtype)
             infos.append(bucket_param.param_info)
             sharded_params.append(bucket_param.sharded_param)
+        self._run_post_reduce_hook()
         self._set_unsharded_grad_dtypes(defer_upcast=False)
         if self.is_unsharded:
             self.reshard()
@@ -904,6 +922,15 @@ class BucketRuntime:
             raise NotImplementedError(
                 "FlexShard set_requires_gradient_sync(False) is eager-only; "
                 "torch.compile reduce-scatters in the traced backward."
+            )
+        if (
+            self.bucket_storage._pre_backward_hook is not None
+            or self.bucket_storage._post_reduce_hook is not None
+        ):
+            raise NotImplementedError(
+                "FlexShard BucketSpec pre_backward_hook and post_reduce_hook are "
+                "eager-only; torch.compile does not use the persistent unsharded "
+                "params they receive."
             )
         full_params = _BucketUnshard.apply(self, *self._local_shards(use_autograd=True))
         self._swap_in_params(list(full_params))
