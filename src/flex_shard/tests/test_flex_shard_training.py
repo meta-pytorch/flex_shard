@@ -1020,14 +1020,15 @@ class TestFlexShardTraining(FSDPTest):
         check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
 
     @skip_if_lt_x_gpu(2)
-    def test_main_grad_fused_accumulation(self):
-        # Fused gradient accumulation adds weight grads into main_grad and
-        # gives autograd none. BucketSpec(main_grad=True) aliases each unsharded
-        # param's grad as main_grad before its bucket's backward, so the fused
-        # weight grads and the bias's autograd grads accumulate there over two
-        # backwards without sync, and the third reduce-scatters them and drops
-        # the alias. The first bucket reshards after forward, so its backward
-        # re-gathers before aliasing.
+    def test_pre_backward_and_post_reduce_hooks(self):
+        # Kernels that add weight grads into main_grad and give autograd none
+        # (fused gradient accumulation) need the grad allocated before their
+        # backward. The hooks do what a trainer would: the pre-backward hook
+        # allocates each unsharded param's grad and aliases it as main_grad,
+        # the fused weight grads and the bias's autograd grads accumulate there
+        # over two backwards without sync, and the post-reduce hook drops the
+        # alias once the third reduce-scatters them. The first bucket reshards
+        # after forward, so its backward re-gathers before the hook runs.
         mesh = init_device_mesh(
             device_type.type,
             (self.world_size,),
@@ -1038,6 +1039,23 @@ class TestFlexShardTraining(FSDPTest):
             (torch.bfloat16, torch.float32),
         ):
             grad_dtype = reduce_dtype or dtype
+            calls = []
+
+            def alias_main_grads(named_params, grad_dtype=grad_dtype):
+                calls.append(("pre_backward", [fqn for fqn, _ in named_params]))
+                for _, param in named_params:
+                    if param.grad is None:
+                        param.grad = torch.zeros(
+                            param.shape, dtype=grad_dtype, device=param.device
+                        )
+                    param.main_grad = param.grad
+
+            def drop_main_grads(named_params):
+                calls.append(("post_reduce", [fqn for fqn, _ in named_params]))
+                for _, param in named_params:
+                    self.assertIsNone(param.grad)
+                    del param.main_grad
+
             with self.subTest(dtype=dtype):
                 torch.manual_seed(0)
                 model = torch.nn.Sequential(
@@ -1062,7 +1080,8 @@ class TestFlexShardTraining(FSDPTest):
                             mesh=mesh,
                             mp_policy=MixedPrecisionPolicy(reduce_dtype=reduce_dtype),
                             reshard_after_forward=idx == 0,
-                            main_grad=True,
+                            pre_backward_hook=alias_main_grads,
+                            post_reduce_hook=drop_main_grads,
                         )
                         for idx in range(2)
                     ],
@@ -1081,6 +1100,17 @@ class TestFlexShardTraining(FSDPTest):
                         else:
                             self.assertIsNone(weight.grad)
                             self.assertFalse(hasattr(weight, "main_grad"))
+                fqns = [["1.weight", "1.bias"], ["0.weight", "0.bias"]]
+                self.assertEqual(
+                    calls,
+                    [("pre_backward", fqns[0]), ("pre_backward", fqns[1])] * 2
+                    + [
+                        ("pre_backward", fqns[0]),
+                        ("post_reduce", fqns[0]),
+                        ("pre_backward", fqns[1]),
+                        ("post_reduce", fqns[1]),
+                    ],
+                )
                 for layer in reference:
                     layer.weight.grad = layer.weight.main_grad
                 _average_reference_grads(reference)
