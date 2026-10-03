@@ -273,6 +273,8 @@ class Shard(Placement):
         ws = mesh.size()
         dtype = infos[0].unsharded_dtype
         device = tensors[0].device
+        if any(info.unsharded_dtype != dtype for info in infos):
+            raise ValueError("Shard requires one unsharded dtype per bucket.")
 
         with _record_copy_in_if_eager():
             padded_layout = self._padded_unshard_layout(infos)

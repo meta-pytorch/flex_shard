@@ -59,6 +59,17 @@ class LocalDistMuonBinding:
                 "local DistMuon requires every real parameter gradient before "
                 f"step(); missing gradients: {missing}"
             )
+        # Casting instead would silently drop the precision grad_dtype requested.
+        mismatched = [
+            binding.fqn
+            for binding in self._parameter_bindings
+            if binding.real_param.grad.dtype != binding.real_param.dtype
+        ]
+        if mismatched:
+            raise RuntimeError(
+                "local DistMuon requires real parameter gradients in the "
+                f"parameter dtype; mismatched gradient dtypes: {mismatched}"
+            )
         for binding in self._parameter_bindings:
             binding.proxy_param.grad = _proxy_gradient(binding)
         self.optimizer.step()
