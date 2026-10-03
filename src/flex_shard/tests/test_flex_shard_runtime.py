@@ -153,6 +153,7 @@ class TestFlexShardEagerRuntime(TestCase):
         with single_rank_cuda_mesh() as mesh:
             with torch.device("meta"):
                 args, model = make_transformer_model()
+            model.output.weight.grad_dtype = torch.bfloat16
 
             flex_shard_cuda(model, mesh)
             for storage in model.sharded_bucket_storages:
@@ -167,12 +168,15 @@ class TestFlexShardEagerRuntime(TestCase):
                     self.assertTrue(is_flex_shard_param(param))
                     nn.init.uniform_(param, -0.1, 0.1)
                     param.grad = None
+                output_weight = model.output._parameters["weight"]
+                self.assertEqual(output_weight.grad_dtype, torch.bfloat16)
 
                 loss = model(transformer_inputs(args, device="cuda")).sum()
                 loss.backward()
 
                 for param in model.parameters():
                     self.assertIsNotNone(param.grad)
+                self.assertEqual(output_weight.grad.dtype, torch.bfloat16)
 
     def test_persistent_unsharded_params(self):
         for reshard_after_forward in (False, True):

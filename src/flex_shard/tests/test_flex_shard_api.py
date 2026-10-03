@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import replace
+
 import torch
 import torch.nn as nn
 from torch.testing._internal.common_utils import run_tests, TestCase
@@ -14,6 +16,7 @@ from .. import (
     get_global_shape,
     get_placements,
     is_flex_shard_param,
+    MixedPrecisionPolicy,
     OffloadPolicy,
 )
 from ..custom_placements.shard import per_param_placements, Shard
@@ -137,6 +140,42 @@ class TestFlexShardAPI(TestCase):
                         )
                     ],
                 )
+
+    def test_param_dtype_overrides_span_buckets_sharing_the_policy(self):
+        bf16 = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
+        with_override = replace(bf16, param_dtype_overrides={"1.weight": torch.float32})
+
+        with single_rank_cuda_mesh() as mesh:
+
+            def shard(*policies):
+                model = nn.Sequential(
+                    nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)
+                )
+                buckets = [
+                    BucketSpec(
+                        [f"{i}.*"],
+                        placement_fn=per_param_placements,
+                        mesh=mesh,
+                        mp_policy=policy,
+                        reshard_after_forward=False,
+                    )
+                    for i, policy in enumerate(policies)
+                ]
+                return flex_shard_cuda(model, mesh, buckets=buckets)
+
+            model = shard(with_override, with_override)
+            unsharded_dtypes = {
+                fqn: info.unsharded_dtype
+                for storage in model.sharded_bucket_storages
+                for fqn, info in storage.param_infos.items()
+            }
+            self.assertEqual(
+                unsharded_dtypes,
+                {"0.weight": torch.bfloat16, "1.weight": torch.float32},
+            )
+
+            with self.assertRaisesRegex(ValueError, r"\['1\.weight'\]"):
+                shard(with_override, bf16)
 
     def test_cpu_mesh_is_rejected(self):
         with single_rank_cpu_mesh() as mesh:

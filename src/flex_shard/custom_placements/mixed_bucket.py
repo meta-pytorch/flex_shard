@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class _PlacementGroup:
     placement: Placement
+    key: object
     indices: list[int]
     tensors: list[torch.Tensor]
     infos: list[ParamInfo]
@@ -401,7 +403,12 @@ class MixedBucketPlacement(Placement):
     ) -> PlacementPreparedUnshard:
         rank = mesh.get_local_rank()
         world_size = mesh.size()
-        groups = _group_tensors_by_placement(tensors, infos, world_size)
+        groups = _group_tensors_by_placement(
+            tensors,
+            infos,
+            world_size,
+            lambda info: info.unsharded_dtype,
+        )
         _validate_mixed_groups(groups)
 
         prepared_groups: list[tuple[PlacementPreparedUnshard, tuple[int, ...]]] = []
@@ -858,6 +865,7 @@ def _group_tensors_by_placement(
     tensors: list[torch.Tensor],
     infos: list[ParamInfo],
     world_size: int,
+    key_fn: Callable[[ParamInfo], object] | None = None,
 ) -> list[_PlacementGroup]:
     groups: list[_PlacementGroup] = []
     for index, (tensor, info) in enumerate(zip(tensors, infos, strict=True)):
@@ -867,8 +875,15 @@ def _group_tensors_by_placement(
             info.global_shape,
             world_size,
         )
+        # FP8 pack plans span the whole member and index infos by position, and
+        # FP8 quantizes each param from its own dtype, so never split it.
+        key = (
+            None
+            if key_fn is None or isinstance(placement, Fp8BucketedBlockShard)
+            else key_fn(info)
+        )
         for group in groups:
-            if placement == group.placement:
+            if placement == group.placement and key == group.key:
                 group.indices.append(index)
                 group.tensors.append(tensor)
                 group.infos.append(info)
@@ -877,6 +892,7 @@ def _group_tensors_by_placement(
             groups.append(
                 _PlacementGroup(
                     placement=placement,
+                    key=key,
                     indices=[index],
                     tensors=[tensor],
                     infos=[info],

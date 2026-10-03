@@ -31,7 +31,7 @@ from ..flex_shard.utils import (
     _record_copy_out_if_eager,
     _record_function_if_eager,
 )
-from .utils import copy_tensor_to_dtype
+from .utils import chunk_cat_mixed_dtype, copy_tensor_to_dtype
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -273,6 +273,8 @@ class Shard(Placement):
         ws = mesh.size()
         dtype = infos[0].unsharded_dtype
         device = tensors[0].device
+        if any(info.unsharded_dtype != dtype for info in infos):
+            raise ValueError("Shard requires one unsharded dtype per bucket.")
 
         with _record_copy_in_if_eager():
             padded_layout = self._padded_unshard_layout(infos)
@@ -364,7 +366,9 @@ class Shard(Placement):
         input_numel = sum(s.numel() for s in padded_sizes)
         send_buf = torch.empty(input_numel, dtype=dtype, device=device)
         send_buf_2d = send_buf.view(world_size, -1)
-        torch._chunk_cat(tensors, dim=self.dim, num_chunks=world_size, out=send_buf_2d)
+        # Grads may differ in dtype (per-parameter grad_dtype); the copy-in
+        # casts them to the reduce dtype.
+        chunk_cat_mixed_dtype(tensors, self.dim, world_size, send_buf_2d)
         return send_buf, Shard._ReduceGradLayout(padded_sizes)
 
     def _unpack_reduce_scatter_grad(

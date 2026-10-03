@@ -38,6 +38,34 @@ def foreach_copy_(
         torch._foreach_copy_(dst_tensors, src_tensors)
 
 
+# Landed with PyTorch's separate sharded and unsharded gradient dtypes
+# (pytorch/pytorch#194434); older PyTorch lacks it.
+_HAS_CHUNK_CAT_MIXED_DTYPE = hasattr(torch.ops.fsdp, "chunk_cat_mixed_dtype")
+
+
+def chunk_cat_mixed_dtype(
+    tensors: list[torch.Tensor],
+    dim: int,
+    num_chunks: int,
+    out: torch.Tensor,
+) -> None:
+    """``torch._chunk_cat`` into ``out``, casting inputs to its dtype.
+
+    Inputs may have different dtypes. ``fsdp::chunk_cat_mixed_dtype`` casts
+    during the copy-in (one fused kernel for CUDA bf16 + fp32) instead of
+    launching a cast per input; ``_chunk_cat`` itself takes one input dtype
+    and casts it to ``out``'s.
+    """
+    if _HAS_CHUNK_CAT_MIXED_DTYPE:
+        torch.ops.fsdp.chunk_cat_mixed_dtype(
+            tensors, dim=dim, num_chunks=num_chunks, out=out
+        )
+        return
+    if any(tensor.dtype != tensors[0].dtype for tensor in tensors):
+        tensors = [tensor.to(out.dtype) for tensor in tensors]
+    torch._chunk_cat(tensors, dim=dim, num_chunks=num_chunks, out=out)
+
+
 def copy_tensor_to_dtype(
     tensor: torch.Tensor,
     dtype: torch.dtype,

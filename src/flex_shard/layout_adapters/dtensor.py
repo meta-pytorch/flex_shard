@@ -43,6 +43,8 @@ def dtensor_to_global_layout(module: nn.Module) -> None:
             )
         local_tensor = param.to_local().detach().contiguous()
         local_param = nn.Parameter(local_tensor, requires_grad=param.requires_grad)
+        if param._has_grad_dtype_override:
+            local_param.grad_dtype = param.grad_dtype
         set_global_layout(local_param, _dtensor_global_layout(param))
         _set_param_on_module(module, fqn, local_param)
 

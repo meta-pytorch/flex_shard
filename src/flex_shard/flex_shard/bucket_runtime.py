@@ -628,6 +628,9 @@ class BucketRuntime:
             unsharded_param = nn.Parameter(
                 full_param, requires_grad=bucket_param.sharded_param.requires_grad
             )
+            # Like FSDP2's unsharded_param.grad_dtype: autograd casts each
+            # incoming grad before accumulating multiple uses.
+            unsharded_param.grad_dtype = bucket_param.param_info.unsharded_grad_dtype
             for name, value in bucket_param.param_info.param_attrs.items():
                 setattr(unsharded_param, name, value)
             unsharded_params.append(unsharded_param)
@@ -707,7 +710,6 @@ class BucketRuntime:
             self.needs_sync = True
             if self.is_unsharded and self.bucket_storage._reshard_after_backward:
                 self.reshard()
-            self._upcast_kept_grads()
             return
         self.needs_sync = False
         grads: list[torch.Tensor | None] = []
@@ -730,39 +732,23 @@ class BucketRuntime:
         if not grads:
             return
         # Zeros fill missing grads after resharding, so they never coexist
-        # with the unsharded params. The reduce-scatter copy-in needs one
-        # dtype: the reduce dtype if some grads were kept and upcast.
-        dtypes = {grad.dtype for grad in grads if grad is not None}
-        if len(dtypes) > 1:
-            dtype = infos[0].grad_reduce_dtype
-        else:
-            dtype = dtypes.pop() if dtypes else params[0].dtype
-        self.reduce_grads(
-            [
-                torch.zeros(param.shape, dtype=dtype, device=param.device)
-                if grad is None
-                else grad.to(dtype)
-                for grad, param in zip(grads, params, strict=True)
-            ],
-            infos,
-            sharded_params,
-        )
-
-    def _upcast_kept_grads(self) -> None:
-        """Upcast grads kept without sync to the reduce dtype if wider.
-
-        Like FSDP2, each kept grad is upcast once, after resharding, and
-        ``grad_dtype=None`` lets autograd add later grads into it in place.
-        """
-        for bucket_param, unsharded_param in zip(
-            self.bucket_params, self.unsharded_params or [], strict=False
-        ):
-            grad = unsharded_param.grad
-            reduce_dtype = bucket_param.param_info.grad_reduce_dtype
-            if grad is None or grad.dtype.itemsize >= reduce_dtype.itemsize:
-                continue
-            unsharded_param.grad_dtype = None
-            unsharded_param.grad = grad.to(reduce_dtype)
+        # with the unsharded params, in the dtype the param accumulates in (its
+        # forward dtype if it accepts any).
+        grads = [
+            torch.zeros(
+                param.shape,
+                dtype=info.unsharded_grad_dtype or info.unsharded_dtype,
+                device=param.device,
+            )
+            if grad is None
+            else grad
+            for grad, param, info in zip(grads, params, infos, strict=True)
+        ]
+        # Per-parameter grad dtypes meet in the bucket's promoted reduce dtype.
+        # The placement's copy-in casts to it, fused with the copy, rather
+        # than one cast kernel per param here.
+        infos = _promote_reduce_dtype_over_grads(grads, infos)
+        self.reduce_grads(grads, infos, sharded_params)
 
     # ------------------------------------------------------------------
     # Forward hooks
@@ -899,7 +885,6 @@ class _BucketUnshard(torch.autograd.Function):
         *local_shards: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         ctx.bucket = bucket
-        ctx.local_shard_dtypes = tuple(shard.dtype for shard in local_shards)
         full_params = (
             bucket.begin_unshard([shard.detach() for shard in local_shards])
             .finish()
@@ -933,6 +918,11 @@ class _BucketUnshard(torch.autograd.Function):
             infos.append(info)
             indices.append(idx)
         if grads:
+            # Per-parameter grad dtypes meet in the bucket's promoted reduce
+            # dtype, which the placement's copy-in casts to. Dynamo cannot
+            # trace set_output_grad_dtype, so unlike eager, a param used more
+            # than once accumulates in its forward dtype.
+            infos = _promote_reduce_dtype_over_grads(grads, infos)
             sharded_grads = begin_reduce_grad(
                 grads,
                 infos,
@@ -940,12 +930,37 @@ class _BucketUnshard(torch.autograd.Function):
                 bucket.context.reduce_grad_stream,
                 debug_fqn=bucket.debug_fqn,
             ).finish()
+            # Inputs are the sharded params, so autograd casts each grad to
+            # that leaf's grad_dtype before accumulating it.
             for idx, sharded_grad in zip(indices, sharded_grads, strict=True):
-                input_dtype = ctx.local_shard_dtypes[idx]
-                if sharded_grad.dtype != input_dtype:
-                    sharded_grad = sharded_grad.to(input_dtype)
                 input_grads[idx] = sharded_grad
         return (None, *input_grads)
+
+
+def _promote_reduce_dtype_over_grads(
+    grads: list[torch.Tensor],
+    infos: list[ParamInfo],
+) -> list[ParamInfo]:
+    """Promote the bucket reduce dtype over this backward's grads."""
+    if not any(
+        info.requires_grad and info.unsharded_grad_dtype is None for info in infos
+    ):
+        return infos
+    # Nothing checks that ranks agree. Grads arriving in different dtypes,
+    # including an unused param's zero grad in the forward dtype, make ranks
+    # reduce in different dtypes.
+    reduce_dtype = functools.reduce(
+        torch.promote_types,
+        (
+            info.unsharded_grad_dtype or grad.dtype
+            for grad, info in zip(grads, infos, strict=True)
+            if info.requires_grad
+        ),
+    )
+    if reduce_dtype == infos[0].grad_reduce_dtype:
+        return infos
+    # ParamInfo is shared bucket metadata; this dtype holds for one backward.
+    return [replace(info, bucket_reduce_dtype=reduce_dtype) for info in infos]
 
 
 def _match_param_grad_layout(
@@ -953,8 +968,9 @@ def _match_param_grad_layout(
     param: nn.Parameter,
 ) -> torch.Tensor:
     """Return a grad tensor suitable for assignment to ``param.grad``."""
-    if grad.dtype != param.dtype or grad.device != param.device:
-        grad = grad.to(device=param.device, dtype=param.dtype)
+    dtype = param.grad_dtype or grad.dtype
+    if grad.dtype != dtype or grad.device != param.device:
+        grad = grad.to(device=param.device, dtype=dtype)
     if grad.layout != param.layout:
         raise RuntimeError(
             "FlexShard reduced gradient layout does not match the local "
@@ -964,7 +980,7 @@ def _match_param_grad_layout(
         aligned = torch.empty_strided(
             tuple(param.shape),
             tuple(param.stride()),
-            dtype=param.dtype,
+            dtype=dtype,
             device=param.device,
         )
         aligned.copy_(grad)
@@ -976,7 +992,7 @@ def _accumulate_sharded_grads(
     sharded_params: list[nn.Parameter],
     sharded_grads: list[torch.Tensor],
 ) -> list[torch.Tensor]:
-    """Cast sharded grads to local param dtype/layout and accumulate into .grad."""
+    """Cast sharded grads to param grad dtype/layout and accumulate into .grad."""
     stored_grads: list[torch.Tensor] = []
     for param, grad in zip(sharded_params, sharded_grads, strict=True):
         grad = _match_param_grad_layout(grad, param)
