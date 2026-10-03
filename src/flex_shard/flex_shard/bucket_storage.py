@@ -8,17 +8,20 @@ from __future__ import annotations
 
 import fnmatch
 import functools
-import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
-from typing import Any, Literal, TYPE_CHECKING
+from dataclasses import dataclass, field, replace
+from typing import Any, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch._prims_common import make_contiguous_strides_for
 
-from .placement_contract import get_global_layout
+from .placement_contract import (
+    get_global_layout,
+    GradientReduceOp,
+    GradientReduction,
+)
 from .sharded_param import set_sharding_info
 from .utils import _get_single_placement, _set_param_on_module
 
@@ -42,53 +45,6 @@ PlacementFn = Callable[
 
 # Called with a bucket's ``(fqn, unsharded param)`` pairs.
 BucketHook = Callable[[list[tuple[str, nn.Parameter]]], None]
-
-GradientReduceOp = Literal[dist.ReduceOp.AVG, dist.ReduceOp.SUM]
-
-
-def gradient_reduce_op_from_infos(infos: list[ParamInfo]) -> GradientReduceOp:
-    if not infos:
-        raise AssertionError("Expected at least one ParamInfo.")
-    op = infos[0].gradient_reduce_op
-    for info in infos[1:]:
-        if info.gradient_reduce_op != op:
-            raise ValueError(
-                "FlexShard requires one gradient_reduce_op per communication "
-                f"bucket, but {infos[0].fqn!r} uses {op!r} and {info.fqn!r} "
-                f"uses {info.gradient_reduce_op!r}."
-            )
-    return op
-
-
-def gradient_divide_factor_from_infos(infos: list[ParamInfo]) -> float | None:
-    if not infos:
-        raise AssertionError("Expected at least one ParamInfo.")
-    factor = infos[0].gradient_divide_factor
-    for info in infos[1:]:
-        if info.gradient_divide_factor != factor:
-            raise ValueError(
-                "FlexShard requires one gradient_divide_factor per communication "
-                f"bucket, but {infos[0].fqn!r} uses {factor!r} and {info.fqn!r} "
-                f"uses {info.gradient_divide_factor!r}."
-            )
-    return factor
-
-
-def _check_gradient_divide_factor(
-    op: GradientReduceOp, factor: float | None
-) -> None:
-    if factor is None:
-        return
-    if not math.isfinite(factor) or factor <= 0:
-        raise ValueError(
-            f"gradient_divide_factor must be a positive number, got {factor!r}."
-        )
-    if op == dist.ReduceOp.SUM:
-        raise ValueError(
-            "gradient_divide_factor requires gradient_reduce_op=AVG; SUM does not "
-            "divide gradients."
-        )
-
 
 @dataclass(frozen=True)
 class MixedPrecisionPolicy:
@@ -221,7 +177,9 @@ class BucketSpec:
             ``set_gradient_divide_factor``. For example, with expert parallelism
             an expert's gradient already includes tokens routed from its
             expert-parallel peers, so an expert bucket on the expert
-            data-parallel mesh divides by the dense data-parallel size.
+            data-parallel mesh divides by the dense data-parallel size. The
+            placement implements both settings: ``reduce_prepared_grad``
+            receives them as a ``GradientReduction``.
         reshard_after_forward: Whether to free this bucket's unsharded
             parameters after forward and re-gather them before backward. This
             defaults to True. Under ``torch.compile`` the traced graph owns
@@ -282,8 +240,6 @@ class ParamInfo:
     placements: tuple[Placement, ...]
     param_dtype: torch.dtype | None = None
     reduce_dtype: torch.dtype | None = None
-    gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG
-    gradient_divide_factor: float | None = None
     local_shape: torch.Size = field(default_factory=lambda: torch.Size([]))
     local_numel: int = 0
     byte_offset: int = 0  # byte offset into the sharded storage
@@ -374,12 +330,9 @@ class ShardedBucketStorage:
         # See set_requires_gradient_sync and set_reshard_after_backward.
         self._requires_gradient_sync = True
         self._reshard_after_backward = True
-        _check_gradient_divide_factor(gradient_reduce_op, gradient_divide_factor)
-        self._gradient_reduce_op = gradient_reduce_op
-        self._gradient_divide_factor = gradient_divide_factor
-        for info in self._param_infos.values():
-            info.gradient_reduce_op = self._gradient_reduce_op
-            info.gradient_divide_factor = self._gradient_divide_factor
+        self._gradient_reduction = GradientReduction(
+            gradient_reduce_op, gradient_divide_factor
+        )
 
     @classmethod
     def from_bucket(
@@ -398,7 +351,6 @@ class ShardedBucketStorage:
             mesh,
             param_placements,
             bucket_spec.mp_policy,
-            bucket_spec.gradient_reduce_op,
         )
         for fqn, other_fqns in (shared_names or {}).items():
             if fqn in param_infos:
@@ -438,7 +390,6 @@ class ShardedBucketStorage:
         mesh: DeviceMesh,
         param_placements: dict[str, tuple[Placement, ...]],
         mp_policy: MixedPrecisionPolicy | None = None,
-        gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG,
     ) -> tuple[dict[str, ParamInfo], int]:
         """
         Create ParamInfo for each parameter, computing local layout and byte offsets.
@@ -469,7 +420,6 @@ class ShardedBucketStorage:
                 param_placements,
                 bucket_layout,
                 mp_policy,
-                gradient_reduce_op,
             )
         else:
             param_infos, total_bytes = cls._create_param_infos_from_local_layouts(
@@ -477,7 +427,6 @@ class ShardedBucketStorage:
                 mesh,
                 param_placements,
                 mp_policy,
-                gradient_reduce_op,
             )
 
         # One collective per bucket needs one dtype. Like FSDP2, promote over
@@ -505,7 +454,6 @@ class ShardedBucketStorage:
         mesh: DeviceMesh,
         param_placements: dict[str, tuple[Placement, ...]],
         mp_policy: MixedPrecisionPolicy | None,
-        gradient_reduce_op: GradientReduceOp,
     ) -> tuple[dict[str, ParamInfo], int]:
         rank = mesh.get_local_rank()
         world_size = mesh.size()
@@ -536,7 +484,6 @@ class ShardedBucketStorage:
                 byte_offset=byte_offset,
                 storage_nbytes=local_storage_layout.storage_nbytes,
                 mp_policy=mp_policy,
-                gradient_reduce_op=gradient_reduce_op,
             )
 
         return param_infos, current_byte_offset
@@ -586,7 +533,6 @@ class ShardedBucketStorage:
         param_placements: dict[str, tuple[Placement, ...]],
         bucket_layout: BucketStorageLayout,
         mp_policy: MixedPrecisionPolicy | None,
-        gradient_reduce_op: GradientReduceOp,
     ) -> tuple[dict[str, ParamInfo], int]:
         expected_fqns = {fqn for fqn, _ in named_params}
         actual_fqns = set(bucket_layout.param_layouts)
@@ -646,7 +592,6 @@ class ShardedBucketStorage:
                 storage_nbytes=layout.storage_nbytes,
                 bucket_layout=layout.bucket_layout,
                 mp_policy=mp_policy,
-                gradient_reduce_op=gradient_reduce_op,
             )
 
         return param_infos, bucket_layout.total_bytes
@@ -663,7 +608,6 @@ class ShardedBucketStorage:
         storage_nbytes: int,
         bucket_layout: BucketLayout | None = None,
         mp_policy: MixedPrecisionPolicy | None = None,
-        gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG,
     ) -> ParamInfo:
         has_explicit_grad_dtype = param._has_grad_dtype_override
         return ParamInfo(
@@ -677,7 +621,6 @@ class ShardedBucketStorage:
                 else None
             ),
             reduce_dtype=mp_policy.reduce_dtype if mp_policy is not None else None,
-            gradient_reduce_op=gradient_reduce_op,
             requires_grad=param.requires_grad,
             placements=placements,
             local_shape=local_shape,
@@ -764,29 +707,31 @@ class ShardedBucketStorage:
         return self._param_infos
 
     @property
+    def gradient_reduction(self) -> GradientReduction:
+        """What this bucket's gradient reduction must produce, which its
+        placement implements."""
+        return self._gradient_reduction
+
+    @property
     def gradient_reduce_op(self) -> GradientReduceOp:
         """Gradient reduction semantics for this bucket."""
-        return self._gradient_reduce_op
+        return self._gradient_reduction.op
 
     def set_gradient_reduce_op(self, op: GradientReduceOp) -> None:
-        """Set gradient reduction semantics for this bucket and its params."""
-        _check_gradient_divide_factor(op, self._gradient_divide_factor)
-        self._gradient_reduce_op = op
-        for info in self._param_infos.values():
-            info.gradient_reduce_op = op
+        """Set gradient reduction semantics for this bucket."""
+        self._gradient_reduction = replace(self._gradient_reduction, op=op)
 
     @property
     def gradient_divide_factor(self) -> float | None:
         """What ``AVG`` divides this bucket's summed gradients by; None means the
         mesh size."""
-        return self._gradient_divide_factor
+        return self._gradient_reduction.divide_factor
 
     def set_gradient_divide_factor(self, factor: float | None) -> None:
         """Set what ``AVG`` divides this bucket's summed gradients by."""
-        _check_gradient_divide_factor(self._gradient_reduce_op, factor)
-        self._gradient_divide_factor = factor
-        for info in self._param_infos.values():
-            info.gradient_divide_factor = factor
+        self._gradient_reduction = replace(
+            self._gradient_reduction, divide_factor=factor
+        )
 
     def set_requires_gradient_sync(self, requires_gradient_sync: bool) -> None:
         """Set whether backward reduce-scatters this bucket's gradients.

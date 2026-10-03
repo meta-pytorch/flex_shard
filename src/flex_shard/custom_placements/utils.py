@@ -8,15 +8,18 @@ from __future__ import annotations
 
 import importlib.util
 from collections.abc import Sequence
-from typing import Any, TypeAlias
+from typing import Any, TYPE_CHECKING, TypeAlias
 
 import torch
 import torch.distributed as dist
 
 try:
-    from ..flex_shard.bucket_storage import GradientReduceOp
+    from ..flex_shard.placement_contract import GradientReduceOp
 except ImportError:
     GradientReduceOp: TypeAlias = str
+
+if TYPE_CHECKING:
+    from ..flex_shard.placement_contract import GradientReduction
 
 
 def foreach_copy_(
@@ -116,20 +119,16 @@ def _to_dist_reduce_op(op: GradientReduceOp) -> dist.ReduceOp.RedOpType:
 
 
 def _gradient_reduce_scatter_op(
-    op: GradientReduceOp,
-    divide_factor: float | None,
+    reduction: GradientReduction,
     group_size: int,
     dtype: torch.dtype,
 ) -> tuple[Any, float | None, float | None]:
-    """Return ``(reduce op, pre-divide factor, post-divide factor)`` for a
-    gradient reduce-scatter, following FSDP2's ``_get_gradient_divide_factors``.
-
-    ``AVG`` divides the sum by ``divide_factor``, which defaults to the group
-    size; ``SUM`` does not divide.
-    """
-    if _to_dist_reduce_op(op) == dist.ReduceOp.SUM:
+    """Return ``(reduce op, pre-divide factor, post-divide factor)`` that make one
+    reduce-scatter produce ``reduction``, following FSDP2's
+    ``_get_gradient_divide_factors``."""
+    if _to_dist_reduce_op(reduction.op) == dist.ReduceOp.SUM:
         return dist.ReduceOp.SUM, None, None
-    factor = group_size if divide_factor is None else divide_factor
+    factor = group_size if reduction.divide_factor is None else reduction.divide_factor
     if group_size == 1:
         # NCCL's AVG may produce incorrect results with world size 1 (FSDP2).
         return dist.ReduceOp.SUM, None, None if factor == 1 else factor
@@ -153,13 +152,13 @@ def _gradient_reduce_scatter_op(
 def reduce_scatter_grads(
     output: torch.Tensor,
     input: torch.Tensor,
-    op: GradientReduceOp,
-    divide_factor: float | None,
+    reduction: GradientReduction,
     group: Any,
 ) -> None:
-    """Reduce-scatter packed gradients with ``op`` and ``divide_factor``."""
+    """Reduce-scatter packed gradients into ``output`` as ``reduction`` specifies,
+    for placements whose gradient reduction is one reduce-scatter."""
     reduce_op, pre_factor, post_factor = _gradient_reduce_scatter_op(
-        op, divide_factor, group.size(), input.dtype
+        reduction, group.size(), input.dtype
     )
     if pre_factor is not None:
         input = input / pre_factor

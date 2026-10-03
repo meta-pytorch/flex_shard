@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
     from ..flex_shard.bucket_storage import ParamInfo, PlacementFn
+    from ..flex_shard.placement_contract import GradientReduction
 
 
 @dataclass(frozen=True)
@@ -372,8 +373,9 @@ class BucketedOwned(Placement):
     def reduce_prepared_grad(
         self,
         prepared: PlacementPreparedReduceGrad,
+        reduction: GradientReduction,
     ) -> PlacementReduceGradResult:
-        return self._mixed_member().reduce_prepared_grad(prepared)
+        return self._mixed_member().reduce_prepared_grad(prepared, reduction)
 
 
 def _assign_params_to_ranks(

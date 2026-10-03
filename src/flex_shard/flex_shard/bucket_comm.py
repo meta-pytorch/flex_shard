@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
     from .bucket_storage import ParamInfo
-    from .placement_contract import Placement
+    from .placement_contract import GradientReduction, Placement
 
 
 class UnshardHandle:
@@ -138,6 +138,7 @@ def begin_reduce_grad(
     tensors: list[torch.Tensor],
     infos: list[ParamInfo],
     mesh: DeviceMesh,
+    reduction: GradientReduction,
     reduce_grad_stream: torch.Stream,
     debug_fqn: str | None = None,
 ) -> ReduceGradHandle:
@@ -145,7 +146,7 @@ def begin_reduce_grad(
     placement = _get_bucket_placement(infos, "reduce-grad")
     prepared = placement.prepare_reduce_grad(tensors, infos, mesh, debug_fqn)
     if torch.compiler.is_compiling():
-        result = prepared.placement.reduce_prepared_grad(prepared)
+        result = prepared.placement.reduce_prepared_grad(prepared, reduction)
         return SyncReduceGradResult(result.sharded_grads)
 
     device = prepared.buffers[0].device
@@ -155,7 +156,7 @@ def begin_reduce_grad(
     copy_in_done.record(copy_in_stream)
     with device_handle.stream(reduce_grad_stream):
         reduce_grad_stream.wait_event(copy_in_done)
-        result = prepared.placement.reduce_prepared_grad(prepared)
+        result = prepared.placement.reduce_prepared_grad(prepared, reduction)
         event = device_handle.Event()
         event.record(reduce_grad_stream)
     return AsyncReduceGradResult(

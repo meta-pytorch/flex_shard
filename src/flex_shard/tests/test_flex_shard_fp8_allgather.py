@@ -16,7 +16,7 @@ from torch.testing._internal.common_fsdp import FSDPTest, get_devtype
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torchao.utils import is_sm_at_least_90
 
-from .. import BucketSpec, flex_shard, MixedPrecisionPolicy
+from .. import BucketSpec, flex_shard, GradientReduction, MixedPrecisionPolicy
 from ..custom_placements import (
     fp8_bucketed_block_shard as fp8_bucketed_block_shard_module,
 )
@@ -894,7 +894,7 @@ class TestFp8AllGather(FSDPTest):
             "reduce_scatter_tensor",
             wraps=dist.reduce_scatter_tensor,
         ) as reduce_scatter:
-            reduced = mixed.reduce_prepared_grad(prepared_reduce)
+            reduced = mixed.reduce_prepared_grad(prepared_reduce, GradientReduction())
         self.assertEqual(reduce_scatter.call_count, 1)
         for grad, info in zip(reduced.sharded_grads, infos, strict=True):
             self.assertEqual(grad, storage.get_local_view(info.fqn))

@@ -14,11 +14,6 @@ import torch.distributed as dist
 import torch.nn as nn
 from typing_extensions import override
 
-from ..flex_shard.bucket_storage import (
-    gradient_divide_factor_from_infos,
-    gradient_reduce_op_from_infos,
-    GradientReduceOp,
-)
 from ..flex_shard.placement_contract import (
     BucketParamStorageLayout,
     BucketStorageLayout,
@@ -41,6 +36,7 @@ if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
     from ..flex_shard.bucket_storage import ParamInfo, PlacementFn
+    from ..flex_shard.placement_contract import GradientReduction
 
 
 class Shard(Placement):
@@ -70,8 +66,6 @@ class Shard(Placement):
         world_size: int
         pg: Any
         debug_fqn: str | None
-        gradient_reduce_op: GradientReduceOp
-        gradient_divide_factor: float | None
 
     def __init__(self, dim: int = 0):
         self.dim = dim
@@ -429,8 +423,6 @@ class Shard(Placement):
                 world_size=ws,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
-                gradient_reduce_op=gradient_reduce_op_from_infos(infos),
-                gradient_divide_factor=gradient_divide_factor_from_infos(infos),
             ),
         )
 
@@ -438,6 +430,7 @@ class Shard(Placement):
     def reduce_prepared_grad(
         self,
         prepared: PlacementPreparedReduceGrad,
+        reduction: GradientReduction,
     ) -> PlacementReduceGradResult:
         """Reduce a prepared gradient request using reduce-scatter."""
         if not isinstance(prepared.placement_state, Shard._ReduceGradState):
@@ -456,11 +449,7 @@ class Shard(Placement):
             prepared.placement_state.debug_fqn,
         ):
             reduce_scatter_grads(
-                recv_buf,
-                send_buf,
-                prepared.placement_state.gradient_reduce_op,
-                prepared.placement_state.gradient_divide_factor,
-                prepared.placement_state.pg,
+                recv_buf, send_buf, reduction, prepared.placement_state.pg
             )
         with _record_function_if_eager(
             "FlexShard::reduce_scatter_copy_out",

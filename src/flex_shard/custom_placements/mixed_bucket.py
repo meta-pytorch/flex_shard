@@ -13,10 +13,6 @@ from typing import Any, TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from ..flex_shard.bucket_storage import (
-    gradient_divide_factor_from_infos,
-    gradient_reduce_op_from_infos,
-)
 from ..flex_shard.placement_contract import (
     BucketParamStorageLayout,
     BucketStorageLayout,
@@ -42,6 +38,7 @@ if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
     from ..flex_shard.bucket_storage import ParamInfo
+    from ..flex_shard.placement_contract import GradientReduction
 
 
 @dataclass(frozen=True)
@@ -102,8 +99,6 @@ class _MixedReduceGradState:
     row_numel: int
     pg: Any
     debug_fqn: str | None
-    gradient_reduce_op: dist.ReduceOp
-    gradient_divide_factor: float | None
 
 
 class _MixedBucketMember:
@@ -173,8 +168,9 @@ class _MixedBucketMember:
     def reduce_prepared_grad(
         self,
         prepared: PlacementPreparedReduceGrad,
+        reduction: GradientReduction,
     ) -> PlacementReduceGradResult:
-        return self._mixed_bucket.reduce_prepared_grad(prepared)
+        return self._mixed_bucket.reduce_prepared_grad(prepared, reduction)
 
 
 class _MixedShard0(_MixedBucketMember, Shard):
@@ -699,14 +695,13 @@ class MixedBucketPlacement(Placement):
                 row_numel=row_numel,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
-                gradient_reduce_op=gradient_reduce_op_from_infos(infos),
-                gradient_divide_factor=gradient_divide_factor_from_infos(infos),
             ),
         )
 
     def reduce_prepared_grad(
         self,
         prepared: PlacementPreparedReduceGrad,
+        reduction: GradientReduction,
     ) -> PlacementReduceGradResult:
         if not isinstance(prepared.placement_state, _MixedReduceGradState):
             raise AssertionError(
@@ -725,13 +720,7 @@ class MixedBucketPlacement(Placement):
             state.debug_fqn,
         ):
             try:
-                reduce_scatter_grads(
-                    recv,
-                    send,
-                    state.gradient_reduce_op,
-                    state.gradient_divide_factor,
-                    state.pg,
-                )
+                reduce_scatter_grads(recv, send, reduction, state.pg)
             finally:
                 for group in state.groups:
                     _release_group_scratch_lease(group.prepared)

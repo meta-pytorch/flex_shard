@@ -25,7 +25,7 @@ from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import FSDPTest, get_devtype
 from torch.testing._internal.common_utils import run_tests, TestCase
 
-from .. import BucketSpec, flex_shard
+from .. import BucketSpec, flex_shard, GradientReduction
 from ..custom_placements.shard import per_param_placements
 from ..custom_placements.utils import _gradient_reduce_scatter_op
 from ..flex_shard.checkpoint import get_flex_shard_global_layouts
@@ -38,50 +38,49 @@ device_type = torch.device(get_devtype())
 _DIM, _HIDDEN, _NUM_EXPERTS, _TOKENS = 8, 16, 4, 16
 
 
+def _op(
+    factor: float | None,
+    group_size: int,
+    dtype: torch.dtype,
+    op: dist.ReduceOp = dist.ReduceOp.AVG,
+):
+    return _gradient_reduce_scatter_op(GradientReduction(op, factor), group_size, dtype)
+
+
 class TestGradientReduceScatterOp(TestCase):
+    def test_reduction_validates_itself(self) -> None:
+        for factor in (0, -2.0, float("inf")):
+            with self.assertRaisesRegex(ValueError, "positive number"):
+                GradientReduction(divide_factor=factor)
+        with self.assertRaisesRegex(ValueError, "requires gradient_reduce_op=AVG"):
+            GradientReduction(dist.ReduceOp.SUM, 2)
+
     def test_sum_never_divides(self) -> None:
         self.assertEqual(
-            _gradient_reduce_scatter_op(dist.ReduceOp.SUM, None, 4, torch.float32),
+            _op(None, 4, torch.float32, dist.ReduceOp.SUM),
             (dist.ReduceOp.SUM, None, None),
         )
 
     def test_avg_defaults_to_the_group_size(self) -> None:
         for factor in (None, 4):
             self.assertEqual(
-                _gradient_reduce_scatter_op(
-                    dist.ReduceOp.AVG, factor, 4, torch.bfloat16
-                ),
-                (dist.ReduceOp.AVG, None, None),
+                _op(factor, 4, torch.bfloat16), (dist.ReduceOp.AVG, None, None)
             )
 
     def test_other_factors_premultiply_in_fp32_and_bf16(self) -> None:
         for dtype in (torch.float32, torch.bfloat16):
-            op, pre_factor, post_factor = _gradient_reduce_scatter_op(
-                dist.ReduceOp.AVG, 8, 4, dtype
-            )
+            op, pre_factor, post_factor = _op(8, 4, dtype)
             self.assertEqual(op, dist.ReduceOp.PREMUL_SUM)
             self.assertIsNone(pre_factor)
             self.assertIsNone(post_factor)
 
     def test_fp16_divides_before_and_after_the_sum(self) -> None:
-        self.assertEqual(
-            _gradient_reduce_scatter_op(dist.ReduceOp.AVG, 8, 4, torch.float16),
-            (dist.ReduceOp.SUM, 4, 2.0),
-        )
-        self.assertEqual(
-            _gradient_reduce_scatter_op(dist.ReduceOp.AVG, 2.5, 4, torch.float16),
-            (dist.ReduceOp.SUM, None, 2.5),
-        )
+        self.assertEqual(_op(8, 4, torch.float16), (dist.ReduceOp.SUM, 4, 2.0))
+        self.assertEqual(_op(2.5, 4, torch.float16), (dist.ReduceOp.SUM, None, 2.5))
 
     def test_one_rank_group_sums(self) -> None:
-        self.assertEqual(
-            _gradient_reduce_scatter_op(dist.ReduceOp.AVG, None, 1, torch.float32),
-            (dist.ReduceOp.SUM, None, None),
-        )
-        self.assertEqual(
-            _gradient_reduce_scatter_op(dist.ReduceOp.AVG, 4, 1, torch.float32),
-            (dist.ReduceOp.SUM, None, 4),
-        )
+        self.assertEqual(_op(None, 1, torch.float32), (dist.ReduceOp.SUM, None, None))
+        self.assertEqual(_op(4, 1, torch.float32), (dist.ReduceOp.SUM, None, 4))
 
 
 def _mlp(dtype: torch.dtype = torch.float32) -> nn.Module:

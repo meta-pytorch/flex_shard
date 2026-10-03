@@ -236,6 +236,14 @@ memory use, or equivalence to GraphTrainer's scheduling and optimization passes.
 omit that argument. Its `reshard_after_forward` default is `True`, which the
 eager AdamW example uses.
 
+`AVG` divides the gradient sum over the bucket's mesh by
+`gradient_divide_factor`, which defaults to the mesh size, like FSDP2's
+`set_gradient_divide_factor`. With expert parallelism, where a token dispatcher
+sends each token to the rank that owns its expert, set it to the dense
+data-parallel size on expert buckets: an expert's local gradient already sums
+the tokens its expert-parallel peers routed to it. The example evaluates every
+expert locally, so the default fits it.
+
 As in FSDP2, each managed parameter has a persistent unsharded `nn.Parameter`.
 While its bucket is unsharded, the owning module's `_parameters` holds it, so
 module code sees a regular parameter in forward and backward; otherwise it holds
