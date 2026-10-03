@@ -536,6 +536,7 @@ class BucketRuntime:
                 grads,
                 infos,
                 self.bucket_storage._mesh,
+                self.bucket_storage.gradient_reduction,
                 self.context.reduce_grad_stream,
                 debug_fqn=self.debug_fqn,
             )
@@ -1002,6 +1003,7 @@ class _BucketUnshard(torch.autograd.Function):
                 grads,
                 infos,
                 bucket.bucket_storage._mesh,
+                bucket.bucket_storage.gradient_reduction,
                 bucket.context.reduce_grad_stream,
                 debug_fqn=bucket.debug_fqn,
             ).finish()

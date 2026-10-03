@@ -567,6 +567,56 @@ class TestFlexShardTraining(FSDPTest):
             )
 
     @skip_if_lt_x_gpu(2)
+    def test_gradient_divide_factor(self):
+        # The reduced gradient is the sum over the mesh divided by the factor,
+        # e.g. the dense data-parallel size for an expert bucket on an expert
+        # data-parallel mesh.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        cases = (
+            # (dtype, factor in BucketSpec, factor set later, no-sync)
+            (torch.float32, 3.0, None, True),  # PREMUL_SUM
+            (torch.bfloat16, None, 8, False),
+            (torch.float16, 6, None, False),  # divides before and after the sum
+        )
+        for dtype, factor, later_factor, no_sync in cases:
+            with self.subTest(dtype=dtype):
+                torch.manual_seed(0)
+                model = torch.nn.Sequential(
+                    torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 6)
+                ).to(device_type, dtype)
+                reference = copy.deepcopy(model)
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            ["*"],
+                            placement_fn=per_param_placements,
+                            mesh=mesh,
+                            reshard_after_forward=False,
+                            gradient_divide_factor=factor,
+                        )
+                    ],
+                )
+                if later_factor is not None:
+                    model.set_gradient_divide_factor(later_factor)
+                torch.manual_seed(1 + self.rank)
+                for step in range(2 if no_sync else 1):
+                    model.set_requires_gradient_sync(step == int(no_sync))
+                    x = torch.randn(4, 8, device=device_type, dtype=dtype)
+                    model(x).sum().backward()
+                    reference(x).sum().backward()
+                tolerance = {} if dtype == torch.float32 else dict(atol=2e-2, rtol=2e-2)
+                for param, ref_param in zip(model.parameters(), reference.parameters()):
+                    expected = ref_param.grad.float()
+                    dist.all_reduce(expected)
+                    expected = expected_shard(
+                        expected / (later_factor or factor),
+                        rank=self.rank,
+                        world_size=self.world_size,
+                    )
+                    self.assertEqual(param.grad.float(), expected, **tolerance)
+
+    @skip_if_lt_x_gpu(2)
     def test_gradient_accumulation(self):
         # Three microbatches, in three modes:
         # - "sync": every microbatch reduce-scatters.

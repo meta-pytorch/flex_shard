@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 
 if TYPE_CHECKING:
-    from ..flex_shard.bucket_storage import GradientReduceOp
+    from ..flex_shard.placement_contract import GradientReduceOp, GradientReduction
 
 
 def foreach_copy_(
@@ -113,6 +113,55 @@ def _to_dist_reduce_op(op: GradientReduceOp) -> dist.ReduceOp.RedOpType:
     raise ValueError(f"Unsupported gradient reduce op: {op!r}")
 
 
+def _gradient_reduce_scatter_op(
+    reduction: GradientReduction,
+    group_size: int,
+    dtype: torch.dtype,
+) -> tuple[Any, float | None, float | None]:
+    """Return ``(reduce op, pre-divide factor, post-divide factor)`` that make one
+    reduce-scatter produce ``reduction``, following FSDP2's
+    ``_get_gradient_divide_factors``."""
+    if _to_dist_reduce_op(reduction.op) == dist.ReduceOp.SUM:
+        return dist.ReduceOp.SUM, None, None
+    factor = group_size if reduction.divide_factor is None else reduction.divide_factor
+    if group_size == 1:
+        # NCCL's AVG may produce incorrect results with world size 1 (FSDP2).
+        return dist.ReduceOp.SUM, None, None if factor == 1 else factor
+    if factor == group_size:
+        return dist.ReduceOp.AVG, None, None
+    if dtype in (torch.float32, torch.bfloat16):
+        # One NCCL call, which multiplies each input by 1/factor before summing.
+        return dist._make_nccl_premul_sum(1.0 / factor), None, None
+    # fp16 has a narrow range: divide by about sqrt(factor) before the sum and by
+    # the rest after it.
+    pre_factor = 1
+    while factor % pre_factor == 0 and factor / pre_factor > pre_factor:
+        pre_factor *= 2
+    return (
+        dist.ReduceOp.SUM,
+        None if pre_factor == 1 else pre_factor,
+        factor / pre_factor,
+    )
+
+
+def reduce_scatter_grads(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    reduction: GradientReduction,
+    group: Any,
+) -> None:
+    """Reduce-scatter packed gradients into ``output`` as ``reduction`` specifies,
+    for placements whose gradient reduction is one reduce-scatter."""
+    reduce_op, pre_factor, post_factor = _gradient_reduce_scatter_op(
+        reduction, group.size(), input.dtype
+    )
+    if pre_factor is not None:
+        input = input / pre_factor
+    dist.reduce_scatter_tensor(output=output, input=input, op=reduce_op, group=group)
+    if post_factor is not None:
+        output.div_(post_factor)
+
+
 def pack_segments_into_flat_buffer_triton_if_supported(
     inputs: list[torch.Tensor],
     tensor_indices: Sequence[int],
@@ -183,5 +232,7 @@ __all__ = [
     "pack_segments_into_flat_buffer_triton_if_supported",
     "pack_tensors_into_flat_buffer",
     "pack_tensors_into_flat_buffer_with_scratch",
+    "reduce_scatter_grads",
+    "_gradient_reduce_scatter_op",
     "_to_dist_reduce_op",
 ]
