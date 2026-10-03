@@ -718,16 +718,14 @@ class MixedBucketPlacement(Placement):
             "FlexShard::mixed_reduce_scatter",
             state.debug_fqn,
         ):
-            try:
-                dist.reduce_scatter_tensor(
-                    output=recv,
-                    input=send,
-                    op=state.gradient_reduce_op,
-                    group=state.pg,
-                )
-            finally:
-                for group in state.groups:
-                    _release_group_scratch_lease(group.prepared)
+            dist.reduce_scatter_tensor(
+                output=recv,
+                input=send,
+                op=state.gradient_reduce_op,
+                group=state.pg,
+            )
+            for group in state.groups:
+                _release_group_scratch_lease(group.prepared)
 
         sharded_grads: list[torch.Tensor | None] = [None] * sum(
             len(group.indices) for group in state.groups

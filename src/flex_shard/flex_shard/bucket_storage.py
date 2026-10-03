@@ -196,9 +196,8 @@ class BucketSpec:
             ``fuse_wgrad_accumulation`` reads ``param.main_grad``) need the
             grads allocated and exposed there first. Eager only.
         post_reduce_hook: Optional callable run with the same pairs once a
-            syncing backward has taken their grads for the reduce-scatter, or
-            a backward that raised dropped them, e.g. to release references
-            to those grads. Eager only.
+            syncing backward has taken their grads for the reduce-scatter, e.g.
+            to release references to those grads. Eager only.
     """
 
     patterns: list[str]
@@ -504,23 +503,12 @@ class ShardedBucketStorage:
         rank: int,
         world_size: int,
     ) -> LocalStorageLayout:
-        try:
-            local_storage_layout = placement.local_storage_layout(
-                param.shape,
-                param.dtype,
-                rank,
-                world_size,
-            )
-        except NotImplementedError as exc:
-            raise TypeError(
-                f"Placement {placement!r} for parameter {fqn!r} must implement "
-                "the FlexShard storage layout contract."
-            ) from exc
-        except Exception as exc:
-            raise ValueError(
-                f"Placement {placement!r} is invalid for parameter {fqn!r} "
-                f"with shape {tuple(param.shape)}: {exc}"
-            ) from exc
+        local_storage_layout = placement.local_storage_layout(
+            param.shape,
+            param.dtype,
+            rank,
+            world_size,
+        )
 
         if local_storage_layout.local_numel < 0:
             raise ValueError(
