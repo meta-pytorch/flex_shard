@@ -11,7 +11,8 @@ row units over the original dense parameters. Every rank owns complete block
 rows, so it can quantize its dense shard to fp8 locally -- no cross-rank
 ``amax``. The all-gather moves temporary **fp8 + tiny scales** buffers, and the
 gathered fp8 weight is **bit-identical** to "all-gather bf16, then
-block-quantize".
+block-quantize" with the same quantizer: torchao's by default, or a consumer's
+(``BlockwiseFp8Quantizer``), e.g. to match TransformerEngine's scales.
 
 The master weight stays dense bf16/fp32-sharded with no fp8 padding in
 sharded storage. The gathered FP8 data and scales are compacted into one buffer
@@ -158,6 +159,45 @@ def _quantize_dense_weight_to_blockwise_fp8(
     return fp8_data, recip_scale
 
 
+class BlockwiseFp8Quantizer(Protocol):
+    """Quantize a rank's contiguous block rows of a 2D weight to blockwise FP8.
+
+    ``quantize`` returns the FP8 data in the weight's shape and orientation, and
+    the scales passed to the weight factory: one row per ``block_size`` rows,
+    ``scale_cols(in_dim, block_size)`` wide. Ranks quantize their block rows
+    independently, so scales of consecutive block rows must concatenate along
+    dim 0 into the full weight's; padding, if any, goes along the columns.
+    """
+
+    def scale_cols(self, in_dim: int, block_size: int) -> int: ...
+
+    def quantize(
+        self,
+        weight: torch.Tensor,
+        block_size: int,
+        fp8_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+class TorchaoBlockwiseFp8Quantizer:
+    """torchao's blockwise weight quantization: fp32 reciprocal scales
+    ``amax / fp8_max`` (no power-of-2 rounding), one per block."""
+
+    def scale_cols(self, in_dim: int, block_size: int) -> int:
+        return _ceil_div(in_dim, block_size)
+
+    def quantize(
+        self,
+        weight: torch.Tensor,
+        block_size: int,
+        fp8_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _quantize_dense_weight_to_blockwise_fp8(weight, block_size, fp8_dtype)
+
+
+_TORCHAO_QUANTIZER = TorchaoBlockwiseFp8Quantizer()
+
+
 def _callable_name(value: Any) -> str:
     return getattr(value, "__qualname__", type(value).__qualname__)
 
@@ -167,8 +207,12 @@ def make_fp8_bucketed_block_placement_fn(
     weight_factory: BlockwiseFp8WeightFactory,
     block_size: int = 128,
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+    quantizer: BlockwiseFp8Quantizer | None = None,
 ) -> PlacementFn:
-    """Assign one FP8 bucketed block placement using the mesh rank count."""
+    """Assign one FP8 bucketed block placement using the mesh rank count.
+
+    ``quantizer`` defaults to torchao's blockwise weight quantization.
+    """
 
     def fp8_bucketed_block_placements(
         named_params: list[tuple[str, nn.Parameter]],
@@ -179,6 +223,7 @@ def make_fp8_bucketed_block_placement_fn(
             weight_factory=weight_factory,
             block_size=block_size,
             fp8_dtype=fp8_dtype,
+            quantizer=quantizer,
         )
         return {fqn: (placement,) for fqn, _ in named_params}
 
@@ -313,6 +358,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         weight_factory: BlockwiseFp8WeightFactory,
         block_size: int = 128,
         fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+        quantizer: BlockwiseFp8Quantizer | None = None,
     ) -> None:
         if world_size <= 0:
             raise ValueError(
@@ -329,6 +375,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         self.block_size = block_size
         self.fp8_dtype = fp8_dtype
         self.weight_factory = weight_factory
+        self.quantizer = _TORCHAO_QUANTIZER if quantizer is None else quantizer
         self._metadata_plans: dict[
             int,
             Fp8BucketedBlockShard._Fp8MetadataPlan,
@@ -351,6 +398,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             and self.block_size == other.block_size
             and self.fp8_dtype == other.fp8_dtype
             and self.weight_factory is other.weight_factory
+            and self.quantizer is other.quantizer
         )
 
     def __hash__(self) -> int:
@@ -361,6 +409,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                 self.block_size,
                 self.fp8_dtype,
                 id(self.weight_factory),
+                id(self.quantizer),
             )
         )
 
@@ -369,7 +418,16 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             "Fp8BucketedBlockShard("
             f"world_size={self.world_size}, "
             f"block_size={self.block_size}, "
-            f"weight_factory={_callable_name(self.weight_factory)})"
+            f"weight_factory={_callable_name(self.weight_factory)}, "
+            f"quantizer={type(self.quantizer).__qualname__})"
+        )
+
+    def _scale_shape(self, shape: torch.Size) -> tuple[int, int]:
+        """The quantizer's scale shape for a whole 2D weight."""
+        out_dim, in_dim = _validate_2d_non_empty(shape, "blockwise scale")
+        return (
+            _ceil_div(out_dim, self.block_size),
+            self.quantizer.scale_cols(in_dim, self.block_size),
         )
 
     @staticmethod
@@ -468,7 +526,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         units: list[Fp8BucketedBlockShard._BlockRowUnit] = []
         for param in params:
             out_dim, in_dim = param.global_shape
-            num_col_blocks = _ceil_div(in_dim, self.block_size)
+            scale_cols = self.quantizer.scale_cols(in_dim, self.block_size)
             for row_start in range(0, out_dim, self.block_size):
                 row_end = min(row_start + self.block_size, out_dim)
                 dense_numel = (row_end - row_start) * in_dim
@@ -479,7 +537,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                         row_end=row_end,
                         dense_numel=dense_numel,
                         cost_bytes=dense_numel * fp8_itemsize
-                        + num_col_blocks * scale_itemsize,
+                        + scale_cols * scale_itemsize,
                     )
                 )
         return units
@@ -570,10 +628,9 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                 scale_row_start = row_start // self.block_size
                 scale_row_end = _ceil_div(row_end, self.block_size)
                 chunk_dense_numel = (row_end - row_start) * in_dim
-                scale_numel = (scale_row_end - scale_row_start) * _ceil_div(
-                    in_dim,
-                    self.block_size,
-                )
+                scale_numel = (
+                    scale_row_end - scale_row_start
+                ) * self.quantizer.scale_cols(in_dim, self.block_size)
                 chunks.append(
                     Fp8BucketedBlockShard._Fp8Chunk(
                         rank=rank,
@@ -697,11 +754,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         self,
         tensor: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return _quantize_dense_weight_to_blockwise_fp8(
-            tensor,
-            self.block_size,
-            self.fp8_dtype,
-        )
+        return self.quantizer.quantize(tensor, self.block_size, self.fp8_dtype)
 
     def _make_blockwise_fp8_weight(
         self,
@@ -1283,7 +1336,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         full_params: list[torch.Tensor] = []
         for info in state.infos:
             fp8_numel = info.global_numel
-            scale_shape = _scale_shape(info.global_shape, self.block_size)
+            scale_shape = self._scale_shape(info.global_shape)
             scale_numel = scale_shape[0] * scale_shape[1]
             fp8_data = fp8_flat[fp8_offset : fp8_offset + fp8_numel].view(
                 info.global_shape
@@ -1376,7 +1429,9 @@ def _is_backward_graph_task() -> bool:
 
 
 __all__ = [
+    "BlockwiseFp8Quantizer",
     "BlockwiseFp8WeightFactory",
     "Fp8BucketedBlockShard",
     "make_fp8_bucketed_block_placement_fn",
+    "TorchaoBlockwiseFp8Quantizer",
 ]

@@ -81,6 +81,34 @@ def _reference_blockwise_quant_weight(
     )
 
 
+class _Pow2PaddedQuantizer:
+    """TransformerEngine-like blockwise scales: power-of-2 reciprocal scales,
+    with scale columns padded to a multiple of 4."""
+
+    def scale_cols(self, in_dim: int, block_size: int) -> int:
+        cols = (in_dim + block_size - 1) // block_size
+        return (cols + 3) // 4 * 4
+
+    def quantize(
+        self,
+        weight: torch.Tensor,
+        block_size: int,
+        fp8_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rows, in_dim = weight.shape
+        cols = (in_dim + block_size - 1) // block_size
+        fp8_max = torch.finfo(fp8_dtype).max
+        blocks = weight.float().reshape(-1, block_size, cols, block_size)
+        amax = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp(min=_REFERENCE_EPS)
+        scale = torch.exp2(torch.floor(torch.log2(fp8_max / amax)))
+        fp8 = (blocks * scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+        recip_scale = torch.ones(
+            rows // block_size, self.scale_cols(in_dim, block_size), device=weight.device
+        )
+        recip_scale[:, :cols] = (1.0 / scale).reshape(-1, cols)
+        return fp8.reshape(rows, in_dim), recip_scale
+
+
 def _return_fp8_data(
     fp8_data: torch.Tensor,
     recip_scale: torch.Tensor,
@@ -198,15 +226,13 @@ def _packed_rank_views(
     )
 
 
-def _cpu_reference_quantize_local_weight(
-    placement: Fp8BucketedBlockShard,
-    tensor: torch.Tensor,
+def _cpu_reference_torchao_quantize(
+    quantizer: fp8_bucketed_block_shard_module.TorchaoBlockwiseFp8Quantizer,
+    weight: torch.Tensor,
+    block_size: int,
+    fp8_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _reference_blockwise_quant_weight(
-        tensor,
-        placement.block_size,
-        placement.fp8_dtype,
-    )
+    return _reference_blockwise_quant_weight(weight, block_size, fp8_dtype)
 
 
 class TestFp8AllGatherLayout(TestCase):
@@ -215,9 +241,9 @@ class TestFp8AllGatherLayout(TestCase):
     def setUp(self) -> None:
         super().setUp()
         quantize_patch = patch.object(
-            Fp8BucketedBlockShard,
-            "_quantize_local_weight",
-            _cpu_reference_quantize_local_weight,
+            fp8_bucketed_block_shard_module.TorchaoBlockwiseFp8Quantizer,
+            "quantize",
+            _cpu_reference_torchao_quantize,
         )
         quantize_patch.start()
         self.addCleanup(quantize_patch.stop)
@@ -752,6 +778,64 @@ class TestFp8AllGatherLayout(TestCase):
                 )
             )
             self.assertTrue(torch.equal(factory_call.recip_scale, reference_scale))
+
+    def test_custom_quantizer_sets_the_gathered_scales(self) -> None:
+        # A consumer's quantizer, here with TransformerEngine-like scales
+        # (power-of-2, columns padded to 4), sets the scales the bucket packs and
+        # the weight factory receives: each rank quantizes its block rows, and the
+        # gathered result equals the quantizer applied to the full weight.
+        block, world_size = 4, 4
+        quantizer = _Pow2PaddedQuantizer()
+        weight_factory = _RecordingWeightFactory()
+        placement = Fp8BucketedBlockShard(
+            world_size=world_size,
+            weight_factory=weight_factory,
+            block_size=block,
+            quantizer=quantizer,
+        )
+        self.assertNotEqual(
+            placement,
+            Fp8BucketedBlockShard(
+                world_size=world_size, weight_factory=weight_factory, block_size=block
+            ),
+        )
+        torch.manual_seed(0)
+        named_params = [
+            ("w1", nn.Parameter(torch.randn(16, 8, device=device_type))),
+            ("w2", nn.Parameter(torch.randn(8, 12, device=device_type))),
+        ]
+        prepared_by_rank = []
+        for rank in range(world_size):
+            mesh = _FakeMesh(world_size, rank)
+            infos = _make_fp8_param_infos(named_params, placement, mesh)
+            local_tensors = []
+            for (_, param), info in zip(named_params, infos, strict=True):
+                layout = info.bucket_layout.param_layouts[info.fqn]
+                row_start = (
+                    layout.local_global_offset - layout.param_offset
+                ) // param.shape[1]
+                local_tensors.append(
+                    param.detach()[row_start : row_start + info.local_shape[0]]
+                )
+            prepared_by_rank.append(
+                placement.prepare_unshard_bucket(local_tensors, infos, mesh, None)
+            )
+        rank_rows = torch.stack([prepared.buffers[0] for prepared in prepared_by_rank])
+        placement._finish_unshard_from_rank_rows(prepared_by_rank[0], rank_rows)
+        for call, (_, full_weight) in zip(
+            weight_factory.calls, named_params, strict=True
+        ):
+            fp8, recip_scale = quantizer.quantize(
+                full_weight.detach(), block, placement.fp8_dtype
+            )
+            self.assertEqual(
+                call.recip_scale.shape,
+                (full_weight.shape[0] // block, 4),
+            )
+            self.assertTrue(
+                torch.equal(call.fp8_data.view(torch.uint8), fp8.view(torch.uint8))
+            )
+            self.assertTrue(torch.equal(call.recip_scale, recip_scale))
 
 
 class TestFp8BlockwiseWeightQuantization(TestCase):
