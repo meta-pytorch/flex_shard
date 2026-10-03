@@ -20,7 +20,7 @@ from torch.testing._internal.common_fsdp import (
 )
 from torch.testing._internal.common_utils import TestCase
 
-from .. import BucketSpec, flex_shard, GradientReduction
+from .. import BucketSpec, flex_shard
 from ..custom_placements import (
     BlockShard,
     BucketedBlockShard,
@@ -341,7 +341,7 @@ class TestBucketedBlockShardDistributed(FSDPTestMultiThread):
         infos = [bucket_storage.param_infos[fqn] for fqn, _ in named_params]
 
         prepared = placement.prepare_reduce_grad(grads, infos, mesh, None)
-        reduce_result = placement.reduce_prepared_grad(prepared, GradientReduction())
+        reduce_result = placement.reduce_prepared_grad(prepared)
         sharded_grads = reduce_result.sharded_grads
         recv_buf = reduce_result.buffers[0]
 

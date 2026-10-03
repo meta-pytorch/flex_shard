@@ -37,13 +37,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     Transformer,
 )
 
-from .. import (
-    BucketSpec,
-    flex_shard,
-    GradientReduction,
-    is_flex_shard_param,
-    Placement,
-)
+from .. import BucketSpec, flex_shard, is_flex_shard_param, Placement
 from ..custom_placements.block_shard import BlockShard
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..custom_placements.owned import make_bucketed_owned_full_param_segments
@@ -866,7 +860,7 @@ class TestDistributedBuckets(FSDPTest):
             "reduce_scatter_tensor",
             wraps=dist.reduce_scatter_tensor,
         ) as reduce_scatter:
-            reduced = mixed.reduce_prepared_grad(prepared_reduce, GradientReduction())
+            reduced = mixed.reduce_prepared_grad(prepared_reduce)
         self.assertEqual(reduce_scatter.call_count, 1)
         for local_grad, (fqn, _) in zip(
             reduced.sharded_grads,
