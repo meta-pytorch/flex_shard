@@ -12,6 +12,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import _get_device_handle
+from torch.distributed.tensor import DTensor
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -219,13 +220,8 @@ def _validate_eager_params(
     expected_device: torch.device | None = None,
 ) -> None:
     """Validate parameters supported by the eager-only path."""
-    try:
-        from torch.distributed.tensor import DTensor
-    except ImportError:
-        DTensor = None
-
     for fqn, param in named_params:
-        if DTensor is not None and isinstance(param, DTensor):
+        if isinstance(param, DTensor):
             raise ValueError(
                 "FlexShard eager mode expects plain parameters; "
                 f"{fqn!r} is a DTensor. Convert DTensor parameters with "
