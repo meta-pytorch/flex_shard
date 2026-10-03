@@ -307,14 +307,26 @@ class BucketCommContext:
         )
 
     def finish_buckets(self) -> None:
-        """Finish the buckets backwards left: buckets still unsharded (no
-        post-backward trigger fired) and, with gradient sync on, buckets whose
-        grads a backward without sync accumulated since their last
-        reduce-scatter. Then reset the per-backward trigger counts."""
+        """Finish the buckets backwards left (see ``BucketRuntime.needs_finish``),
+        then reset the per-backward trigger counts.
+
+        A bucket that defers its post-backward must be finished before a
+        syncing backward that ran its module's backward ends, since its late
+        grads may not exist yet; outside backward (``finalize_backward``), they
+        do."""
         for bucket in self.buckets:
-            if bucket.is_unsharded or (
-                bucket.needs_sync and bucket.bucket_storage._requires_gradient_sync
-            ):
+            if bucket.needs_finish():
+                if (
+                    bucket.bucket_storage._defer_post_backward
+                    and bucket.bucket_storage._requires_gradient_sync
+                    and bucket.input_triggers_run
+                    and _in_backward()
+                ):
+                    raise RuntimeError(
+                        f"FlexShard: bucket {bucket.debug_fqn} defers its "
+                        "post-backward, but a syncing backward ended before "
+                        "finish_deferred_backward() finished it."
+                    )
                 bucket.post_backward()
             bucket.reset_backward_state()
 
@@ -728,6 +740,14 @@ class BucketRuntime:
         """Clear the post-backward trigger counts at the end of a backward."""
         self.backward_calls = self.input_triggers = self.input_triggers_run = 0
 
+    def needs_finish(self) -> bool:
+        """Whether backwards left this bucket to finish: still unsharded (no
+        post-backward trigger fired) or, with gradient sync on, holding grads
+        that backwards without sync accumulated since its last reduce-scatter."""
+        return self.is_unsharded or (
+            self.needs_sync and self.bucket_storage._requires_gradient_sync
+        )
+
     def pre_backward_hook(self, grad_outputs: Any) -> None:
         """Re-unshard before this bucket's module runs backward.
 
@@ -799,8 +819,12 @@ class BucketRuntime:
         params (frozen ones included), even if some params got no grad. It fires
         only when every forward call since the last backward carried a trigger
         and all of them ran, so no other call's backward still needs the params.
+        A bucket that defers its post-backward waits for
+        ``FlexShardModule.finish_deferred_backward`` instead.
         """
         self.input_triggers_run += 1
+        if self.bucket_storage._defer_post_backward:
+            return
         if self.backward_calls == self.input_triggers == self.input_triggers_run:
             self.post_backward()
 
@@ -994,6 +1018,11 @@ class BucketRuntime:
                 "FlexShard BucketSpec pre_backward_hook and post_reduce_hook are "
                 "eager-only; torch.compile does not use the persistent unsharded "
                 "params they receive."
+            )
+        if self.bucket_storage._defer_post_backward:
+            raise NotImplementedError(
+                "FlexShard BucketSpec defer_post_backward is eager-only; "
+                "torch.compile reduce-scatters in the traced backward."
             )
         full_params = _BucketUnshard.apply(self, *self._local_shards(use_autograd=True))
         self._swap_in_params(list(full_params))

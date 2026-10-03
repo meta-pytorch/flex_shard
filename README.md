@@ -281,6 +281,15 @@ last microbatch's gradients while other stages still compute.
 `model.set_manual_backward_finalization(True)` goes further: backwards finish
 nothing at their end, and `finalize_backward()` does it once per step.
 
+Some kernels compute weight gradients after their module's backward, such as
+TransformerEngine's `delay_wgrad_compute`, whose `backward_dw()` runs later.
+A bucket with `BucketSpec(defer_post_backward=True)` then skips its usual
+post-backward, which reduce-scatters as soon as its module's backward is done.
+Instead, the caller calls `model.finish_deferred_backward(param)` with any of
+its parameters once the late gradients exist, during that backward or before
+`finalize_backward()`. A syncing backward that ends with the bucket unfinished
+raises, instead of reduce-scattering without the late gradients.
+
 A regular FlexShard `state_dict()` contains rank-local shards. It is not a
 gathered model checkpoint. Existing FSDP2 checkpoint code needs an explicit
 compatibility check or conversion, even when the parameter split agrees.
