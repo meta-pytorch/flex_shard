@@ -794,6 +794,57 @@ class TestFlexShardTraining(FSDPTest):
             model(torch.randn(4, 8, device=device_type)).sum().backward()
 
     @skip_if_lt_x_gpu(2)
+    def test_unshard(self):
+        # A schedule that runs a layer's computation directly, bypassing the
+        # forward hooks that gather its bucket, unshards every bucket first, as
+        # Megatron-LM's EP overlap schedule does. It also splits each backward
+        # into two calls, so backward finalization is manual: the buckets keep
+        # their grads until finalize_backward after the last microbatch. Two
+        # steps, so the second unshard gathers the updated shards.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        torch.manual_seed(0)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 6)
+        ).to(device_type)
+        reference = copy.deepcopy(model)
+        flex_shard(
+            model,
+            buckets=[
+                BucketSpec(
+                    [f"{idx}.*"],
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    reshard_after_forward=False,
+                )
+                for idx in (0, 2)
+            ],
+        )
+        model.set_manual_backward_finalization(True)
+        optimizer = make_test_sgd(model.parameters(), lr=0.1)
+        reference_optimizer = make_test_sgd(reference.parameters(), lr=0.1)
+        torch.manual_seed(1 + self.rank)
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            reference_optimizer.zero_grad(set_to_none=True)
+            model.unshard()
+            for microbatch in range(2):
+                model.set_requires_gradient_sync(microbatch == 1)
+                x = torch.randn(4, 8, device=device_type)
+                # The first layer's forward hooks never run.
+                hidden = torch.relu(
+                    torch.nn.functional.linear(x, model[0].weight, model[0].bias)
+                )
+                detached = hidden.detach().requires_grad_()
+                model[2](detached).sum().backward()
+                hidden.backward(detached.grad)
+                reference(x).sum().backward()
+            model.finalize_backward()
+            _average_reference_grads(reference)
+            optimizer.step()
+            reference_optimizer.step()
+            check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
+
+    @skip_if_lt_x_gpu(2)
     def test_gradient_accumulation(self):
         # Three microbatches, in three modes:
         # - "sync": every microbatch reduce-scatters.

@@ -290,6 +290,12 @@ its parameters once the late gradients exist, during that backward or before
 `finalize_backward()`. A syncing backward that ends with the bucket unfinished
 raises, instead of reduce-scattering without the late gradients.
 
+Some schedules run a module's computation directly, bypassing the forward hooks
+that gather its bucket. One example is Megatron-LM's EP all-to-all overlap,
+which calls each layer's sub-modules. Like FSDP2, call `model.unshard()` first:
+it gathers every bucket and keeps it gathered until the end of a backward or
+`finalize_backward()` finishes it.
+
 A regular FlexShard `state_dict()` contains rank-local shards. It is not a
 gathered model checkpoint. Existing FSDP2 checkpoint code needs an explicit
 compatibility check or conversion, even when the parameter split agrees.
