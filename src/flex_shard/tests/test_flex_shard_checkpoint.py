@@ -71,7 +71,12 @@ def _single_param_layout(
     )["weight"]
 
 
-def _shard_model(model: nn.Module, placement: Placement, mesh: Any) -> None:
+def _shard_model(
+    model: nn.Module,
+    placement: Placement,
+    mesh: Any,
+    shared_names: dict[str, list[str]] | None = None,
+) -> None:
     named_params = list(model.named_parameters())
     storage = ShardedBucketStorage.from_bucket(
         model,
@@ -87,6 +92,7 @@ def _shard_model(model: nn.Module, placement: Placement, mesh: Any) -> None:
             mesh=mesh,
             reshard_after_forward=False,
         ),
+        shared_names,
     )
     _attach_flex_shard_module_state(model, [storage])
 
@@ -193,6 +199,37 @@ class TestFlexShardCheckpointStateDict(TestCase):
                 model.load_state_dict(load_state_dict)
 
             self.assertEqual(next(model.parameters()), expected)
+
+    def test_dcp_round_trip_of_tied_weights(self) -> None:
+        # state_dict() lists both names of a tied weight, each as its own
+        # detached tensor. Both carry the layout, so DCP saves and loads each
+        # as the shard it is, and the weight stays shared.
+        expected = torch.arange(20, dtype=torch.float32).view(5, 4)
+        model = nn.Module()
+        model.embed = nn.Embedding(5, 4)
+        model.head = nn.Linear(4, 5, bias=False)
+        model.head.weight = model.embed.weight
+        with torch.no_grad():
+            model.embed.weight.copy_(expected)
+        with single_rank_cpu_mesh() as mesh:
+            _shard_model(
+                model, Shard(0), mesh, shared_names={"embed.weight": ["head.weight"]}
+            )
+            self.assertIs(model.head.weight, model.embed.weight)
+            state_dict = _checkpoint_state_dict(model)
+            layout = GlobalLayout((5, 4), ((0, 0),), ((0, 0),), ((5, 4),))
+            for key in ("embed.weight", "head.weight"):
+                self.assertEqual(get_global_layout(state_dict[key]), layout)
+
+            with TemporaryDirectory() as checkpoint_dir:
+                dcp.save(state_dict, checkpoint_id=checkpoint_dir, no_dist=True)
+                model.embed.weight.detach().fill_(-1)
+                load_state_dict = _checkpoint_state_dict(model)
+                dcp.load(load_state_dict, checkpoint_id=checkpoint_dir, no_dist=True)
+                model.load_state_dict(load_state_dict)
+
+            self.assertIs(model.head.weight, model.embed.weight)
+            self.assertEqual(model.embed.weight, expected)
 
     def test_state_dict_composes_declared_outer_layout(self) -> None:
         model = nn.Module()

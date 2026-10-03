@@ -167,6 +167,53 @@ class TestBucketAssignment(TestCase):
             with self.assertRaises(ValueError, msg="matched multiple buckets"):
                 _assign_params_to_buckets(fqns, buckets)
 
+    def _tied_buckets(self, mesh, patterns_per_bucket):
+        return [
+            BucketSpec(
+                patterns,
+                placement_fn=per_param_placements,
+                mesh=mesh,
+                reshard_after_forward=False,
+            )
+            for patterns in patterns_per_bucket
+        ]
+
+    def test_assigns_shared_param_names_to_one_bucket(self):
+        """Every name of a shared parameter in one bucket is accepted."""
+        fqns = ["tok_embeddings.weight", "norm.weight"]
+        shared_names = {"tok_embeddings.weight": ["output.weight"]}
+        with single_rank_cpu_mesh() as mesh:
+            buckets = self._tied_buckets(
+                mesh, [["tok_embeddings.*", "norm.*", "output.*"]]
+            )
+            result = _assign_params_to_buckets(fqns, buckets, shared_names)
+            self.assertEqual(result[0], ["tok_embeddings.weight", "norm.weight"])
+
+    def test_rejects_shared_param_split_across_buckets(self):
+        """Names of a shared parameter in different buckets raise, like FSDP2."""
+        fqns = ["tok_embeddings.weight", "norm.weight"]
+        shared_names = {"tok_embeddings.weight": ["output.weight"]}
+        with single_rank_cpu_mesh() as mesh:
+            buckets = self._tied_buckets(
+                mesh, [["tok_embeddings.*"], ["norm.*", "output.*"]]
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                r"(?s)'tok_embeddings\.weight' is shared with 'output\.weight'.*"
+                r"output\.weight -> bucket 1.*put every name that refers to the "
+                r"parameter in the same BucketSpec",
+            ):
+                _assign_params_to_buckets(fqns, buckets, shared_names)
+
+    def test_rejects_shared_param_name_without_bucket(self):
+        """A shared parameter's name matching no bucket raises too."""
+        fqns = ["tok_embeddings.weight", "norm.weight"]
+        shared_names = {"tok_embeddings.weight": ["output.weight"]}
+        with single_rank_cpu_mesh() as mesh:
+            buckets = self._tied_buckets(mesh, [["tok_embeddings.*", "norm.*"]])
+            with self.assertRaisesRegex(ValueError, r"output\.weight -> no bucket"):
+                _assign_params_to_buckets(fqns, buckets, shared_names)
+
 
 # ---------------------------------------------------------------------------
 # Placement consistency tests (single-process, no NCCL)
@@ -903,7 +950,8 @@ class TestDistributedBuckets(FSDPTest):
 
 
 def _multi_mesh_moe_args() -> ModelArgs:
-    # weight_tying=False: flex_shard rejects shared params (output<->tok_emb).
+    # weight_tying=False: these tests bucket output and tok_embeddings apart,
+    # which a shared weight's names may not be.
     return ModelArgs(
         n_layers=2,
         vocab_size=16,
