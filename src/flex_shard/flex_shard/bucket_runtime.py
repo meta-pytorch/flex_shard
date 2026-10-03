@@ -306,6 +306,7 @@ class BucketCommContext:
                 for param in bucket.unsharded_params or []:
                     param.grad = None
                 bucket.needs_sync = False
+                bucket._set_unsharded_grad_dtypes(defer_upcast=False)
             if bucket.is_unsharded:
                 bucket.reshard()
             bucket.reset_backward_state()
@@ -679,7 +680,42 @@ class BucketRuntime:
         """
         self.context.queue_post_backward_callback()
         self.unshard()
+        self._set_unsharded_grad_dtypes(defer_upcast=True)
         self.context.prefetch(self.context.next_backward_bucket(self))
+
+    def _set_unsharded_grad_dtypes(self, *, defer_upcast: bool) -> None:
+        """Defer or restore the upcast of grads accumulating in a wider dtype.
+
+        As in FSDP2 (pytorch/pytorch#198668 and #199242), a param whose
+        unsharded grad dtype is wider than its compute dtype keeps the grads
+        autograd produces while deferred (``grad_dtype=None``), in every
+        backward: the reduce-scatter copy-in widens them as it copies, and
+        AccumulateGrad adds them in place to a wider kept grad. That saves a
+        cast kernel per param and the wider unsharded grads until the copy-in.
+        Restoring upcasts a new grad that is not reduced, once, after the
+        bucket reshards, so the accumulation across backwards stays wider.
+        """
+        for bucket_param, param in zip(
+            self.bucket_params, self.unsharded_params or [], strict=False
+        ):
+            info = bucket_param.param_info
+            dtype = info.unsharded_grad_dtype
+            compute_dtype = info.unsharded_dtype
+            if (
+                dtype is None
+                or not param.requires_grad
+                or not dtype.is_floating_point
+                or not compute_dtype.is_floating_point
+                or dtype.itemsize <= compute_dtype.itemsize
+            ):
+                continue
+            if defer_upcast:
+                param.grad_dtype = None
+                continue
+            grad = param.grad
+            if grad is not None and grad.dtype != dtype:
+                param.grad = grad.to(dtype)
+            param.grad_dtype = dtype
 
     def on_input_grads(self) -> None:
         """Post-backward trigger from the hooked module's input grads.
@@ -710,10 +746,14 @@ class BucketRuntime:
             self.needs_sync = True
             if self.is_unsharded and self.bucket_storage._reshard_after_backward:
                 self.reshard()
+            # After resharding, so a deferred grad's upcast never coexists with
+            # the unsharded params.
+            self._set_unsharded_grad_dtypes(defer_upcast=False)
             return
         self.needs_sync = False
         grads: list[torch.Tensor | None] = []
         params: list[nn.Parameter] = []
+        zero_dtypes: list[torch.dtype] = []
         infos: list[ParamInfo] = []
         sharded_params: list[nn.Parameter] = []
         for bucket_param, unsharded_param in zip(
@@ -725,24 +765,23 @@ class BucketRuntime:
                 continue
             grads.append(grad)
             params.append(unsharded_param)
+            # The dtype fresh grads arrive in: the forward dtype while the
+            # upcast is deferred or grad_dtype is None, as in FSDP2.
+            zero_dtypes.append(unsharded_param.grad_dtype or unsharded_param.dtype)
             infos.append(bucket_param.param_info)
             sharded_params.append(bucket_param.sharded_param)
+        self._set_unsharded_grad_dtypes(defer_upcast=False)
         if self.is_unsharded:
             self.reshard()
         if not grads:
             return
         # Zeros fill missing grads after resharding, so they never coexist
-        # with the unsharded params, in the dtype the param accumulates in (its
-        # forward dtype if it accepts any).
+        # with the unsharded params.
         grads = [
-            torch.zeros(
-                param.shape,
-                dtype=info.unsharded_grad_dtype or info.unsharded_dtype,
-                device=param.device,
-            )
+            torch.zeros(param.shape, dtype=dtype, device=param.device)
             if grad is None
             else grad
-            for grad, param, info in zip(grads, params, infos, strict=True)
+            for grad, param, dtype in zip(grads, params, zero_dtypes, strict=True)
         ]
         # Per-parameter grad dtypes meet in the bucket's promoted reduce dtype.
         # The placement's copy-in casts to it, fused with the copy, rather
