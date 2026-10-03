@@ -679,15 +679,12 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             start + numel
             for start, numel in zip(rank_offsets, rank_numels, strict=True)
         )
-        try:
-            return tuple(
-                [offset_to_unit[offset] for offset in rank_offsets]
-                + [offset_to_unit[rank_ends[-1]]]
-            )
-        except KeyError as error:
+        boundaries = (*rank_offsets, rank_ends[-1])
+        if any(offset not in offset_to_unit for offset in boundaries):
             raise AssertionError(
                 "FP8 block-row rank layout is not aligned to row-block units."
-            ) from error
+            )
+        return tuple(offset_to_unit[offset] for offset in boundaries)
 
     def _chunk_numel(
         self,

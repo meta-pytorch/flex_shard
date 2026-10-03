@@ -25,24 +25,18 @@ from ..flex_shard.placement_contract import (
     PlacementReduceGradResult,
     PlacementUnshardResult,
 )
-from ..flex_shard.utils import _record_comm_if_eager, _record_function_if_eager
+from ..flex_shard.utils import (
+    _record_comm_if_eager,
+    _record_copy_in_if_eager,
+    _record_copy_out_if_eager,
+    _record_function_if_eager,
+)
 from .utils import (
     copy_tensor_to_dtype,
     foreach_copy_,
     pack_tensors_into_flat_buffer_with_scratch,
     reduce_scatter_grads,
 )
-
-try:
-    from ..flex_shard.utils import _record_copy_in_if_eager, _record_copy_out_if_eager
-except ImportError:
-
-    def _record_copy_in_if_eager():
-        return _record_function_if_eager("FlexShard::copy_in", None)
-
-    def _record_copy_out_if_eager():
-        return _record_function_if_eager("FlexShard::copy_out", None)
-
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh

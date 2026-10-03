@@ -92,50 +92,48 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl")
-    try:
-        rank, world_size = dist.get_rank(), dist.get_world_size()
-        if world_size != 4:
-            raise ValueError("Run this example with four GPU processes")
-        device = torch.device("cuda", local_rank)
-        dp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
-        grid = init_device_mesh("cuda", (2, 2), mesh_dim_names=("efsdp", "replica"))
-        efsdp_mesh = grid["efsdp"]
+    rank, world_size = dist.get_rank(), dist.get_world_size()
+    if world_size != 4:
+        raise ValueError("Run this example with four GPU processes")
+    device = torch.device("cuda", local_rank)
+    dp_mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
+    grid = init_device_mesh("cuda", (2, 2), mesh_dim_names=("efsdp", "replica"))
+    efsdp_mesh = grid["efsdp"]
 
-        torch.manual_seed(42)
-        model = TinyMoETransformer().to(device).train()
-        buckets = build_buckets(model, dp_mesh, efsdp_mesh)
-        flex_shard(model, buckets=buckets)
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=1e-3, eps=1e-6, weight_decay=0.01, foreach=False
-        )
+    torch.manual_seed(42)
+    model = TinyMoETransformer().to(device).train()
+    buckets = build_buckets(model, dp_mesh, efsdp_mesh)
+    flex_shard(model, buckets=buckets)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=1e-3, eps=1e-6, weight_decay=0.01, foreach=False
+    )
 
-        graphs = []
+    graphs = []
 
-        def capture_backend(graph_module, example_inputs):
-            graphs.append(graph_module)
-            return graph_module.forward
+    def capture_backend(graph_module, example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
 
-        run_model = (
-            torch.compile(model, backend=capture_backend, fullgraph=True)
-            if args.trace
-            else model
-        )
-        # MoE replicas share a batch; the two efsdp coordinates get different batches.
-        data_rank = efsdp_mesh.get_local_rank()
-        rng = torch.Generator(device=device).manual_seed(1234 + data_rank)
-        for step in range(3):
-            tokens = torch.randint(32, (2, 9), generator=rng, device=device)
-            optimizer.zero_grad(set_to_none=True)
-            logits = run_model(tokens[:, :-1])
-            loss = F.cross_entropy(logits.flatten(0, 1), tokens[:, 1:].flatten())
-            loss.backward()
-            optimizer.step()
-            if rank == 0:
-                print(f"step={step} rank0_loss={loss.item():.4f}", flush=True)
-        if args.trace:
-            inspect_trace(graphs, len(buckets), args.graph_dir, rank)
-    finally:
-        dist.destroy_process_group()
+    run_model = (
+        torch.compile(model, backend=capture_backend, fullgraph=True)
+        if args.trace
+        else model
+    )
+    # MoE replicas share a batch; the two efsdp coordinates get different batches.
+    data_rank = efsdp_mesh.get_local_rank()
+    rng = torch.Generator(device=device).manual_seed(1234 + data_rank)
+    for step in range(3):
+        tokens = torch.randint(32, (2, 9), generator=rng, device=device)
+        optimizer.zero_grad(set_to_none=True)
+        logits = run_model(tokens[:, :-1])
+        loss = F.cross_entropy(logits.flatten(0, 1), tokens[:, 1:].flatten())
+        loss.backward()
+        optimizer.step()
+        if rank == 0:
+            print(f"step={step} rank0_loss={loss.item():.4f}", flush=True)
+    if args.trace:
+        inspect_trace(graphs, len(buckets), args.graph_dir, rank)
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

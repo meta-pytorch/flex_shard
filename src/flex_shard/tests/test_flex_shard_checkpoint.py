@@ -247,7 +247,7 @@ class TestFlexShardCheckpointStateDict(TestCase):
         with single_rank_cpu_mesh() as mesh:
             _shard_model(model, BucketedBlockShard(dims=(0, 1)), mesh)
             with self.assertRaisesRegex(
-                NotImplementedError, "Distributed checkpointing is not supported"
+                NotImplementedError, "distributed checkpointing supports only dims"
             ):
                 _checkpoint_state_dict(model)
 

@@ -374,9 +374,3 @@ class StreamHandoff:
         event = self._device_handle.Event()
         event.record(self._device_handle.current_stream(device))
         self.release_after(event)
-
-    def __del__(self) -> None:
-        try:
-            self.release_after_current_stream()
-        except Exception:
-            pass
