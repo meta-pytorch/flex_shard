@@ -64,19 +64,20 @@ class MixedPrecisionPolicy:
         param_dtype: Dtype for forward compute. Placements should materialize
             unsharded parameters in this dtype. If None, use storage dtype.
         reduce_dtype: Dtype for autograd accumulation and gradient
-            reduction. Full-parameter gradients are cast to this dtype as
-            they reach bucket unshard, before per-parameter accumulation.
-            If None, each parameter accumulates in its ``grad_dtype`` (its
+            reduction. Eager casts each full-parameter gradient to this dtype
+            before it accumulates on the unsharded parameter; torch.compile
+            casts the accumulated gradient in the reduce-scatter copy-in. If
+            None, each parameter accumulates in its ``grad_dtype`` (its
             dtype unless explicitly set), independent of param_dtype, and
             each bucket reduces in the promoted accumulation dtype of its
-            trainable parameters. A parameter with ``grad_dtype`` explicitly
-            None accumulates in whatever dtype its gradients arrive in, and
-            its bucket's reduce dtype follows each backward's actual
-            gradients. Every rank must produce the same gradient dtypes, or
-            ranks reduce in different dtypes and the collective can hang.
-            Where the parameter is unused, its zero gradient has the forward
-            dtype (param_dtype, else its dtype); set reduce_dtype if its
-            gradients can arrive in another dtype. This only sets the
+            parameters trainable at wrap time, widened in each backward by
+            those trainable then. A parameter with ``grad_dtype`` explicitly
+            None accumulates in whatever dtype its gradients arrive in, which
+            can widen its bucket's reduce dtype. Every rank must produce the
+            same gradient dtypes, or ranks reduce in different dtypes and the
+            collective can hang. Where the parameter is unused, its zero
+            gradient has the forward dtype (param_dtype, else its dtype); set
+            reduce_dtype if its gradients can arrive in another dtype. This only sets the
             accumulation and communication dtype: the reduced sharded
             gradient is then cast to the parameter's ``grad_dtype`` when
             stored in ``.grad``, and ``grad_dtype=None`` skips that cast.
@@ -402,9 +403,9 @@ class ShardedBucketStorage:
             )
 
         # One collective per bucket needs one dtype. Like FSDP2, promote over
-        # trainable grads only; frozen params' zero grads are cast to it.
-        # Grads with no fixed dtype normally arrive in the unsharded dtype;
-        # backward re-promotes over the grads that actually arrive.
+        # trainable grads only. Grads with no fixed dtype normally arrive in
+        # the unsharded dtype; backward only widens this over the grads that
+        # actually arrive.
         trainable_grad_dtypes = [
             info.unsharded_grad_dtype or info.unsharded_dtype
             for info in param_infos.values()

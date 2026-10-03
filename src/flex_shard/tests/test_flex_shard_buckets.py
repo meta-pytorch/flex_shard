@@ -42,6 +42,7 @@ from ..custom_placements.block_shard import BlockShard
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..custom_placements.owned import make_bucketed_owned_full_param_segments
 from ..custom_placements.shard import per_param_placements, Shard
+from ..flex_shard.bucket_runtime import _promote_reduce_dtype_over_grads
 from ..flex_shard.bucket_storage import (
     _assign_params_to_buckets,
     ParamInfo,
@@ -382,6 +383,57 @@ class TestBucketReduceDtype(TestCase):
         self.assertIsNone(infos["none_grad"].unsharded_grad_dtype)
         for info in infos.values():
             self.assertEqual(info.grad_reduce_dtype, torch.float32)
+
+    def test_backward_promotion_follows_current_requires_grad(self):
+        bf16, fp32 = torch.bfloat16, torch.float32
+        with single_rank_cpu_mesh() as mesh:
+
+            def create_infos(grad_dtypes, frozen=()):
+                params = {}
+                for fqn, grad_dtype in grad_dtypes.items():
+                    params[fqn] = nn.Parameter(torch.empty(2, 2, dtype=bf16))
+                    params[fqn].grad_dtype = grad_dtype
+                    params[fqn].requires_grad_(fqn not in frozen)
+                infos, _ = ShardedBucketStorage.create_param_infos(
+                    list(params.items()),
+                    mesh,
+                    {fqn: (Shard(0),) for fqn in params},
+                )
+                return list(infos.values())
+
+            # fp32_grad frozen after wrap still counts in the wrap-time fp32,
+            # whatever none_grad's grad dtype or if it is missing.
+            none_info, _ = create_infos({"none_grad": None, "fp32_grad": fp32})
+            for dtype in (fp32, bf16, None):
+                grad = None if dtype is None else torch.zeros(2, 2, dtype=dtype)
+                with self.subTest(grad_dtype=dtype):
+                    (info,) = _promote_reduce_dtype_over_grads([grad], [none_info])
+                    self.assertEqual(info.grad_reduce_dtype, fp32)
+            # Unfrozen after wrap: fp32_grad's grads widen the bucket's.
+            for frozen in (("fp32_grad",), ("bf16_grad", "fp32_grad")):
+                with self.subTest(frozen=frozen):
+                    infos = create_infos({"bf16_grad": bf16, "fp32_grad": fp32}, frozen)
+                    infos = _promote_reduce_dtype_over_grads(
+                        [torch.zeros(2, 2, dtype=bf16), torch.zeros(2, 2, dtype=fp32)],
+                        infos,
+                    )
+                    self.assertEqual(
+                        [info.grad_reduce_dtype for info in infos], [fp32, fp32]
+                    )
+            # Still frozen, as compile backward marks: fp32_grad's zero grad
+            # does not widen bf16_grad's bf16, also with nothing trainable at
+            # wrap, where fp32_grad's info keeps its own fp32.
+            for frozen in (("fp32_grad",), ("fp32_grad", "bf16_grad")):
+                with self.subTest(frozen=frozen, trainable_mask=True):
+                    infos = create_infos({"fp32_grad": fp32, "bf16_grad": bf16}, frozen)
+                    infos = _promote_reduce_dtype_over_grads(
+                        [torch.zeros(2, 2, dtype=fp32), torch.zeros(2, 2, dtype=bf16)],
+                        infos,
+                        trainable=[False, True],
+                    )
+                    self.assertEqual(
+                        [info.grad_reduce_dtype for info in infos], [bf16, bf16]
+                    )
 
 
 # ---------------------------------------------------------------------------

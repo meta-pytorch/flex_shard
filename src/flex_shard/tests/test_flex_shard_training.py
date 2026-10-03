@@ -101,7 +101,9 @@ class _ParallelLinears(torch.nn.Module):
 class _AccumulatingWeight(torch.nn.Module):
     def __init__(self, *, device: torch.device, dtype: torch.dtype) -> None:
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros(8, 8, device=device, dtype=dtype))
+        self.weight = torch.nn.Parameter(
+            torch.zeros(8, 8, device=device, dtype=dtype)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Grads of 256 and then 1 accumulate to 257 in fp32 but 256 in bf16."""
@@ -113,6 +115,28 @@ class _AccumulatingWeights(torch.nn.Module):
         super().__init__()
         self.a = _AccumulatingWeight(device=device, dtype=dtype)
         self.b = _AccumulatingWeight(device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.a(x) + self.b(x)
+
+
+class _ReusedWeight(torch.nn.Module):
+    def __init__(self, *, device: torch.device, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.zeros(8, 8, device=device, dtype=dtype)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-use grads 256 and 1 sum to 257 in fp32 but round to 256 in bf16."""
+        return ((256 * x) @ self.weight).float().sum() + (x @ self.weight).float().sum()
+
+
+class _ReusedWeights(torch.nn.Module):
+    def __init__(self, *, device: torch.device, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.a = _ReusedWeight(device=device, dtype=dtype)
+        self.b = _ReusedWeight(device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.a(x) + self.b(x)
@@ -699,8 +723,9 @@ class TestFlexShardTraining(FSDPTest):
         # bucket, with zeros for its unused params. Three microbatches: the
         # first without sync (keeping fp32 grads on rank 0 only), the second
         # skipping the side bucket, so the pending sync makes it reduce on
-        # every rank, and routing each rank to the other expert, and the third
-        # syncing with the side bucket's outputs unused on rank 1.
+        # every rank, and routing each rank to the other expert, so kept and
+        # fresh grads add up, and the third syncing with the side
+        # bucket's outputs unused on rank 1.
         mesh = init_device_mesh(
             device_type.type,
             (self.world_size,),
@@ -920,6 +945,36 @@ class TestFlexShardTraining(FSDPTest):
         ):
             grad = module._parameters["weight"].grad
             self.assertIsNotNone(grad)
+            self.assertEqual(grad.dtype, grad_dtype)
+            self.assertEqual(grad, torch.full_like(grad, grad_value))
+
+    @skip_if_lt_x_gpu(2)
+    def test_kept_grads_accumulate_in_param_grad_dtype(self):
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+        model = _ReusedWeights(device=device_type, dtype=torch.bfloat16)
+        model.b.weight.grad_dtype = torch.float32
+        flex_shard_cuda(model, mesh)
+        model.set_reshard_after_backward(False)
+        x = torch.ones(1, 8, dtype=torch.bfloat16, device=device_type)
+
+        model.set_requires_gradient_sync(False)
+        model(x).backward()
+        # Like FSDP2, a's kept grad stays in its bf16 grad dtype, not the
+        # bucket's fp32 reduce dtype promoted by b's grad_dtype.
+        self.assertEqual(model.a._parameters["weight"].grad.dtype, torch.bfloat16)
+        model.set_requires_gradient_sync(True)
+        model(x).backward()
+        # b's two uses sum in its bf16 compute dtype while its upcast is
+        # deferred, as in FSDP2, so each backward adds 256 rather than 257.
+        for module, grad_value, grad_dtype in (
+            (model.a, 512.0, torch.bfloat16),
+            (model.b, 512.0, torch.float32),
+        ):
+            grad = module._parameters["weight"].grad
             self.assertEqual(grad.dtype, grad_dtype)
             self.assertEqual(grad, torch.full_like(grad, grad_value))
 
