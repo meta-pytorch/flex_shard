@@ -7,6 +7,7 @@
 from dataclasses import replace
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.testing._internal.common_utils import run_tests, TestCase
 
@@ -15,6 +16,7 @@ from .. import (
     flex_shard,
     get_global_shape,
     get_placements,
+    GradientReduction,
     is_flex_shard_param,
     MixedPrecisionPolicy,
     OffloadPolicy,
@@ -122,6 +124,13 @@ class TestFlexShardAPI(TestCase):
             self.assertFalse(is_flex_shard_param(unmanaged))
             self.assertIsNone(get_placements(unmanaged))
             self.assertIsNone(get_global_shape(unmanaged))
+
+    def test_gradient_reduction_validates_its_factor(self):
+        for factor in (0, -2.0, float("inf")):
+            with self.assertRaisesRegex(ValueError, "positive number"):
+                GradientReduction(divide_factor=factor)
+        with self.assertRaisesRegex(ValueError, "requires gradient_reduce_op=AVG"):
+            GradientReduction(dist.ReduceOp.SUM, 2)
 
     def test_offload_policy_is_rejected_until_supported(self):
         with single_rank_cuda_mesh() as mesh:
