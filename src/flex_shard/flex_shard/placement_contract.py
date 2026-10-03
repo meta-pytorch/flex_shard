@@ -9,10 +9,9 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Literal, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
-import torch.distributed as dist
 from torch.distributed.checkpoint import CheckpointableTensor
 
 if TYPE_CHECKING:
@@ -124,37 +123,6 @@ def compose_global_layouts(outer: GlobalLayout, inner: GlobalLayout) -> GlobalLa
         local_offsets=tuple(local_offsets),
         local_sizes=tuple(local_sizes),
     )
-
-
-GradientReduceOp = Literal[dist.ReduceOp.AVG, dist.ReduceOp.SUM]
-
-
-@dataclass(frozen=True)
-class GradientReduction:
-    """What a bucket's gradient reduction must produce, from its ``BucketSpec``.
-
-    The reduced local shard is this rank's part of the bucket's gradients
-    summed over its mesh and, with ``op=AVG``, divided by ``divide_factor``,
-    which defaults to the mesh size. The placement owns how: its collectives,
-    op choice and divisions.
-    """
-
-    op: GradientReduceOp = dist.ReduceOp.AVG
-    divide_factor: float | None = None
-
-    def __post_init__(self) -> None:
-        if self.divide_factor is None:
-            return
-        if not math.isfinite(self.divide_factor) or self.divide_factor <= 0:
-            raise ValueError(
-                "gradient_divide_factor must be a positive number, got "
-                f"{self.divide_factor!r}."
-            )
-        if self.op == dist.ReduceOp.SUM:
-            raise ValueError(
-                "gradient_divide_factor requires gradient_reduce_op=AVG; SUM does "
-                "not divide gradients."
-            )
 
 
 class Placement(ABC):
@@ -324,11 +292,8 @@ class Placement(ABC):
     def reduce_prepared_grad(
         self,
         prepared: PlacementPreparedReduceGrad,
-        reduction: GradientReduction,
     ) -> PlacementReduceGradResult:
-        """Reduce prepared full gradients as ``reduction`` specifies and return
-        local gradient shards. ``custom_placements.utils.reduce_scatter_grads``
-        implements ``reduction`` for one reduce-scatter."""
+        """Reduce prepared full gradients and return local gradient shards."""
         raise NotImplementedError
 
 
@@ -406,8 +371,6 @@ __all__ = [
     "compose_global_layouts",
     "get_global_layout",
     "GlobalLayout",
-    "GradientReduceOp",
-    "GradientReduction",
     "LocalStorageLayout",
     "Placement",
     "PlacementPreparedUnshard",
