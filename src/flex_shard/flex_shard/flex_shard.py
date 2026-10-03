@@ -14,8 +14,10 @@ import torch.nn as nn
 
 from .bucket_runtime import (
     _EAGER_COMM_CONTEXTS_ATTR,
+    _in_backward,
     _install_bucket_unshard_hooks,
     _MAX_PENDING_REDUCE_GRADS_ATTR,
+    GradientReductionHandle,
 )
 from .bucket_storage import (
     _assign_params_to_buckets,
@@ -122,11 +124,51 @@ class FlexShardModule:
         forward until its backward; call this when that backward will not run.
         Until then, ``module.parameters()`` returns their unsharded params, so
         zero grads through the optimizer rather than ``module.zero_grad()``.
-        Grads accumulated without sync are kept, except after a backward that
-        raised on this rank, since they mix with its partial grads.
+        Grads accumulated without sync are kept.
         """
         for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
             context.reset()
+
+    def set_manual_backward_finalization(self, enabled: bool) -> None:
+        """Set whether the caller finalizes backward, like FSDP2's
+        ``set_manual_backward_finalization``.
+
+        When enabled, a backward does not finish FlexShard's work at its end;
+        call :meth:`finalize_backward` after the step's last backward. Until
+        then, buckets a backward left unsharded stay unsharded and their grads
+        stay on the unsharded params. It cannot change during a backward.
+        """
+        if _in_backward():
+            raise RuntimeError(
+                "FlexShard: set_manual_backward_finalization() cannot run in backward."
+            )
+        for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
+            context.manual_backward_finalization = enabled
+
+    def finalize_backward(
+        self, *, async_op: bool = False
+    ) -> GradientReductionHandle | None:
+        """Finish backward on the calling thread, like FSDP2's
+        ``finalize_backward``.
+
+        Reduce-scatters, if gradient sync is on, the grads that backwards
+        without sync accumulated, finishes buckets a backward left unsharded,
+        and resets per-backward state, following the current sync and reshard
+        settings. For example, a pipeline stage can reduce its last
+        microbatch's grads after its backward, while other stages compute.
+        Call it after a backward, not between a forward and its backward. With
+        ``async_op=True``, it returns a handle without waiting; call its
+        ``wait()`` before using the grads or running the next forward. Eager
+        only.
+        """
+        contexts = list(getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values())
+        for context in contexts:
+            context.start_finalize_backward()
+        handle = GradientReductionHandle(contexts)
+        if async_op:
+            return handle
+        handle.wait()
+        return None
 
     def _bucket_storages(self, recurse: bool) -> list[ShardedBucketStorage]:
         modules = self.modules() if recurse else [self]

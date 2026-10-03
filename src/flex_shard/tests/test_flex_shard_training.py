@@ -617,6 +617,57 @@ class TestFlexShardTraining(FSDPTest):
                     self.assertEqual(param.grad.float(), expected, **tolerance)
 
     @skip_if_lt_x_gpu(2)
+    def test_finalize_backward(self):
+        # Grads accumulated without sync reduce-scatter outside backward, as a
+        # pipeline stage does after its last backward: after automatic
+        # finalization at each backward's end, and in manual mode, where
+        # backward finishes nothing itself.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        for manual, async_op in ((False, True), (True, False)):
+            with self.subTest(manual=manual, async_op=async_op):
+                torch.manual_seed(0)
+                model = torch.nn.Sequential(
+                    torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 6)
+                ).to(device_type)
+                reference = copy.deepcopy(model)
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            ["*"],
+                            placement_fn=per_param_placements,
+                            mesh=mesh,
+                            reshard_after_forward=False,
+                        )
+                    ],
+                )
+                model.set_manual_backward_finalization(manual)
+                model.set_requires_gradient_sync(False)
+                model.set_reshard_after_backward(False)
+                torch.manual_seed(1 + self.rank)
+                for _ in range(2):
+                    x = torch.randn(4, 8, device=device_type)
+                    model(x).sum().backward()
+                    reference(x).sum().backward()
+                model.set_requires_gradient_sync(True)
+                handle = model.finalize_backward(async_op=async_op)
+                if async_op:
+                    with self.assertRaisesRegex(RuntimeError, "wait on the previous"):
+                        model.finalize_backward()
+                    handle.wait()
+                else:
+                    self.assertIsNone(handle)
+                for param, ref_param in zip(model.parameters(), reference.parameters()):
+                    expected = ref_param.grad.clone()
+                    dist.all_reduce(expected, op=dist.ReduceOp.AVG)
+                    self.assertEqual(
+                        param.grad,
+                        expected_shard(
+                            expected, rank=self.rank, world_size=self.world_size
+                        ),
+                    )
+
+    @skip_if_lt_x_gpu(2)
     def test_gradient_accumulation(self):
         # Three microbatches, in three modes:
         # - "sync": every microbatch reduce-scatters.
