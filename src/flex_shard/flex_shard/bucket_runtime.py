@@ -731,26 +731,24 @@ class BucketRuntime:
             self.reshard()
         if not grads:
             return
+        # Promote over the real grads before the zeros exist, so zeros never
+        # pick the reduce dtype.
         infos = _promote_reduce_dtype_over_grads(grads, infos)
         # Zeros fill missing grads after resharding, so they never coexist
-        # with the unsharded params. The reduce-scatter copy-in needs one
-        # dtype: the reduce dtype if grads arrive in mixed (per-param grad)
-        # dtypes.
-        dtypes = {grad.dtype for grad in grads if grad is not None}
-        if len(dtypes) > 1:
-            dtype = infos[0].grad_reduce_dtype
-        else:
-            dtype = dtypes.pop() if dtypes else params[0].dtype
-        self.reduce_grads(
-            [
-                torch.zeros(param.shape, dtype=dtype, device=param.device)
-                if grad is None
-                else grad.to(dtype)
-                for grad, param in zip(grads, params, strict=True)
-            ],
-            infos,
-            sharded_params,
-        )
+        # with the unsharded params, in the dtype autograd would produce, as
+        # FSDP2's unsharded_zero_grad_data does.
+        grads = [
+            torch.zeros(
+                param.shape, dtype=param.grad_dtype or param.dtype, device=param.device
+            )
+            if grad is None
+            else grad
+            for grad, param in zip(grads, params, strict=True)
+        ]
+        # Per-parameter grad dtypes meet in the bucket's reduce dtype in the
+        # placement's copy-in, which casts as it copies, rather than one cast
+        # kernel per param here.
+        self.reduce_grads(grads, infos, sharded_params)
 
     # ------------------------------------------------------------------
     # Forward hooks
@@ -924,11 +922,8 @@ class _BucketUnshard(torch.autograd.Function):
             trainable = [ctx.needs_input_grad[idx + 1] for idx in indices]
             infos = _promote_reduce_dtype_over_grads(grads, infos, trainable)
             # Compile does not declare output grad dtypes, so grads arrive in
-            # each output's dtype; the reduce-scatter copy-in needs one.
-            grads = [
-                grad.to(info.grad_reduce_dtype)
-                for grad, info in zip(grads, infos, strict=True)
-            ]
+            # each output's dtype; the reduce-scatter copy-in casts them to the
+            # bucket's reduce dtype as it copies.
             sharded_grads = begin_reduce_grad(
                 grads,
                 infos,
