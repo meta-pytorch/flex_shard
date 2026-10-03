@@ -318,21 +318,6 @@ class TestFlexShardEagerRuntime(TestCase):
                 # grads have landed.
                 model.layers[1].weight.requires_grad_(False)
                 reference.layers[1].weight.requires_grad_(False)
-            if step == 2:
-                # A backward that raises drops FlexShard's final callback; the
-                # next forward, or reshard(), recovers and drops its partial
-                # grads.
-                def fail(grad):
-                    raise RuntimeError("injected backward failure")
-
-                handle = model.layers[1].register_forward_hook(
-                    lambda module, args, output: output.register_hook(fail) and None
-                )
-                with self.assertRaisesRegex(RuntimeError, "injected backward failure"):
-                    model(x).sum().backward()
-                handle.remove()
-                if not reshard_after_forward:
-                    model.reshard()
             optim.zero_grad()
             ref_optim.zero_grad()
             loss = model(x).sum()
@@ -366,7 +351,7 @@ class TestFlexShardEagerRuntime(TestCase):
                 )
             )
             self.assertTrue(all(b.untyped_storage().size() == 0 for b in buffers))
-        self.assertEqual(head_resharded, [True] * 4)
+        self.assertEqual(head_resharded, [True] * 3)
         self.assertTrue(all(weight is persistent[0] for weight in seen_weights))
         self.assertEqual(persistent[0].custom_tag, "kept")
         with torch.inference_mode():
@@ -374,6 +359,21 @@ class TestFlexShardEagerRuntime(TestCase):
         model(x)  # a forward whose backward will not run
         model.reshard()
         self.assertTrue(all(b.untyped_storage().size() == 0 for b in buffers))
+
+        # FlexShard does not recover from errors: after a backward that raises
+        # partway, the next forward and reshard() raise too.
+        def fail(grad):
+            raise RuntimeError("injected backward failure")
+
+        model.layers[1].register_forward_hook(
+            lambda module, args, output: output.register_hook(fail) and None
+        )
+        with self.assertRaisesRegex(RuntimeError, "injected backward failure"):
+            model(x).sum().backward()
+        with self.assertRaisesRegex(RuntimeError, "a previous backward raised"):
+            model(x)
+        with self.assertRaisesRegex(RuntimeError, "a previous backward raised"):
+            model.reshard()
 
     def test_reshard_after_forward_holds_one_bucket(self):
         # Each bucket is freed before the next one is re-gathered, in forward

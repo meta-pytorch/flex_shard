@@ -269,9 +269,9 @@ reshards, so the optimizer step never leaves stale unsharded parameters. Both
 are eager-only. Like FSDP2's per-module setters, both also exist per bucket,
 on the entries of `model.sharded_bucket_storages` (one per non-empty
 `BucketSpec`, in order). For example, a model can keep reduce-scattering expert
-buckets whose full gradients would be large. A backward that raises drops the
-gradients accumulated so far on that rank, since they mix with its partial
-ones.
+buckets whose full gradients would be large. FlexShard does not recover from errors:
+after a backward that raises, the next forward or `model.reshard()` raises too,
+and training has to restart.
 
 A regular FlexShard `state_dict()` contains rank-local shards. It is not a
 gathered model checkpoint. Existing FSDP2 checkpoint code needs an explicit

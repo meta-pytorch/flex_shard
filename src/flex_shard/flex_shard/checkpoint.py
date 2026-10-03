@@ -36,13 +36,7 @@ def get_flex_shard_global_layouts(module: nn.Module) -> dict[str, GlobalLayout]:
     for prefix, storage in storages:
         rank, world_size = storage._mesh.get_local_rank(), storage._mesh.size()
         for fqn, info in storage.param_infos.items():
-            name = f"{prefix}.{fqn}" if prefix else fqn
-            try:
-                layout = info.placement.global_layout(info, rank, world_size)
-            except NotImplementedError as e:
-                raise NotImplementedError(
-                    f"Distributed checkpointing is not supported for {name!r}: {e}"
-                ) from e
+            layout = info.placement.global_layout(info, rank, world_size)
             if info.outer_layout is not None:
                 layout = compose_global_layouts(info.outer_layout, layout)
             # ``state_dict()`` lists every name of a shared parameter, each as
