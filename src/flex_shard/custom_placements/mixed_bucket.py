@@ -13,7 +13,6 @@ from typing import Any, TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from ..flex_shard.bucket_storage import gradient_reduce_op_from_infos
 from ..flex_shard.placement_contract import (
     BucketParamStorageLayout,
     BucketStorageLayout,
@@ -33,11 +32,13 @@ from .block_shard import BlockShard
 from .fp8_bucketed_block_shard import _align_up, _VEC_ALIGN_BYTES, Fp8BucketedBlockShard
 from .owned import BucketedOwned
 from .shard import Shard
+from .utils import reduce_scatter_grads
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
     from ..flex_shard.bucket_storage import ParamInfo
+    from ..flex_shard.placement_contract import GradientReduction
 
 
 @dataclass(frozen=True)
@@ -98,7 +99,6 @@ class _MixedReduceGradState:
     row_numel: int
     pg: Any
     debug_fqn: str | None
-    gradient_reduce_op: dist.ReduceOp
 
 
 class _MixedBucketMember:
@@ -168,8 +168,9 @@ class _MixedBucketMember:
     def reduce_prepared_grad(
         self,
         prepared: PlacementPreparedReduceGrad,
+        reduction: GradientReduction,
     ) -> PlacementReduceGradResult:
-        return self._mixed_bucket.reduce_prepared_grad(prepared)
+        return self._mixed_bucket.reduce_prepared_grad(prepared, reduction)
 
 
 class _MixedShard0(_MixedBucketMember, Shard):
@@ -694,13 +695,13 @@ class MixedBucketPlacement(Placement):
                 row_numel=row_numel,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
-                gradient_reduce_op=gradient_reduce_op_from_infos(infos),
             ),
         )
 
     def reduce_prepared_grad(
         self,
         prepared: PlacementPreparedReduceGrad,
+        reduction: GradientReduction,
     ) -> PlacementReduceGradResult:
         if not isinstance(prepared.placement_state, _MixedReduceGradState):
             raise AssertionError(
@@ -718,12 +719,7 @@ class MixedBucketPlacement(Placement):
             "FlexShard::mixed_reduce_scatter",
             state.debug_fqn,
         ):
-            dist.reduce_scatter_tensor(
-                output=recv,
-                input=send,
-                op=state.gradient_reduce_op,
-                group=state.pg,
-            )
+            reduce_scatter_grads(recv, send, reduction, state.pg)
             for group in state.groups:
                 _release_group_scratch_lease(group.prepared)
 

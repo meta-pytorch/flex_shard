@@ -146,6 +146,18 @@ class FlexShardModule:
         for bucket_storage in self._bucket_storages(recurse):
             bucket_storage.set_gradient_reduce_op(op)
 
+    def set_gradient_divide_factor(
+        self,
+        factor: float | None,
+        *,
+        recurse: bool = True,
+    ) -> None:
+        """Set what ``AVG`` divides this module's FlexShard buckets' summed
+        gradients by, like FSDP2's ``set_gradient_divide_factor``. None restores
+        the default, each bucket's mesh size."""
+        for bucket_storage in self._bucket_storages(recurse):
+            bucket_storage.set_gradient_divide_factor(factor)
+
     def set_requires_gradient_sync(
         self,
         requires_gradient_sync: bool,

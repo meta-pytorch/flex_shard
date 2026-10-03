@@ -15,7 +15,6 @@ import torch.distributed as dist
 import torch.nn as nn
 from typing_extensions import override
 
-from ..flex_shard.bucket_storage import gradient_reduce_op_from_infos, GradientReduceOp
 from ..flex_shard.placement_contract import (
     BucketParamStorageLayout,
     BucketStorageLayout,
@@ -33,10 +32,10 @@ from ..flex_shard.utils import (
     _record_function_if_eager,
 )
 from .utils import (
-    _to_dist_reduce_op,
     copy_tensor_to_dtype,
     foreach_copy_,
     pack_tensors_into_flat_buffer_with_scratch,
+    reduce_scatter_grads,
 )
 
 if TYPE_CHECKING:
@@ -48,6 +47,7 @@ if TYPE_CHECKING:
         ParamInfo,
         PlacementFn,
     )
+    from ..flex_shard.placement_contract import GradientReduction
 
 
 def _unsharded_dtype(info: ParamInfo) -> torch.dtype:
@@ -92,7 +92,6 @@ class BlockShard(Placement):
         layout: BlockShard._PaddedBucketLayout
         pg: Any
         debug_fqn: str | None
-        gradient_reduce_op: GradientReduceOp
 
     def __init__(self, blocks_per_rank: tuple[int, ...], dim: int = 0) -> None:
         # Type annotations are not enforced at runtime, and bool subclasses int.
@@ -468,7 +467,6 @@ class BlockShard(Placement):
                 layout=layout,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
-                gradient_reduce_op=gradient_reduce_op_from_infos(infos),
             ),
         )
 
@@ -476,6 +474,7 @@ class BlockShard(Placement):
     def reduce_prepared_grad(
         self,
         prepared: PlacementPreparedReduceGrad,
+        reduction: GradientReduction,
     ) -> PlacementReduceGradResult:
         if not isinstance(prepared.placement_state, BlockShard._ReduceGradState):
             raise AssertionError(
@@ -493,12 +492,7 @@ class BlockShard(Placement):
             "FlexShard::post_backward_reduce",
             state.debug_fqn,
         ):
-            dist.reduce_scatter_tensor(
-                output=recv_buf,
-                input=send_buf,
-                op=_to_dist_reduce_op(state.gradient_reduce_op),
-                group=state.pg,
-            )
+            reduce_scatter_grads(recv_buf, send_buf, reduction, state.pg)
         with _record_function_if_eager(
             "FlexShard::reduce_scatter_copy_out",
             state.debug_fqn,
@@ -536,7 +530,6 @@ class BucketedBlockShard(Placement):
         pg: Any
         debug_fqn: str | None
         padded_segment_numel: int
-        gradient_reduce_op: GradientReduceOp
 
     def __init__(
         self,
@@ -1047,7 +1040,6 @@ class BucketedBlockShard(Placement):
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
                 padded_segment_numel=padded_segment_numel,
-                gradient_reduce_op=gradient_reduce_op_from_infos(infos),
             ),
         )
 
@@ -1055,6 +1047,7 @@ class BucketedBlockShard(Placement):
     def reduce_prepared_grad(
         self,
         prepared: PlacementPreparedReduceGrad,
+        reduction: GradientReduction,
     ) -> PlacementReduceGradResult:
         if not isinstance(
             prepared.placement_state, BucketedBlockShard._ReduceGradState
@@ -1074,12 +1067,7 @@ class BucketedBlockShard(Placement):
             "FlexShard::post_backward_reduce",
             state.debug_fqn,
         ):
-            dist.reduce_scatter_tensor(
-                output=recv_buf,
-                input=send_buf,
-                op=_to_dist_reduce_op(state.gradient_reduce_op),
-                group=state.pg,
-            )
+            reduce_scatter_grads(recv_buf, send_buf, reduction, state.pg)
 
         with _record_function_if_eager(
             "FlexShard::reduce_scatter_copy_out",
