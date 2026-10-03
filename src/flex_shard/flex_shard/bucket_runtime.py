@@ -628,11 +628,11 @@ class BucketRuntime:
             unsharded_param = nn.Parameter(
                 full_param, requires_grad=bucket_param.sharded_param.requires_grad
             )
+            for name, value in bucket_param.param_info.param_attrs.items():
+                setattr(unsharded_param, name, value)
             # Like FSDP2's unsharded_param.grad_dtype: autograd casts each
             # incoming grad before accumulating multiple uses.
             unsharded_param.grad_dtype = bucket_param.param_info.unsharded_grad_dtype
-            for name, value in bucket_param.param_info.param_attrs.items():
-                setattr(unsharded_param, name, value)
             unsharded_params.append(unsharded_param)
         self.unsharded_params = unsharded_params
         self.persistent_buffers = list(persistent_buffers)
@@ -714,6 +714,7 @@ class BucketRuntime:
         self.needs_sync = False
         grads: list[torch.Tensor | None] = []
         params: list[nn.Parameter] = []
+        zero_dtypes: list[torch.dtype] = []
         infos: list[ParamInfo] = []
         sharded_params: list[nn.Parameter] = []
         for bucket_param, unsharded_param in zip(
@@ -725,30 +726,33 @@ class BucketRuntime:
                 continue
             grads.append(grad)
             params.append(unsharded_param)
+            # The dtype a real grad arrives in: its grad_dtype, else (None) the
+            # forward dtype.
+            zero_dtypes.append(unsharded_param.grad_dtype or unsharded_param.dtype)
             infos.append(bucket_param.param_info)
             sharded_params.append(bucket_param.sharded_param)
         if self.is_unsharded:
             self.reshard()
         if not grads:
             return
-        # Zeros fill missing grads after resharding, so they never coexist
-        # with the unsharded params, in the dtype the param accumulates in (its
-        # forward dtype if it accepts any).
-        grads = [
-            torch.zeros(
-                param.shape,
-                dtype=info.unsharded_grad_dtype or info.unsharded_dtype,
-                device=param.device,
-            )
-            if grad is None
-            else grad
-            for grad, param, info in zip(grads, params, infos, strict=True)
-        ]
-        # Per-parameter grad dtypes meet in the bucket's promoted reduce dtype.
-        # The placement's copy-in casts to it, fused with the copy, rather
-        # than one cast kernel per param here.
+        # Promote over the real grads before the zeros exist, so zeros never
+        # pick the reduce dtype.
         infos = _promote_reduce_dtype_over_grads(grads, infos)
-        self.reduce_grads(grads, infos, sharded_params)
+        # Zeros fill missing grads after resharding, so they never coexist
+        # with the unsharded params, in the dtype a real grad would arrive in
+        # on a rank that used the param. Per-parameter grad dtypes meet in the
+        # bucket's reduce dtype in the placement's copy-in, which casts as it
+        # copies, rather than one cast kernel per param here.
+        self.reduce_grads(
+            [
+                torch.zeros(param.shape, dtype=dtype, device=param.device)
+                if grad is None
+                else grad
+                for grad, param, dtype in zip(grads, params, zero_dtypes, strict=True)
+            ],
+            infos,
+            sharded_params,
+        )
 
     # ------------------------------------------------------------------
     # Forward hooks
@@ -918,11 +922,12 @@ class _BucketUnshard(torch.autograd.Function):
             infos.append(info)
             indices.append(idx)
         if grads:
-            # Per-parameter grad dtypes meet in the bucket's promoted reduce
-            # dtype, which the placement's copy-in casts to. Dynamo cannot
-            # trace set_output_grad_dtype, so unlike eager, a param used more
-            # than once accumulates in its forward dtype.
-            infos = _promote_reduce_dtype_over_grads(grads, infos)
+            # Frozen outputs still get zero grads, which eager never sees.
+            trainable = [ctx.needs_input_grad[idx + 1] for idx in indices]
+            infos = _promote_reduce_dtype_over_grads(grads, infos, trainable)
+            # Compile does not declare output grad dtypes, so grads arrive in
+            # each output's dtype; the reduce-scatter copy-in casts them to the
+            # bucket's reduce dtype as it copies.
             sharded_grads = begin_reduce_grad(
                 grads,
                 infos,
@@ -938,26 +943,41 @@ class _BucketUnshard(torch.autograd.Function):
 
 
 def _promote_reduce_dtype_over_grads(
-    grads: list[torch.Tensor],
+    grads: list[torch.Tensor | None],
     infos: list[ParamInfo],
+    trainable: list[bool] | None = None,
 ) -> list[ParamInfo]:
-    """Promote the bucket reduce dtype over this backward's grads."""
-    if not any(
-        info.requires_grad and info.unsharded_grad_dtype is None for info in infos
-    ):
+    """Promote the bucket reduce dtype over this backward's grads.
+
+    Only params requiring grad now count, which may differ from
+    ``ParamInfo.requires_grad`` at wrap time; ``trainable`` marks them
+    (default: all). Every returned info gets the promoted dtype.
+    """
+    if trainable is None:
+        trainable = [True] * len(infos)
+    kept = [
+        (grad, info)
+        for grad, info, keep in zip(grads, infos, trainable, strict=True)
+        if keep
+    ]
+    if not kept:
         return infos
-    # Nothing checks that ranks agree. Grads arriving in different dtypes,
-    # including an unused param's zero grad in the forward dtype, make ranks
-    # reduce in different dtypes.
+    # Only widens the wrap-time dtype, so it still covers params frozen since
+    # wrap. Nothing checks that ranks agree: grads arriving in different
+    # dtypes on different ranks make them reduce in different dtypes. A
+    # missing grad counts in the unsharded dtype, in which grads normally
+    # arrive.
     reduce_dtype = functools.reduce(
         torch.promote_types,
         (
-            info.unsharded_grad_dtype or grad.dtype
-            for grad, info in zip(grads, infos, strict=True)
-            if info.requires_grad
+            info.unsharded_grad_dtype
+            or (info.unsharded_dtype if grad is None else grad.dtype)
+            for grad, info in kept
         ),
+        # Without trainable params at wrap, each info has its own dtype.
+        kept[0][1].grad_reduce_dtype,
     )
-    if reduce_dtype == infos[0].grad_reduce_dtype:
+    if all(info.grad_reduce_dtype == reduce_dtype for info in infos):
         return infos
     # ParamInfo is shared bucket metadata; this dtype holds for one backward.
     return [replace(info, bucket_reduce_dtype=reduce_dtype) for info in infos]

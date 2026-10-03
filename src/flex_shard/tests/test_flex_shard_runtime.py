@@ -447,6 +447,28 @@ class TestFlexShardEagerRuntime(TestCase):
             self.assertIn("_c10d_functional.reduce_scatter_tensor", subgraph_targets)
             self.assertIn("_c10d_functional.wait_tensor", subgraph_targets)
 
+    def test_torch_compile_frozen_params_do_not_widen_reduce_dtype(self):
+        with single_rank_cuda_mesh() as mesh:
+            model = nn.Sequential(
+                nn.Linear(8, 8, bias=False),
+                nn.Linear(8, 8, bias=False),
+            ).to(device="cuda", dtype=torch.bfloat16)
+            # Explicit None stores the reduced grad in the reduce dtype.
+            model[0].weight.grad_dtype = None
+            model[1].weight.grad_dtype = torch.float32
+            model[1].weight.requires_grad_(False)
+            flex_shard_cuda(model, mesh)
+            compiled_model = torch.compile(model, backend="eager", fullgraph=True)
+
+            x = torch.ones(2, 8, dtype=torch.bfloat16, device="cuda")
+            compiled_model(x).float().sum().backward()
+
+            # Compile backward gets the frozen param's zero grad; like eager,
+            # its fp32 grad_dtype does not widen the bucket's bf16.
+            params = dict(model.named_parameters())
+            self.assertIsNone(params["1.weight"].grad)
+            self.assertEqual(params["0.weight"].grad.dtype, torch.bfloat16)
+
 
 if __name__ == "__main__":
     run_tests()

@@ -154,10 +154,11 @@ class FlexShardModule:
         """Set whether backward reduce-scatters gradients, like FSDP2's.
 
         With ``False``, backward keeps each bucket's full gradients on its
-        unsharded params and later backwards accumulate into them, in each
-        param's gradient accumulation dtype (see ``MixedPrecisionPolicy``). The
-        next backward with ``True`` reduce-scatters the accumulated gradients,
-        also for buckets it does not use. A backward that raises drops the
+        unsharded params and later backwards accumulate into them, in
+        ``MixedPrecisionPolicy.reduce_dtype`` if set and otherwise as each
+        param's ``grad_dtype`` specifies (its dtype if unset). The next
+        backward with ``True`` reduce-scatters the accumulated gradients, also
+        for buckets it does not use. A backward that raises drops the
         gradients accumulated so far on that rank, since they mix with its
         partial ones.
         It applies to the backwards after the call, e.g.
