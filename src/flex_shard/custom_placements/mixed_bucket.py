@@ -13,7 +13,10 @@ from typing import Any, TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from ..flex_shard.bucket_storage import gradient_reduce_op_from_infos
+from ..flex_shard.bucket_storage import (
+    gradient_divide_factor_from_infos,
+    gradient_reduce_op_from_infos,
+)
 from ..flex_shard.placement_contract import (
     BucketParamStorageLayout,
     BucketStorageLayout,
@@ -33,6 +36,7 @@ from .block_shard import BlockShard
 from .fp8_bucketed_block_shard import _align_up, _VEC_ALIGN_BYTES, Fp8BucketedBlockShard
 from .owned import BucketedOwned
 from .shard import Shard
+from .utils import reduce_scatter_grads
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -99,6 +103,7 @@ class _MixedReduceGradState:
     pg: Any
     debug_fqn: str | None
     gradient_reduce_op: dist.ReduceOp
+    gradient_divide_factor: float | None
 
 
 class _MixedBucketMember:
@@ -695,6 +700,7 @@ class MixedBucketPlacement(Placement):
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
                 gradient_reduce_op=gradient_reduce_op_from_infos(infos),
+                gradient_divide_factor=gradient_divide_factor_from_infos(infos),
             ),
         )
 
@@ -719,11 +725,12 @@ class MixedBucketPlacement(Placement):
             state.debug_fqn,
         ):
             try:
-                dist.reduce_scatter_tensor(
-                    output=recv,
-                    input=send,
-                    op=state.gradient_reduce_op,
-                    group=state.pg,
+                reduce_scatter_grads(
+                    recv,
+                    send,
+                    state.gradient_reduce_op,
+                    state.gradient_divide_factor,
+                    state.pg,
                 )
             finally:
                 for group in state.groups:

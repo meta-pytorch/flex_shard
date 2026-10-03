@@ -27,14 +27,15 @@ from ..flex_shard.placement_contract import (
 )
 from ..flex_shard.utils import _record_comm_if_eager, _record_function_if_eager
 from .utils import (
-    _to_dist_reduce_op,
     copy_tensor_to_dtype,
     foreach_copy_,
     pack_tensors_into_flat_buffer_with_scratch,
+    reduce_scatter_grads,
 )
 
 try:
     from ..flex_shard.bucket_storage import (
+        gradient_divide_factor_from_infos,
         gradient_reduce_op_from_infos,
         GradientReduceOp,
     )
@@ -44,6 +45,10 @@ except ImportError:
     def gradient_reduce_op_from_infos(infos: list[ParamInfo]) -> GradientReduceOp:
         _ = infos
         return "avg"
+
+    def gradient_divide_factor_from_infos(infos: list[ParamInfo]) -> float | None:
+        _ = infos
+        return None
 
 
 try:
@@ -111,6 +116,7 @@ class BlockShard(Placement):
         pg: Any
         debug_fqn: str | None
         gradient_reduce_op: GradientReduceOp
+        gradient_divide_factor: float | None
 
     def __init__(self, blocks_per_rank: tuple[int, ...], dim: int = 0) -> None:
         # Type annotations are not enforced at runtime, and bool subclasses int.
@@ -487,6 +493,7 @@ class BlockShard(Placement):
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
                 gradient_reduce_op=gradient_reduce_op_from_infos(infos),
+                gradient_divide_factor=gradient_divide_factor_from_infos(infos),
             ),
         )
 
@@ -511,11 +518,12 @@ class BlockShard(Placement):
             "FlexShard::post_backward_reduce",
             state.debug_fqn,
         ):
-            dist.reduce_scatter_tensor(
-                output=recv_buf,
-                input=send_buf,
-                op=_to_dist_reduce_op(state.gradient_reduce_op),
-                group=state.pg,
+            reduce_scatter_grads(
+                recv_buf,
+                send_buf,
+                state.gradient_reduce_op,
+                state.gradient_divide_factor,
+                state.pg,
             )
         with _record_function_if_eager(
             "FlexShard::reduce_scatter_copy_out",
@@ -555,6 +563,7 @@ class BucketedBlockShard(Placement):
         debug_fqn: str | None
         padded_segment_numel: int
         gradient_reduce_op: GradientReduceOp
+        gradient_divide_factor: float | None
 
     def __init__(
         self,
@@ -1066,6 +1075,7 @@ class BucketedBlockShard(Placement):
                 debug_fqn=debug_fqn,
                 padded_segment_numel=padded_segment_numel,
                 gradient_reduce_op=gradient_reduce_op_from_infos(infos),
+                gradient_divide_factor=gradient_divide_factor_from_infos(infos),
             ),
         )
 
@@ -1092,11 +1102,12 @@ class BucketedBlockShard(Placement):
             "FlexShard::post_backward_reduce",
             state.debug_fqn,
         ):
-            dist.reduce_scatter_tensor(
-                output=recv_buf,
-                input=send_buf,
-                op=_to_dist_reduce_op(state.gradient_reduce_op),
-                group=state.pg,
+            reduce_scatter_grads(
+                recv_buf,
+                send_buf,
+                state.gradient_reduce_op,
+                state.gradient_divide_factor,
+                state.pg,
             )
 
         with _record_function_if_eager(

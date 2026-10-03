@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fnmatch
 import functools
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, TYPE_CHECKING
@@ -57,6 +58,36 @@ def gradient_reduce_op_from_infos(infos: list[ParamInfo]) -> GradientReduceOp:
                 f"uses {info.gradient_reduce_op!r}."
             )
     return op
+
+
+def gradient_divide_factor_from_infos(infos: list[ParamInfo]) -> float | None:
+    if not infos:
+        raise AssertionError("Expected at least one ParamInfo.")
+    factor = infos[0].gradient_divide_factor
+    for info in infos[1:]:
+        if info.gradient_divide_factor != factor:
+            raise ValueError(
+                "FlexShard requires one gradient_divide_factor per communication "
+                f"bucket, but {infos[0].fqn!r} uses {factor!r} and {info.fqn!r} "
+                f"uses {info.gradient_divide_factor!r}."
+            )
+    return factor
+
+
+def _check_gradient_divide_factor(
+    op: GradientReduceOp, factor: float | None
+) -> None:
+    if factor is None:
+        return
+    if not math.isfinite(factor) or factor <= 0:
+        raise ValueError(
+            f"gradient_divide_factor must be a positive number, got {factor!r}."
+        )
+    if op == dist.ReduceOp.SUM:
+        raise ValueError(
+            "gradient_divide_factor requires gradient_reduce_op=AVG; SUM does not "
+            "divide gradients."
+        )
 
 
 @dataclass(frozen=True)
@@ -184,6 +215,13 @@ class BucketSpec:
             preserves FlexShard's historical average-gradient behavior.
             ``dist.ReduceOp.SUM`` matches FSDP2's no-gradient-division mode,
             where the training loop owns global gradient scaling.
+        gradient_divide_factor: With ``gradient_reduce_op=AVG``, the reduced
+            gradient is the sum over ``mesh`` divided by this factor, which
+            defaults to the mesh size; like FSDP2's
+            ``set_gradient_divide_factor``. For example, with expert parallelism
+            an expert's gradient already includes tokens routed from its
+            expert-parallel peers, so an expert bucket on the expert
+            data-parallel mesh divides by the dense data-parallel size.
         reshard_after_forward: Whether to free this bucket's unsharded
             parameters after forward and re-gather them before backward. This
             defaults to True. Under ``torch.compile`` the traced graph owns
@@ -207,6 +245,7 @@ class BucketSpec:
     mp_policy: MixedPrecisionPolicy | None = None
     offload_policy: OffloadPolicy | None = None
     gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG
+    gradient_divide_factor: float | None = None
     reshard_after_forward: bool = True
     pre_backward_hook: BucketHook | None = None
     post_reduce_hook: BucketHook | None = None
@@ -244,6 +283,7 @@ class ParamInfo:
     param_dtype: torch.dtype | None = None
     reduce_dtype: torch.dtype | None = None
     gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG
+    gradient_divide_factor: float | None = None
     local_shape: torch.Size = field(default_factory=lambda: torch.Size([]))
     local_numel: int = 0
     byte_offset: int = 0  # byte offset into the sharded storage
@@ -319,6 +359,7 @@ class ShardedBucketStorage:
         gradient_reduce_op: GradientReduceOp = dist.ReduceOp.AVG,
         pre_backward_hook: BucketHook | None = None,
         post_reduce_hook: BucketHook | None = None,
+        gradient_divide_factor: float | None = None,
     ) -> None:
         if byte_storage.dtype != torch.uint8:
             raise ValueError(f"Expected uint8 storage, got {byte_storage.dtype}")
@@ -333,9 +374,12 @@ class ShardedBucketStorage:
         # See set_requires_gradient_sync and set_reshard_after_backward.
         self._requires_gradient_sync = True
         self._reshard_after_backward = True
+        _check_gradient_divide_factor(gradient_reduce_op, gradient_divide_factor)
         self._gradient_reduce_op = gradient_reduce_op
+        self._gradient_divide_factor = gradient_divide_factor
         for info in self._param_infos.values():
             info.gradient_reduce_op = self._gradient_reduce_op
+            info.gradient_divide_factor = self._gradient_divide_factor
 
     @classmethod
     def from_bucket(
@@ -381,6 +425,7 @@ class ShardedBucketStorage:
             gradient_reduce_op=bucket_spec.gradient_reduce_op,
             pre_backward_hook=bucket_spec.pre_backward_hook,
             post_reduce_hook=bucket_spec.post_reduce_hook,
+            gradient_divide_factor=bucket_spec.gradient_divide_factor,
         )
         bucket_storage.copy_params_from(named_params)
         bucket_storage.install_sharded_params(expected_param_device)
@@ -725,9 +770,23 @@ class ShardedBucketStorage:
 
     def set_gradient_reduce_op(self, op: GradientReduceOp) -> None:
         """Set gradient reduction semantics for this bucket and its params."""
+        _check_gradient_divide_factor(op, self._gradient_divide_factor)
         self._gradient_reduce_op = op
         for info in self._param_infos.values():
             info.gradient_reduce_op = op
+
+    @property
+    def gradient_divide_factor(self) -> float | None:
+        """What ``AVG`` divides this bucket's summed gradients by; None means the
+        mesh size."""
+        return self._gradient_divide_factor
+
+    def set_gradient_divide_factor(self, factor: float | None) -> None:
+        """Set what ``AVG`` divides this bucket's summed gradients by."""
+        _check_gradient_divide_factor(self._gradient_reduce_op, factor)
+        self._gradient_divide_factor = factor
+        for info in self._param_infos.values():
+            info.gradient_divide_factor = factor
 
     def set_requires_gradient_sync(self, requires_gradient_sync: bool) -> None:
         """Set whether backward reduce-scatters this bucket's gradients.
