@@ -66,7 +66,8 @@ class MixedPrecisionPolicy:
         reduce_dtype: Dtype for autograd accumulation and gradient
             reduction. Eager casts each full-parameter gradient to this dtype
             before it accumulates on the unsharded parameter; torch.compile
-            casts the accumulated gradient before reduction. If None, each parameter accumulates in its ``grad_dtype`` (its
+            casts the accumulated gradient in the reduce-scatter copy-in. If
+            None, each parameter accumulates in its ``grad_dtype`` (its
             dtype unless explicitly set), independent of param_dtype, and
             each bucket reduces in the promoted accumulation dtype of its
             parameters trainable at wrap time, widened in each backward by

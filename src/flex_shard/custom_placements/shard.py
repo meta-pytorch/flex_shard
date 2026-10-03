@@ -366,7 +366,12 @@ class Shard(Placement):
         input_numel = sum(s.numel() for s in padded_sizes)
         send_buf = torch.empty(input_numel, dtype=dtype, device=device)
         send_buf_2d = send_buf.view(world_size, -1)
-        torch._chunk_cat(tensors, dim=self.dim, num_chunks=world_size, out=send_buf_2d)
+        # Grads may differ in dtype (per-parameter grad_dtype). The copy-in
+        # casts each to the reduce dtype as it copies, one fused kernel for
+        # CUDA bf16 + fp32 (fsdp::chunk_cat_mixed_dtype, pytorch/pytorch#194434).
+        torch.ops.fsdp.chunk_cat_mixed_dtype(
+            tensors, dim=self.dim, num_chunks=world_size, out=send_buf_2d
+        )
         return send_buf, Shard._ReduceGradLayout(padded_sizes)
 
     def _unpack_reduce_scatter_grad(
