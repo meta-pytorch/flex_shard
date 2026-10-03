@@ -273,6 +273,14 @@ buckets whose full gradients would be large. FlexShard does not recover from err
 after a backward that raises, the next forward or `model.reshard()` raises too,
 and training has to restart.
 
+To reduce-scatter the accumulated gradients outside a backward, turn sync back
+on and call `model.finalize_backward()`, as with FSDP2. With
+`async_op=True` it returns a handle without waiting; call its `wait()` before
+the optimizer step or the next forward. A pipeline stage can then reduce its
+last microbatch's gradients while other stages still compute.
+`model.set_manual_backward_finalization(True)` goes further: backwards finish
+nothing at their end, and `finalize_backward()` does it once per step.
+
 A regular FlexShard `state_dict()` contains rank-local shards. It is not a
 gathered model checkpoint. Existing FSDP2 checkpoint code needs an explicit
 compatibility check or conversion, even when the parameter split agrees.
