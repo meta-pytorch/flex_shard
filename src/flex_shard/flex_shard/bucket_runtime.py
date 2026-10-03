@@ -714,7 +714,6 @@ class BucketRuntime:
         self.needs_sync = False
         grads: list[torch.Tensor | None] = []
         params: list[nn.Parameter] = []
-        zero_dtypes: list[torch.dtype] = []
         infos: list[ParamInfo] = []
         sharded_params: list[nn.Parameter] = []
         for bucket_param, unsharded_param in zip(
@@ -726,9 +725,6 @@ class BucketRuntime:
                 continue
             grads.append(grad)
             params.append(unsharded_param)
-            # The dtype a real grad arrives in: its grad_dtype, else (None) the
-            # forward dtype.
-            zero_dtypes.append(unsharded_param.grad_dtype or unsharded_param.dtype)
             infos.append(bucket_param.param_info)
             sharded_params.append(bucket_param.sharded_param)
         if self.is_unsharded:
@@ -739,20 +735,20 @@ class BucketRuntime:
         # pick the reduce dtype.
         infos = _promote_reduce_dtype_over_grads(grads, infos)
         # Zeros fill missing grads after resharding, so they never coexist
-        # with the unsharded params, in the dtype a real grad would arrive in
-        # on a rank that used the param. Per-parameter grad dtypes meet in the
-        # bucket's reduce dtype in the placement's copy-in, which casts as it
-        # copies, rather than one cast kernel per param here.
-        self.reduce_grads(
-            [
-                torch.zeros(param.shape, dtype=dtype, device=param.device)
-                if grad is None
-                else grad
-                for grad, param, dtype in zip(grads, params, zero_dtypes, strict=True)
-            ],
-            infos,
-            sharded_params,
-        )
+        # with the unsharded params, in the dtype autograd would produce, as
+        # FSDP2's unsharded_zero_grad_data does.
+        grads = [
+            torch.zeros(
+                param.shape, dtype=param.grad_dtype or param.dtype, device=param.device
+            )
+            if grad is None
+            else grad
+            for grad, param in zip(grads, params, strict=True)
+        ]
+        # Per-parameter grad dtypes meet in the bucket's reduce dtype in the
+        # placement's copy-in, which casts as it copies, rather than one cast
+        # kernel per param here.
+        self.reduce_grads(grads, infos, sharded_params)
 
     # ------------------------------------------------------------------
     # Forward hooks
