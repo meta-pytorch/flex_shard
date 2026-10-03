@@ -170,6 +170,36 @@ class FlexShardModule:
         handle.wait()
         return None
 
+    def finish_deferred_backward(self, param: nn.Parameter) -> None:
+        """Finish the backward of the bucket that holds ``param`` and defers its
+        post-backward (``BucketSpec.defer_post_backward``).
+
+        With gradient sync on, this reduce-scatters the bucket's grads into the
+        local shards and reshards, as its post-backward would have once its
+        module's backward was done; without, the grads stay for the next
+        syncing backward. Call it once the late grads exist, e.g. after
+        TransformerEngine's ``backward_dw()``, inside that backward or before
+        ``finalize_backward``. ``param`` is the local shard or, while the
+        bucket is unsharded, the unsharded param. Calls after the bucket is
+        finished do nothing, so a hook per param may call it. Eager only.
+        """
+        for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
+            for bucket in context.buckets:
+                if not any(
+                    p is param
+                    for p in (*bucket.sharded_params, *(bucket.unsharded_params or ()))
+                ):
+                    continue
+                if not bucket.bucket_storage._defer_post_backward:
+                    raise ValueError(
+                        f"FlexShard: bucket {bucket.debug_fqn} does not defer its "
+                        "post-backward (BucketSpec.defer_post_backward)."
+                    )
+                if bucket.needs_finish():
+                    bucket.post_backward()
+                return
+        raise ValueError("FlexShard: param is not in this module's buckets.")
+
     def _bucket_storages(self, recurse: bool) -> list[ShardedBucketStorage]:
         modules = self.modules() if recurse else [self]
         return [
