@@ -181,18 +181,18 @@ class TestBucketAssignment(TestCase):
     def test_assigns_shared_param_names_to_one_bucket(self):
         """Every name of a shared parameter in one bucket is accepted."""
         fqns = ["tok_embeddings.weight", "norm.weight"]
-        aliases = {"tok_embeddings.weight": ["output.weight"]}
+        shared_names = {"tok_embeddings.weight": ["output.weight"]}
         with single_rank_cpu_mesh() as mesh:
             buckets = self._tied_buckets(
                 mesh, [["tok_embeddings.*", "norm.*", "output.*"]]
             )
-            result = _assign_params_to_buckets(fqns, buckets, aliases)
+            result = _assign_params_to_buckets(fqns, buckets, shared_names)
             self.assertEqual(result[0], ["tok_embeddings.weight", "norm.weight"])
 
     def test_rejects_shared_param_split_across_buckets(self):
         """Names of a shared parameter in different buckets raise, like FSDP2."""
         fqns = ["tok_embeddings.weight", "norm.weight"]
-        aliases = {"tok_embeddings.weight": ["output.weight"]}
+        shared_names = {"tok_embeddings.weight": ["output.weight"]}
         with single_rank_cpu_mesh() as mesh:
             buckets = self._tied_buckets(
                 mesh, [["tok_embeddings.*"], ["norm.*", "output.*"]]
@@ -203,16 +203,16 @@ class TestBucketAssignment(TestCase):
                 r"output\.weight -> bucket 1.*put every name that refers to the "
                 r"parameter in the same BucketSpec",
             ):
-                _assign_params_to_buckets(fqns, buckets, aliases)
+                _assign_params_to_buckets(fqns, buckets, shared_names)
 
     def test_rejects_shared_param_name_without_bucket(self):
         """A shared parameter's name matching no bucket raises too."""
         fqns = ["tok_embeddings.weight", "norm.weight"]
-        aliases = {"tok_embeddings.weight": ["output.weight"]}
+        shared_names = {"tok_embeddings.weight": ["output.weight"]}
         with single_rank_cpu_mesh() as mesh:
             buckets = self._tied_buckets(mesh, [["tok_embeddings.*", "norm.*"]])
             with self.assertRaisesRegex(ValueError, r"output\.weight -> no bucket"):
-                _assign_params_to_buckets(fqns, buckets, aliases)
+                _assign_params_to_buckets(fqns, buckets, shared_names)
 
 
 # ---------------------------------------------------------------------------

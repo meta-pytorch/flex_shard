@@ -260,7 +260,7 @@ class ParamInfo:
     grad_dtype_override: torch.dtype | None = None
     # Other names the parameter is registered under (e.g. tied weights), all in
     # this bucket; each module slot holds the same sharded or unsharded param.
-    alias_fqns: tuple[str, ...] = ()
+    shared_fqns: tuple[str, ...] = ()
     bucket_reduce_dtype: torch.dtype | None = None  # promoted over the bucket
 
     @property
@@ -346,7 +346,7 @@ class ShardedBucketStorage:
         mesh: DeviceMesh,
         device: torch.device,
         bucket_spec: BucketSpec,
-        aliases: dict[str, list[str]] | None = None,
+        shared_names: dict[str, list[str]] | None = None,
     ) -> ShardedBucketStorage:
         """Create storage metadata for one bucket and install sharded params."""
         param_infos, total_bytes = cls.create_param_infos(
@@ -356,9 +356,9 @@ class ShardedBucketStorage:
             bucket_spec.mp_policy,
             bucket_spec.gradient_reduce_op,
         )
-        for fqn, alias_fqns in (aliases or {}).items():
+        for fqn, other_fqns in (shared_names or {}).items():
             if fqn in param_infos:
-                param_infos[fqn].alias_fqns = tuple(alias_fqns)
+                param_infos[fqn].shared_fqns = tuple(other_fqns)
         if bucket_spec.offload_policy is not None:
             byte_storage = torch.empty(
                 total_bytes,
@@ -690,7 +690,7 @@ class ShardedBucketStorage:
                 global_stride=info.global_stride,
                 mesh=self._mesh,
             )
-            for name in (fqn, *info.alias_fqns):
+            for name in (fqn, *info.shared_fqns):
                 _set_param_on_module(self._module, name, new_param)
 
     @property
@@ -759,7 +759,7 @@ class ShardedBucketStorage:
 def _assign_params_to_buckets(
     param_fqns: list[str],
     buckets: list[BucketSpec],
-    aliases: dict[str, list[str]] | None = None,
+    shared_names: dict[str, list[str]] | None = None,
 ) -> BucketParamFQNsByIndex:
     """Assign each param FQN to exactly one bucket via fnmatch.
 
@@ -769,7 +769,7 @@ def _assign_params_to_buckets(
 
     Raises:
         ValueError: if any param matches zero or multiple buckets, or if the
-            names of a shared parameter (``aliases``: first name -> other
+            names of a shared parameter (``shared_names``: first name -> other
             names) match different buckets.
     """
     param_to_buckets: dict[str, list[int]] = {
@@ -803,8 +803,8 @@ def _assign_params_to_buckets(
     # Like FSDP2, which requires one FSDP group per parameter, every name of a
     # shared parameter must match its bucket: the bucket's hooks then sit on a
     # module that contains every use of the parameter.
-    for fqn, alias_fqns in (aliases or {}).items():
-        names = {name: _matching_buckets(name, buckets) for name in (fqn, *alias_fqns)}
+    for fqn, other_fqns in (shared_names or {}).items():
+        names = {name: _matching_buckets(name, buckets) for name in (fqn, *other_fqns)}
         if any(idxs != param_to_buckets[fqn] for idxs in names.values()):
             lines = []
             for name, idxs in names.items():
@@ -813,7 +813,7 @@ def _assign_params_to_buckets(
             matches = "\n".join(lines)
             raise ValueError(
                 f"flex_shard: parameter {fqn!r} is shared with "
-                f"{', '.join(map(repr, alias_fqns))}, but its names match "
+                f"{', '.join(map(repr, other_fqns))}, but its names match "
                 f"different buckets:\n{matches}\n"
                 "For shared/tied parameters, put every name that refers to the "
                 "parameter in the same BucketSpec."

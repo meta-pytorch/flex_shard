@@ -72,14 +72,14 @@ class BucketParam:
     shard used for unshard input and grad writes, captured at runtime install
     and re-read after to_empty(). param_info carries immutable bucket storage and
     placement metadata for collectives. Keeping them together preserves bucket
-    order and avoids repeated FQN resolution in hooks. alias_owners locates the
+    order and avoids repeated FQN resolution in hooks. shared_owners locates the
     other slots of a shared parameter, which swap together with param_owner.
     """
 
     param_owner: ParamOwnerRef
     param_info: ParamInfo
     sharded_param: nn.Parameter
-    alias_owners: tuple[ParamOwnerRef, ...] = ()
+    shared_owners: tuple[ParamOwnerRef, ...] = ()
 
 
 def _in_backward() -> bool:
@@ -431,9 +431,9 @@ class BucketRuntime:
                     sharded_param=param_owner.module._parameters[
                         param_owner.param_name
                     ],
-                    alias_owners=tuple(
-                        ParamOwnerRef.resolve(bucket_storage._module, alias)
-                        for alias in info.alias_fqns
+                    shared_owners=tuple(
+                        ParamOwnerRef.resolve(bucket_storage._module, shared_fqn)
+                        for shared_fqn in info.shared_fqns
                     ),
                 )
             )
@@ -495,7 +495,7 @@ class BucketRuntime:
             [
                 ".".join(fqn.split(".")[:-1])
                 for info in self.infos
-                for fqn in (info.fqn, *info.alias_fqns)
+                for fqn in (info.fqn, *info.shared_fqns)
             ]
         )
         modules = [self.bucket_storage._module]
@@ -667,7 +667,7 @@ class BucketRuntime:
     def _swap_in_params(self, params: list[torch.Tensor]) -> None:
         """Expose ``params`` through their modules' ``_parameters``."""
         for bucket_param, param in zip(self.bucket_params, params, strict=True):
-            for owner in (bucket_param.param_owner, *bucket_param.alias_owners):
+            for owner in (bucket_param.param_owner, *bucket_param.shared_owners):
                 owner.module._parameters[owner.param_name] = param
 
     def reshard(self) -> None:

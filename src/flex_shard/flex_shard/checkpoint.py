@@ -47,8 +47,8 @@ def get_flex_shard_global_layouts(module: nn.Module) -> dict[str, GlobalLayout]:
                 layout = compose_global_layouts(info.outer_layout, layout)
             # ``state_dict()`` lists every name of a shared parameter, each as
             # its own detached tensor, so each name needs the layout.
-            for alias in (fqn, *info.alias_fqns):
-                layouts[f"{prefix}.{alias}" if prefix else alias] = layout
+            for shared_fqn in (fqn, *info.shared_fqns):
+                layouts[f"{prefix}.{shared_fqn}" if prefix else shared_fqn] = layout
     return layouts
 
 

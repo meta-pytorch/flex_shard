@@ -168,7 +168,7 @@ def _get_managed_named_params(
     Collect parameters managed by this root-level flex_shard() call.
 
     A parameter registered under several names (e.g. tied embedding and output
-    weights) is listed once, under its first name; ``_get_param_aliases``
+    weights) is listed once, under its first name; ``_get_shared_param_names``
     returns its other names.
     """
     managed_params: list[tuple[str, nn.Parameter]] = []
@@ -180,15 +180,15 @@ def _get_managed_named_params(
     return managed_params
 
 
-def _get_param_aliases(module: nn.Module) -> dict[str, list[str]]:
+def _get_shared_param_names(module: nn.Module) -> dict[str, list[str]]:
     """Map each shared parameter's first name to its other names."""
     first_names: dict[int, str] = {}
-    aliases: dict[str, list[str]] = {}
+    shared: dict[str, list[str]] = {}
     for fqn, param in module.named_parameters(remove_duplicate=False):
         first_name = first_names.setdefault(id(param), fqn)
         if first_name != fqn:
-            aliases.setdefault(first_name, []).append(fqn)
-    return aliases
+            shared.setdefault(first_name, []).append(fqn)
+    return shared
 
 
 def _validate_flex_shard_mesh(mesh: DeviceMesh) -> None:
