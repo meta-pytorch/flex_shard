@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import cast, TYPE_CHECKING
 
 import torch
@@ -373,7 +373,7 @@ class PreparedFlexShardInputs:
     param_placements: dict[str, tuple[Placement, ...]]
     bucket_assignments: BucketParamFQNsByIndex
     # Shared parameters: first name -> other names, all in the same bucket.
-    param_aliases: dict[str, list[str]]
+    param_aliases: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _materialize_bucket_storages(
