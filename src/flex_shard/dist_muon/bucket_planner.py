@@ -48,7 +48,7 @@ class MatrixBlockGroupSpec:
 
 @dataclass(frozen=True, slots=True)
 class AssignmentGroup:
-    """One bucket's whole matrices, which share its collective, and its block groups."""
+    """Whole matrices and block groups balanced at one ordered step."""
 
     matrices: tuple[WholeMatrixSpec, ...]
     block_groups: tuple[MatrixBlockGroupSpec, ...]
@@ -149,14 +149,57 @@ class _BalancedMatrixAssignment:
         *,
         num_ranks: int,
     ) -> MatrixAssignment:
-        rank_by_matrix = _assign_whole_matrices(groups, num_ranks)
-        rank_loads = [0] * num_ranks
-        for group in groups:
-            for matrix in group.matrices:
-                rank_loads[rank_by_matrix[matrix.name]] += matrix.numel
-
+        rank_by_matrix: dict[str, int] = {}
         blocks_per_rank_by_group: dict[str, tuple[int, ...]] = {}
+        rank_loads = [0] * num_ranks
+
+        # TODO: this balances one group at a time: each group's heaviest slot
+        # goes to the rank least loaded so far, so a group's largest matrix is
+        # never paired with a smaller matrix from another group. With one group
+        # per transformer layer (fc1, qkv, fc2 and proj; 4 layers on 8 ranks),
+        # the most loaded rank holds 1.39x the mean. Megatron-FlexShard's Muon
+        # owners (its #27) place whole matrices from every group at once,
+        # largest first onto the least total, with each rank's share of a group
+        # capped at the group's own balance: 1.06x there. Two gaps before using
+        # that here:
+        # - The cap doesn't bound a packed parameter's per-rank block count, so
+        #   its BlockShard can pad more.
+        # - On random groups it raised the largest total in 20% of cases while
+        #   lowering it in 55%.
         for group in groups:
+            if group.matrices:
+                slot_loads = [0] * num_ranks
+                slot_matrices: list[list[str]] = [[] for _ in range(num_ranks)]
+                slot_heap = [(0, slot) for slot in range(num_ranks)]
+                heapq.heapify(slot_heap)
+                for matrix in sorted(
+                    group.matrices,
+                    key=lambda matrix: matrix.numel,
+                    reverse=True,
+                ):
+                    load, slot = heapq.heappop(slot_heap)
+                    slot_matrices[slot].append(matrix.name)
+                    slot_loads[slot] = load + matrix.numel
+                    heapq.heappush(slot_heap, (load + matrix.numel, slot))
+
+                slots = sorted(
+                    zip(slot_loads, slot_matrices, strict=True),
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+                available_ranks = sorted(
+                    range(num_ranks),
+                    key=lambda rank: (rank_loads[rank], rank),
+                )
+                for (slot_load, matrix_names), rank in zip(
+                    slots,
+                    available_ranks,
+                    strict=True,
+                ):
+                    for matrix_name in matrix_names:
+                        rank_by_matrix[matrix_name] = rank
+                    rank_loads[rank] += slot_load
+
             for block_group in group.block_groups:
                 blocks_per_rank = [0] * len(block_group.eligible_ranks)
                 load_heap = [
@@ -179,87 +222,12 @@ class _BalancedMatrixAssignment:
         )
 
 
-def _assign_whole_matrices(
-    groups: Sequence[AssignmentGroup],
-    num_ranks: int,
-) -> dict[str, int]:
-    """Balance each rank's total over every group's whole matrices.
-
-    Matrices from all groups, largest first, go to the rank with the least
-    total so far. A group's matrices share one collective, which pads every
-    rank's share to the largest, so a rank's share of a group is capped at the
-    largest share that balancing the group alone gives (largest first onto the
-    least loaded rank), so the padding grows only when no rank has room under
-    the cap. Balancing one group at a time would put each group's largest
-    matrix on the rank that was least loaded before the group, never pairing it
-    with a smaller matrix of another group: with one group per transformer
-    layer, every rank holds a whole layer's worth of large matrices before the
-    totals even out.
-    """
-    # TODO: two gaps against balancing one group at a time.
-    # - Packed parameters (e.g. expert stacks split into whole matrices) lower
-    #   to a BlockShard whose collective slot is padded to the parameter's
-    #   largest per-rank block count. The cap bounds each rank's total share of
-    #   a group, not that count, so a packed parameter can get more blocks on
-    #   one rank (e.g. 3 instead of 2) and pad more. Capping each packed
-    #   parameter's per-rank count at its group's own balance would close it.
-    # - Largest first over all groups is a heuristic. On random groups of whole
-    #   matrices it lowered the largest total in 55% of cases but raised it in
-    #   20% (by up to 1.38x), and the fallback below exceeded the cap in 1%.
-    #   Keeping the better of the two rules per call would close it.
-    caps = []
-    for group in groups:
-        shares = [0] * num_ranks
-        for matrix in sorted(
-            group.matrices,
-            key=lambda matrix: matrix.numel,
-            reverse=True,
-        ):
-            shares[shares.index(min(shares))] += matrix.numel
-        caps.append(max(shares))
-
-    totals = [0] * num_ranks
-    shares_by_group = [[0] * num_ranks for _ in groups]
-    rank_by_matrix: dict[str, int] = {}
-    for neg_numel, group_index, name in sorted(
-        (-matrix.numel, group_index, matrix.name)
-        for group_index, group in enumerate(groups)
-        for matrix in group.matrices
-    ):
-        numel = -neg_numel
-        shares = shares_by_group[group_index]
-        fits = [
-            rank
-            for rank in range(num_ranks)
-            if shares[rank] + numel <= caps[group_index]
-        ]
-        if fits:
-            rank = min(fits, key=lambda rank: (totals[rank], rank))
-        else:
-            # Packing differently from the group's own balance can leave no
-            # rank room under the cap; the least filled rank then keeps the
-            # padding closest to it.
-            rank = min(
-                range(num_ranks),
-                key=lambda rank: (shares[rank], totals[rank], rank),
-            )
-        rank_by_matrix[name] = rank
-        shares[rank] += numel
-        totals[rank] += numel
-    return rank_by_matrix
-
-
 def assign_matrices(
     groups: Sequence[AssignmentGroup],
     *,
     num_ranks: int,
 ) -> MatrixAssignment:
-    """Balance each rank's total load over all groups.
-
-    Whole matrices go first, from every group at once (see
-    ``_assign_whole_matrices``), then each group's block groups, in sequence,
-    each block onto its least loaded eligible rank.
-    """
+    """Assign recipe-defined groups in their explicit sequence order."""
     _validate_inputs(groups, num_ranks)
     return _BalancedMatrixAssignment().assign(
         groups,
