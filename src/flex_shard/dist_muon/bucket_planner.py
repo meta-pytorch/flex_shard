@@ -189,12 +189,24 @@ def _assign_whole_matrices(
     total so far. A group's matrices share one collective, which pads every
     rank's share to the largest, so a rank's share of a group is capped at the
     largest share that balancing the group alone gives (largest first onto the
-    least loaded rank), and the padding never grows. Balancing one group at a
-    time would put each group's largest matrix on the rank that was least
-    loaded before the group, never pairing it with a smaller matrix of another
-    group: with one group per transformer layer, every rank holds a whole
-    layer's worth of large matrices before the totals even out.
+    least loaded rank), so the padding grows only when no rank has room under
+    the cap. Balancing one group at a time would put each group's largest
+    matrix on the rank that was least loaded before the group, never pairing it
+    with a smaller matrix of another group: with one group per transformer
+    layer, every rank holds a whole layer's worth of large matrices before the
+    totals even out.
     """
+    # TODO: two gaps against balancing one group at a time.
+    # - Packed parameters (e.g. expert stacks split into whole matrices) lower
+    #   to a BlockShard whose collective slot is padded to the parameter's
+    #   largest per-rank block count. The cap bounds each rank's total share of
+    #   a group, not that count, so a packed parameter can get more blocks on
+    #   one rank (e.g. 3 instead of 2) and pad more. Capping each packed
+    #   parameter's per-rank count at its group's own balance would close it.
+    # - Largest first over all groups is a heuristic. On random groups of whole
+    #   matrices it lowered the largest total in 55% of cases but raised it in
+    #   20% (by up to 1.38x), and the fallback below exceeded the cap in 1%.
+    #   Keeping the better of the two rules per call would close it.
     caps = []
     for group in groups:
         shares = [0] * num_ranks
