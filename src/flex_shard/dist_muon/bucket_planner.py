@@ -153,6 +153,19 @@ class _BalancedMatrixAssignment:
         blocks_per_rank_by_group: dict[str, tuple[int, ...]] = {}
         rank_loads = [0] * num_ranks
 
+        # TODO: this balances one group at a time: each group's heaviest slot
+        # goes to the rank least loaded so far, so a group's largest matrix is
+        # never paired with a smaller matrix from another group. With one group
+        # per transformer layer (fc1, qkv, fc2 and proj; 4 layers on 8 ranks),
+        # the most loaded rank holds 1.39x the mean. Megatron-FlexShard's Muon
+        # owners (its #27) place whole matrices from every group at once,
+        # largest first onto the least total, with each rank's share of a group
+        # capped at the group's own balance: 1.06x there. Two gaps before using
+        # that here:
+        # - The cap doesn't bound a packed parameter's per-rank block count, so
+        #   its BlockShard can pad more.
+        # - On random groups it raised the largest total in 20% of cases while
+        #   lowering it in 55%.
         for group in groups:
             if group.matrices:
                 slot_loads = [0] * num_ranks
