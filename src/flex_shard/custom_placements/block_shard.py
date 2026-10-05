@@ -518,8 +518,12 @@ class BucketedBlockShard(Placement):
     a number of contiguous bucket-global blocks. The placement plans the whole
     bucket as one param-major logical buffer, then shards that buffer into
     rank-local ranges so the all-gather output is laid out as the full
-    parameters. In eager mode it is copied into one persistent bucket buffer
-    that the full parameters view; during graph capture they view it directly.
+    parameters. In eager mode the first unshard copies it into one persistent
+    bucket buffer that the full parameters view, and later unshards gather
+    straight into that buffer; during graph capture they view the gathered
+    bucket directly. With ``BucketSpec(gradient_bucket=True)`` the gradients are
+    views of one bucket in the same layout, which the reduce-scatter reads as
+    is.
     """
 
     @dataclass(frozen=True)
@@ -530,6 +534,8 @@ class BucketedBlockShard(Placement):
         rank_offsets: tuple[int, ...]
         rank_numels: tuple[int, ...]
         equal_rank_numels: bool
+        # Whether the all-gather refills the persistent bucket in place.
+        in_place: bool = False
 
     @dataclass(frozen=True)
     class _ReduceGradState:
@@ -892,12 +898,17 @@ class BucketedBlockShard(Placement):
         )
 
     @override
+    def refills_persistent_buffers_in_place(self) -> bool:
+        return True
+
+    @override
     def prepare_unshard_bucket(
         self,
         tensors: list[torch.Tensor],
         infos: list[ParamInfo],
         mesh: DeviceMesh,
         debug_fqn: str | None,
+        persistent_buffers: list[torch.Tensor] | None = None,
     ) -> PlacementPreparedUnshard:
         dtype = _unsharded_dtype(infos[0])
         device = tensors[0].device
@@ -905,16 +916,12 @@ class BucketedBlockShard(Placement):
             raise ValueError(
                 "BucketedBlockShard requires one unsharded dtype per bucket."
             )
+        if persistent_buffers is not None:
+            return self._prepare_unshard_in_place(
+                tensors, infos, mesh, debug_fqn, persistent_buffers
+            )
         with _record_copy_in_if_eager():
-            send_buf = self._make_local_bucket_view(tensors, infos)
-            copy_in_scratch: list[torch.Tensor] = []
-            if send_buf.dtype != dtype:
-                send_buf, copy_in_scratch = pack_tensors_into_flat_buffer_with_scratch(
-                    [send_buf],
-                    dtype,
-                )
-            else:
-                send_buf = copy_tensor_to_dtype(send_buf, dtype)
+            send_buf, copy_in_scratch = self._unshard_send_buffer(tensors, infos, dtype)
             bucket_layout = self._bucket_layout(infos[0])
             gathered_bucket = torch.empty(
                 bucket_layout.global_numel,
@@ -934,6 +941,67 @@ class BucketedBlockShard(Placement):
             ),
         )
 
+    def _unshard_send_buffer(
+        self,
+        tensors: list[torch.Tensor],
+        infos: list[ParamInfo],
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        send_buf = self._make_local_bucket_view(tensors, infos)
+        copy_in_scratch: list[torch.Tensor] = []
+        if send_buf.dtype != dtype:
+            send_buf, copy_in_scratch = pack_tensors_into_flat_buffer_with_scratch(
+                [send_buf],
+                dtype,
+            )
+        else:
+            send_buf = copy_tensor_to_dtype(send_buf, dtype)
+        return send_buf, copy_in_scratch
+
+    def _prepare_unshard_in_place(
+        self,
+        tensors: list[torch.Tensor],
+        infos: list[ParamInfo],
+        mesh: DeviceMesh,
+        debug_fqn: str | None,
+        persistent_buffers: list[torch.Tensor],
+    ) -> PlacementPreparedUnshard:
+        """Prepare a refill that gathers straight into the persistent bucket."""
+        dtype = _unsharded_dtype(infos[0])
+        bucket_layout = self._bucket_layout(infos[0])
+        if len(persistent_buffers) != 1:
+            raise AssertionError(
+                "BucketedBlockShard expects one persistent bucket, got "
+                f"{len(persistent_buffers)} buffers."
+            )
+        bucket = persistent_buffers[0]
+        if (
+            bucket.dtype != dtype
+            or bucket.shape != (bucket_layout.global_numel,)
+            or not bucket.is_contiguous()
+        ):
+            raise AssertionError(
+                "BucketedBlockShard persistent bucket does not match the bucket "
+                f"layout: {tuple(bucket.shape)} {bucket.dtype}, expected "
+                f"({bucket_layout.global_numel},) {dtype}."
+            )
+        with _record_copy_in_if_eager():
+            send_buf, copy_in_scratch = self._unshard_send_buffer(tensors, infos, dtype)
+        return PlacementPreparedUnshard(
+            placement=self,
+            buffers=[send_buf, *copy_in_scratch],
+            placement_state=BucketedBlockShard._UnshardState(
+                infos=infos,
+                pg=mesh.get_group(),
+                debug_fqn=debug_fqn,
+                rank_offsets=bucket_layout.rank_offsets,
+                rank_numels=bucket_layout.rank_numels,
+                equal_rank_numels=_has_equal_rank_numels(bucket_layout),
+                in_place=True,
+            ),
+            persistent_buffers=persistent_buffers,
+        )
+
     @override
     def run_prepared_unshard(self, prepared: PlacementPreparedUnshard) -> None:
         if not isinstance(prepared.placement_state, BucketedBlockShard._UnshardState):
@@ -943,7 +1011,10 @@ class BucketedBlockShard(Placement):
             )
         state = prepared.placement_state
         send_buf = prepared.buffers[0]
-        gathered_bucket = prepared.buffers[1]
+        if state.in_place:
+            gathered_bucket = prepared.persistent_buffers[0]
+        else:
+            gathered_bucket = prepared.buffers[1]
         with _record_comm_if_eager("FlexShard::all_gather", state.debug_fqn):
             if state.equal_rank_numels:
                 # Into the bucket directly: with a list of outputs,
@@ -968,10 +1039,18 @@ class BucketedBlockShard(Placement):
                 "Expected BucketedBlockShard._UnshardState, "
                 f"got {type(prepared.placement_state).__name__}"
             )
+        if prepared.placement_state.in_place:
+            # The all-gather refilled the persistent bucket; the caller keeps
+            # the full params from the first unshard, which view it.
+            return PlacementUnshardResult(
+                full_params=[],
+                persistent_buffers=list(prepared.persistent_buffers),
+            )
         gathered_bucket = prepared.buffers[1]
         if prepared.persistent:
-            # The gathered bucket comes from the unshard stream; persistent
-            # storage lives on the current stream, so copy into it.
+            # The first unshard: the gathered bucket comes from the unshard
+            # stream, and persistent storage lives on the current stream, so
+            # copy into it. Later unshards gather into it in place.
             bucket = (
                 prepared.persistent_buffers[0]
                 if prepared.persistent_buffers is not None
@@ -993,6 +1072,55 @@ class BucketedBlockShard(Placement):
             full_params=full_params,
             persistent_buffers=[bucket] if prepared.persistent else [],
         )
+
+    @override
+    def gradient_bucket_views(
+        self,
+        infos: list[ParamInfo],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor] | None:
+        bucket_layout = self._bucket_layout(infos[0])
+        if not _has_equal_rank_numels(bucket_layout):
+            # Uneven ranges pack a padded send buffer anyway.
+            return None
+        bucket = torch.zeros(bucket_layout.global_numel, dtype=dtype, device=device)
+        views = []
+        for info in infos:
+            offset = self._param_layout(info).param_offset
+            views.append(
+                bucket[offset : offset + info.global_numel].view(info.global_shape)
+            )
+        return views
+
+    def _gradient_bucket_of(
+        self,
+        tensors: list[torch.Tensor],
+        infos: list[ParamInfo],
+        bucket_layout: BucketLayout,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """The gradient bucket ``tensors`` view at their layout offsets, if
+        they all view one (see ``gradient_bucket_views``)."""
+        bucket = tensors[0]._base
+        if (
+            bucket is None
+            or bucket.dtype != dtype
+            or bucket.shape != (bucket_layout.global_numel,)
+            or not bucket.is_contiguous()
+        ):
+            return None
+        bucket_offset = bucket.storage_offset()
+        for tensor, info in zip(tensors, infos, strict=True):
+            if (
+                tensor._base is not bucket
+                or tensor.shape != info.global_shape
+                or not tensor.is_contiguous()
+                or tensor.storage_offset() - bucket_offset
+                != self._param_layout(info).param_offset
+            ):
+                return None
+        return bucket
 
     def _padding_ranges(
         self,
@@ -1036,6 +1164,22 @@ class BucketedBlockShard(Placement):
         device = tensors[0].device
         bucket_layout = self._bucket_layout(infos[0])
         padded_segment_numel = max(bucket_layout.rank_numels)
+        if _has_equal_rank_numels(bucket_layout):
+            grad_bucket = self._gradient_bucket_of(tensors, infos, bucket_layout, dtype)
+            if grad_bucket is not None:
+                # The grads are views of a gradient bucket in this layout
+                # (BucketSpec(gradient_bucket=True)): reduce it as is.
+                return PlacementPreparedReduceGrad(
+                    placement=self,
+                    buffers=[grad_bucket],
+                    placement_state=BucketedBlockShard._ReduceGradState(
+                        infos=infos,
+                        rank=mesh.get_local_rank(),
+                        pg=mesh.get_group(),
+                        debug_fqn=debug_fqn,
+                        padded_segment_numel=padded_segment_numel,
+                    ),
+                )
         with _record_function_if_eager("FlexShard::reduce_scatter_copy_in", debug_fqn):
             global_grad_bucket = torch.empty(
                 bucket_layout.global_numel,

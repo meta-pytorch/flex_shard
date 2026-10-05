@@ -287,6 +287,33 @@ class Placement(ABC):
             f"{self!r} does not support distributed checkpointing."
         )
 
+    def refills_persistent_buffers_in_place(self) -> bool:
+        """Whether a refill can gather straight into the persistent buffers.
+
+        If so, ``prepare_unshard_bucket`` also accepts ``persistent_buffers``:
+        those of an earlier persistent unshard, with storage the caller
+        re-allocated on the current stream before the unshard stream waits on
+        it. The collective then writes them in place, so finish copies nothing.
+        A refill that is never finished leaves the caller to free their storage
+        once the collective is done.
+        """
+        return False
+
+    def gradient_bucket_views(
+        self,
+        infos: list[ParamInfo],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[torch.Tensor] | None:
+        """Views, one per param, of one zeroed buffer in this placement's
+        gradient reduction layout, or None if it has none.
+
+        For ``BucketSpec(gradient_bucket=True)``, the runtime makes them the
+        unsharded params' grads before backward, so ``prepare_reduce_grad`` can
+        reduce the buffer without copying the grads in.
+        """
+        return None
+
     def prepare_unshard_bucket(
         self,
         tensors: list[torch.Tensor],
@@ -348,7 +375,9 @@ class PlacementPreparedUnshard:
     the full params with them only, and returns them as
     ``PlacementUnshardResult.persistent_buffers``. On later unshards
     ``persistent_buffers`` holds those buffers, with storage re-allocated by
-    the caller, and finish writes the new values into them in the same layout.
+    the caller, and finish writes the new values into them in the same layout;
+    a placement that ``refills_persistent_buffers_in_place()`` receives them in
+    prepare instead and gathers straight into them.
     Eager unshards are persistent. During graph capture they are not, and the
     full params may view gathered buffers whose lifetime the traced graph owns.
     """

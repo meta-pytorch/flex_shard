@@ -23,7 +23,13 @@ if TYPE_CHECKING:
 
 
 class UnshardHandle:
-    """Handle for a FlexShard bucket unshard operation."""
+    """Handle for a FlexShard bucket unshard operation.
+
+    ``refilled_in_place`` marks an unshard that gathered straight into the
+    persistent buffers it was given (see ``begin_bucket_unshard``).
+    """
+
+    refilled_in_place: bool = False
 
     def finish(
         self, persistent_buffers: list[torch.Tensor] | None = None
@@ -102,11 +108,16 @@ def begin_bucket_unshard(
     mesh: DeviceMesh,
     unshard_stream: torch.Stream,
     debug_fqn: str | None = None,
+    persistent_buffers: list[torch.Tensor] | None = None,
 ) -> UnshardHandle:
     """Begin a bucket unshard and return a handle for full params.
 
     Eager unshards are persistent (see ``PlacementPreparedUnshard``); during
-    graph capture the traced graph owns buffer lifetimes.
+    graph capture the traced graph owns buffer lifetimes. Given
+    ``persistent_buffers``, which the placement must
+    ``refills_persistent_buffers_in_place()``, the unshard gathers straight
+    into them, without bumping their version counters. Their storage must
+    already be re-allocated on the current stream, before this call.
     """
     placement = _get_bucket_placement(infos, "unshard")
 
@@ -121,9 +132,26 @@ def begin_bucket_unshard(
     copy_in_done.record(device_handle.current_stream(device))
     with device_handle.stream(unshard_stream):
         unshard_stream.wait_event(copy_in_done)
-        prepared = placement.prepare_unshard_bucket(tensors, infos, mesh, debug_fqn)
-        prepared.persistent = True
-        prepared.placement.run_prepared_unshard(prepared)
+        if persistent_buffers is None:
+            prepared = placement.prepare_unshard_bucket(tensors, infos, mesh, debug_fqn)
+            prepared.persistent = True
+            prepared.placement.run_prepared_unshard(prepared)
+        else:
+            prepared = placement.prepare_unshard_bucket(
+                tensors,
+                infos,
+                mesh,
+                debug_fqn,
+                persistent_buffers=persistent_buffers,
+            )
+            prepared.persistent = True
+            prepared.persistent_buffers = persistent_buffers
+            # Autograd may have saved the unsharded params, which view these
+            # buffers, before a reshard (as in finish_unshard).
+            with torch.autograd._unsafe_preserve_version_counter(
+                tuple(persistent_buffers)
+            ):
+                prepared.placement.run_prepared_unshard(prepared)
         event = device_handle.Event()
         event.record(unshard_stream)
     return AsyncUnshardResult(
@@ -131,6 +159,7 @@ def begin_bucket_unshard(
         event=event,
         unshard_stream=unshard_stream,
         device_handle=device_handle,
+        refilled_in_place=persistent_buffers is not None,
     )
 
 
@@ -196,6 +225,7 @@ class AsyncUnshardResult(UnshardHandle):
     event: torch.Event
     unshard_stream: torch.Stream
     device_handle: ModuleType
+    refilled_in_place: bool = False
     _device: torch.device | None = field(default=None, init=False)
     _finished: bool = field(default=False, init=False)
 

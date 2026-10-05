@@ -641,6 +641,102 @@ class TestFlexShardTraining(FSDPTest):
             )
 
     @skip_if_lt_x_gpu(2)
+    def test_bucketed_block_copy_free_matches_reference(self):
+        # Refills gather straight into the persistent buckets, and with
+        # gradient_bucket=True the reduce-scatter reads the grads' bucket as
+        # is; training matches an unsharded reference, with and without
+        # reshard-after-forward and no-sync.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        placement_fn = make_bucketed_block_placement_fn(
+            dims=(0,), blocks_per_rank=(1,) * self.world_size
+        )
+        begin_bucket_unshard = bucket_runtime.begin_bucket_unshard
+        gradient_bucket_of = BucketedBlockShard._gradient_bucket_of
+        for reshard_after_forward, gradient_bucket in (
+            (False, True),
+            (True, True),
+            (True, False),
+        ):
+            with self.subTest(
+                reshard_after_forward=reshard_after_forward,
+                gradient_bucket=gradient_bucket,
+            ):
+                torch.manual_seed(0)
+                model = torch.nn.Sequential(
+                    torch.nn.Linear(16, 16),
+                    torch.nn.ReLU(),
+                    torch.nn.Linear(16, 16),
+                    torch.nn.ReLU(),
+                    torch.nn.Linear(16, 8),
+                ).to(device_type)
+                reference = copy.deepcopy(model)
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            [f"{idx}.*"],
+                            placement_fn=placement_fn,
+                            mesh=mesh,
+                            reshard_after_forward=reshard_after_forward,
+                            gradient_bucket=gradient_bucket,
+                        )
+                        for idx in (0, 2, 4)
+                    ],
+                )
+                optimizer = make_test_sgd(model.parameters(), lr=0.1)
+                reference_optimizer = make_test_sgd(reference.parameters(), lr=0.1)
+                in_place: list[bool] = []
+                reduced_bucket: list[bool] = []
+
+                def recording_begin(*args, **kwargs):
+                    in_place.append(kwargs.get("persistent_buffers") is not None)
+                    return begin_bucket_unshard(*args, **kwargs)
+
+                def recording_gradient_bucket_of(placement, *args):
+                    bucket = gradient_bucket_of(placement, *args)
+                    reduced_bucket.append(bucket is not None)
+                    return bucket
+
+                torch.manual_seed(1 + self.rank)
+                with (
+                    mock.patch.object(
+                        bucket_runtime, "begin_bucket_unshard", recording_begin
+                    ),
+                    mock.patch.object(
+                        BucketedBlockShard,
+                        "_gradient_bucket_of",
+                        recording_gradient_bucket_of,
+                    ),
+                ):
+                    for step in range(4):
+                        optimizer.zero_grad(set_to_none=True)
+                        reference_optimizer.zero_grad(set_to_none=True)
+                        # The last step accumulates two microbatches without
+                        # sync into the same grads.
+                        microbatches = 2 if step == 3 else 1
+                        for microbatch in range(microbatches):
+                            model.set_requires_gradient_sync(
+                                microbatch == microbatches - 1
+                            )
+                            x = torch.randn(4, 16, device=device_type)
+                            output = model(x)
+                            reference_output = reference(x)
+                            self.assertEqual(output, reference_output)
+                            output.square().sum().backward()
+                            reference_output.square().sum().backward()
+                        _average_reference_grads(reference)
+                        optimizer.step()
+                        reference_optimizer.step()
+                # The first unshard of each bucket copies; refills are in place.
+                self.assertEqual(in_place[:3], [False] * 3)
+                self.assertTrue(all(in_place[3:]))
+                self.assertGreater(len(in_place), 3)
+                self.assertTrue(reduced_bucket)
+                self.assertTrue(
+                    all(found == gradient_bucket for found in reduced_bucket)
+                )
+
+    @skip_if_lt_x_gpu(2)
     def test_gradient_divide_factor(self):
         # The reduced gradient is the sum over the mesh divided by the factor,
         # e.g. the dense data-parallel size for an expert bucket on an expert

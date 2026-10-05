@@ -202,6 +202,16 @@ class BucketSpec:
             ``delay_wgrad_compute``, whose ``backward_dw()`` runs later. A
             syncing backward that runs the module's backward but ends with the
             bucket unfinished raises. Eager only.
+        gradient_bucket: Whether this bucket's unsharded grads are views of one
+            zeroed buffer in the placement's gradient reduction layout, set in
+            its pre-backward hook (before ``pre_backward_hook``) when they do not
+            exist yet, so the reduce-scatter reads that buffer without copying
+            the grads in. They take the bucket's reduce dtype from the start of
+            its backward, instead of the compute dtype until the copy-in. Grads
+            that end up elsewhere (e.g. allocated before the pre-backward hook)
+            fall back to the copy, with a warning. Requires a placement with
+            ``gradient_bucket_views`` (``BucketedBlockShard`` with equal rank
+            ranges). Eager only.
     """
 
     patterns: list[str]
@@ -215,6 +225,7 @@ class BucketSpec:
     pre_backward_hook: BucketHook | None = None
     post_reduce_hook: BucketHook | None = None
     defer_post_backward: bool = False
+    gradient_bucket: bool = False
 
 
 @dataclass(frozen=True)
@@ -325,6 +336,7 @@ class ShardedBucketStorage:
         post_reduce_hook: BucketHook | None = None,
         gradient_divide_factor: float | None = None,
         defer_post_backward: bool = False,
+        gradient_bucket: bool = False,
     ) -> None:
         if byte_storage.dtype != torch.uint8:
             raise ValueError(f"Expected uint8 storage, got {byte_storage.dtype}")
@@ -337,6 +349,7 @@ class ShardedBucketStorage:
         self._pre_backward_hook = pre_backward_hook
         self._post_reduce_hook = post_reduce_hook
         self._defer_post_backward = defer_post_backward
+        self._gradient_bucket = gradient_bucket
         # See set_requires_gradient_sync and set_reshard_after_backward.
         self._requires_gradient_sync = True
         self._reshard_after_backward = True
@@ -389,6 +402,7 @@ class ShardedBucketStorage:
             post_reduce_hook=bucket_spec.post_reduce_hook,
             gradient_divide_factor=bucket_spec.gradient_divide_factor,
             defer_post_backward=bucket_spec.defer_post_backward,
+            gradient_bucket=bucket_spec.gradient_bucket,
         )
         bucket_storage.copy_params_from(named_params)
         bucket_storage.install_sharded_params(expected_param_device)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import warnings
 from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any
@@ -278,6 +279,10 @@ class BucketCommContext:
         ):
             pending.result.wait()
             pending.result.release_buffers()
+            if pending.result.refilled_in_place:
+                # The all-gather refilled the persistent storage, which the
+                # current stream now waits on before the allocator reuses it.
+                pending.bucket.free_persistent_storage()
         return None
 
     def queue_post_backward_callback(self) -> None:
@@ -469,6 +474,8 @@ class BucketRuntime:
     unsharded_params: list[nn.Parameter] | None = None
     persistent_buffers: list[torch.Tensor] = field(default_factory=list)
     persistent_buffer_nbytes: list[int] = field(default_factory=list)
+    # Whether this bucket warned that its gradient bucket fell back to a copy.
+    gradient_bucket_warned: bool = False
 
     @classmethod
     def from_bucket_storage(
@@ -571,15 +578,31 @@ class BucketRuntime:
         self,
         local_shards: list[torch.Tensor] | None = None,
     ) -> UnshardHandle:
-        """Begin this bucket's unshard on the shared stream."""
+        """Begin this bucket's unshard on the shared stream.
+
+        A refill whose placement ``refills_persistent_buffers_in_place()``
+        re-allocates the persistent storage here, on the current stream (the
+        one that frees it on reshard) and before the unshard stream waits on
+        it, and gathers straight into it.
+        """
         if local_shards is None:
             local_shards = self._local_shards(use_autograd=False)
+        persistent_buffers = None
+        if (
+            self.unsharded_params is not None
+            and not torch.compiler.is_compiling()
+            and self.infos[0].placement.refills_persistent_buffers_in_place()
+        ):
+            with torch.inference_mode(False):
+                self._alloc_persistent_storage()
+            persistent_buffers = self.persistent_buffers
         return begin_bucket_unshard(
             local_shards,
             self.infos,
             self.bucket_storage._mesh,
             self.context.unshard_stream,
             debug_fqn=self.debug_fqn,
+            persistent_buffers=persistent_buffers,
         )
 
     def reduce_grads(
@@ -649,10 +672,8 @@ class BucketRuntime:
                     unshard.full_params, unshard.persistent_buffers
                 )
             else:
-                for persistent_buffer, nbytes in zip(
-                    self.persistent_buffers, self.persistent_buffer_nbytes, strict=True
-                ):
-                    _alloc_storage(persistent_buffer, nbytes)
+                # A no-op for an in-place refill, which allocated in begin.
+                self._alloc_persistent_storage()
                 with torch.autograd._unsafe_preserve_version_counter(
                     tuple(self.persistent_buffers)
                 ):
@@ -730,11 +751,24 @@ class BucketRuntime:
     def reshard(self) -> None:
         """Swap the local shards back in and free the persistent storage."""
         self._swap_in_params(self.sharded_params)
-        # Consumers of the storage were queued on this stream, which also
-        # allocated it, so the caching allocator orders the reuse.
+        self.free_persistent_storage()
+        self.is_unsharded = False
+
+    def _alloc_persistent_storage(self) -> None:
+        for persistent_buffer, nbytes in zip(
+            self.persistent_buffers, self.persistent_buffer_nbytes, strict=True
+        ):
+            _alloc_storage(persistent_buffer, nbytes)
+
+    def free_persistent_storage(self) -> None:
+        """Free the storage behind the unsharded params.
+
+        Consumers of the storage were queued on this stream, which also
+        allocated it (an in-place refill's unshard stream writes it only after
+        waiting on this stream), so the caching allocator orders the reuse.
+        """
         for persistent_buffer in self.persistent_buffers:
             _free_storage(persistent_buffer)
-        self.is_unsharded = False
 
     def reset_backward_state(self) -> None:
         """Clear the post-backward trigger counts at the end of a backward."""
@@ -759,6 +793,7 @@ class BucketRuntime:
         self.context.queue_post_backward_callback()
         self.unshard()
         self._set_unsharded_grad_dtypes(defer_upcast=True)
+        self._alloc_gradient_bucket()
         if self.bucket_storage._pre_backward_hook is not None:
             self.bucket_storage._pre_backward_hook(self._named_unsharded_params())
         self.context.prefetch(self.context.next_backward_bucket(self))
@@ -796,6 +831,64 @@ class BucketRuntime:
             if grad is not None and grad.dtype != dtype:
                 param.grad = grad.to(dtype)
             param.grad_dtype = dtype
+
+    def _alloc_gradient_bucket(self) -> None:
+        """For ``BucketSpec(gradient_bucket=True)``: make the unsharded grads
+        views of one buffer in the placement's gradient reduction layout, if
+        none exist yet (later backwards without sync accumulate into them)."""
+        if not self.bucket_storage._gradient_bucket or self.unsharded_params is None:
+            return
+        params = self.unsharded_params
+        if not any(param.requires_grad for param in params) or any(
+            param.grad is not None for param in params
+        ):
+            return
+        info = self.infos[0]
+        views = info.placement.gradient_bucket_views(
+            self.infos, info.grad_reduce_dtype, params[0].device
+        )
+        if views is None:
+            self._warn_gradient_bucket_fallback(
+                f"its placement {info.placement!r} has no gradient bucket views"
+            )
+            return
+        for param, view in zip(params, views, strict=True):
+            if param.requires_grad:
+                param.grad = view
+
+    def _check_gradient_bucket(
+        self, grads: list[torch.Tensor | None], infos: list[ParamInfo]
+    ) -> None:
+        """Warn once if a gradient bucket's grads will not be reduced as is:
+        not all views of one bucket, or not in this backward's reduce dtype."""
+        if not self.bucket_storage._gradient_bucket or self.gradient_bucket_warned:
+            return
+        bucket = grads[0]._base if grads[0] is not None else None
+        if bucket is None or any(
+            grad is None or grad._base is not bucket for grad in grads
+        ):
+            reason = (
+                "its grads are not views of one gradient bucket (e.g. allocated "
+                "or replaced before its pre-backward hook)"
+            )
+        elif bucket.dtype != infos[0].grad_reduce_dtype:
+            reason = (
+                f"its grads are {bucket.dtype}, not the reduce dtype "
+                f"{infos[0].grad_reduce_dtype}"
+            )
+        else:
+            return
+        self._warn_gradient_bucket_fallback(reason)
+
+    def _warn_gradient_bucket_fallback(self, reason: str) -> None:
+        if self.gradient_bucket_warned:
+            return
+        self.gradient_bucket_warned = True
+        warnings.warn(
+            f"FlexShard bucket {self.debug_fqn} has gradient_bucket=True, but "
+            f"{reason}, so its reduce-scatter copies the grads in.",
+            stacklevel=2,
+        )
 
     def _named_unsharded_params(self) -> list[tuple[str, nn.Parameter]]:
         return [
@@ -872,6 +965,7 @@ class BucketRuntime:
         # Promote over the real grads before the zeros exist, so zeros never
         # pick the reduce dtype.
         infos = _promote_reduce_dtype_over_grads(grads, infos)
+        self._check_gradient_bucket(grads, infos)
         # Zeros fill missing grads after resharding, so they never coexist
         # with the unsharded params, in the dtype autograd would produce, as
         # FSDP2's unsharded_zero_grad_data does.
@@ -906,9 +1000,12 @@ class BucketRuntime:
             return
         if _in_backward():
             # Activation-checkpoint recompute: the pre-backward hook usually
-            # re-gathered already; otherwise this consumes its prefetch.
+            # re-gathered already; otherwise this consumes its prefetch. The
+            # original forward ran without grad, so no pre-backward hook set
+            # up the gradient bucket.
             self.call_has_trigger.append(False)
             self.unshard()
+            self._alloc_gradient_bucket()
             return
         self.context.check_no_raised_backward()
         if self.context.pending_finalization is not None:
@@ -1023,6 +1120,11 @@ class BucketRuntime:
             raise NotImplementedError(
                 "FlexShard BucketSpec defer_post_backward is eager-only; "
                 "torch.compile reduce-scatters in the traced backward."
+            )
+        if self.bucket_storage._gradient_bucket:
+            raise NotImplementedError(
+                "FlexShard BucketSpec gradient_bucket is eager-only; the traced "
+                "backward owns its gradient buffers."
             )
         full_params = _BucketUnshard.apply(self, *self._local_shards(use_autograd=True))
         self._swap_in_params(list(full_params))
