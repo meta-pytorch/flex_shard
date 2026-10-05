@@ -243,11 +243,13 @@ class TestFlexShardEagerRuntime(TestCase):
 
     def test_persistent_unsharded_params(self):
         for reshard_after_forward in (False, True):
-            with (
-                self.subTest(reshard_after_forward=reshard_after_forward),
-                single_rank_cuda_mesh() as mesh,
-            ):
-                self._check_persistent_unsharded_params(mesh, reshard_after_forward)
+            # single_rank_cuda_mesh() must be entered outside self.subTest() so its
+            # CUDA SkipTest is raised at the test-method level. Raised inside a
+            # subTest it emits a finish(SKIP) event with no matching start event,
+            # which TPX rejects as a FATAL "invalid sequence of test events".
+            with single_rank_cuda_mesh() as mesh:
+                with self.subTest(reshard_after_forward=reshard_after_forward):
+                    self._check_persistent_unsharded_params(mesh, reshard_after_forward)
 
     def _check_persistent_unsharded_params(self, mesh, reshard_after_forward):
         torch.manual_seed(0)
