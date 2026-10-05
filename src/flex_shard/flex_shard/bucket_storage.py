@@ -238,18 +238,19 @@ class BucketParamLayout:
 
 @dataclass(frozen=True)
 class BucketLayout:
-    """Bucket-global storage layout shared by parameters in one bucket.
-
-    ``padding_ranges`` are the ``(offset, numel)`` ranges of the global bucket
-    that no parameter covers, such as alignment and tail padding.
-    """
+    """Bucket-global storage layout shared by parameters in one bucket."""
 
     global_numel: int
     local_numel: int
     rank_offsets: tuple[int, ...]
     rank_numels: tuple[int, ...]
     param_layouts: dict[str, BucketParamLayout]
-    padding_ranges: tuple[tuple[int, int], ...] = ()
+
+    @functools.cached_property
+    def equal_rank_numels(self) -> bool:
+        """Whether every rank's range has the same size, so the bucket is
+        world size equal segments in rank order."""
+        return len(set(self.rank_numels)) == 1
 
 
 @dataclass
