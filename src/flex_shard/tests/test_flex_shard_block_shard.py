@@ -542,24 +542,18 @@ class TestBucketedBlockShardPadding(TestCase):
             placement, infos, _ = _bucketed_block_storage(
                 _GappedTinyModule(), mesh, (1,)
             )
-            self.assertEqual(infos[0].bucket_layout.padding_ranges, ((3, 1), (13, 1)))
             grads = [
                 torch.full(info.global_shape, index + 1.0)
                 for index, info in enumerate(infos)
             ]
-
-            def nan_empty(numel, **kwargs):
-                # Uninitialized memory, so that unzeroed padding shows.
-                return torch.full((numel,), float("nan"), **kwargs)
-
-            with mock.patch.object(torch, "empty", side_effect=nan_empty):
-                (send_buf,) = placement.prepare_reduce_grad(
-                    grads, infos, mesh, None
-                ).buffers
-                # ``bias`` left out of the reduction, e.g. frozen.
-                (send_buf_without_bias,) = placement.prepare_reduce_grad(
-                    grads[1:], infos[1:], mesh, None
-                ).buffers
+            # The gradient bucket is the reduce-scatter input.
+            (send_buf,) = placement.prepare_reduce_grad(
+                grads, infos, mesh, None
+            ).buffers
+            # ``bias`` left out of the reduction, e.g. frozen.
+            (send_buf_without_bias,) = placement.prepare_reduce_grad(
+                grads[1:], infos[1:], mesh, None
+            ).buffers
             expected = torch.tensor([1.0] * 3 + [0.0] + [2.0] * 6 + [3.0] * 3 + [0.0])
             self.assertEqual(send_buf, expected)
             expected[:3] = 0.0

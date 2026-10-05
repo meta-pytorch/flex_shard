@@ -32,7 +32,7 @@ from .block_shard import BlockShard
 from .fp8_bucketed_block_shard import _align_up, _VEC_ALIGN_BYTES, Fp8BucketedBlockShard
 from .owned import BucketedOwned
 from .shard import Shard
-from .utils import reduce_scatter_grads, zero_padding
+from .utils import reduce_scatter_grads
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -453,7 +453,7 @@ class MixedBucketPlacement(Placement):
                 )
             ]
             send = torch.empty(layout.row_numel, dtype=layout.dtype, device=device)
-            zero_padding(send, layout.padding_ranges)
+            _zero_padding(send, layout.padding_ranges)
             for group_state, group_layout in zip(
                 group_states,
                 layout.groups,
@@ -780,6 +780,18 @@ def _prepare_mixed_unshard_group(
         mesh,
         debug_fqn,
     )
+
+
+def _zero_padding(
+    tensor: torch.Tensor,
+    ranges: tuple[tuple[int, int], ...],
+) -> None:
+    slices = [tensor.narrow(0, offset, numel) for offset, numel in ranges]
+    if torch.compiler.is_compiling():
+        for slice_ in slices:
+            slice_.zero_()
+    elif slices:
+        torch._foreach_zero_(slices)
 
 
 def _build_mixed_unshard_layout(
