@@ -354,6 +354,97 @@ class TestBucketedBlockShardDistributed(FSDPTestMultiThread):
                 )
 
 
+class _PaddedTinyModule(nn.Module):
+    """6 + 4 elements in a bucket padded to 12: alignment 2, 2 equal blocks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.arange(6, dtype=torch.float32).view(3, 2))
+        self.bias = nn.Parameter(torch.arange(4, dtype=torch.float32) + 10)
+
+
+def _bucketed_block_storage(model, mesh, blocks_per_rank, device="cpu"):
+    placement = BucketedBlockShard(dims=(0,), blocks_per_rank=blocks_per_rank)
+    named_params = list(model.named_parameters())
+    bucket_spec = BucketSpec(
+        ["*"],
+        placement_fn=make_bucketed_block_placement_fn(
+            dims=(0,),
+            blocks_per_rank=blocks_per_rank,
+        ),
+        mesh=mesh,
+        reshard_after_forward=False,
+    )
+    bucket_storage = ShardedBucketStorage.from_bucket(
+        model,
+        named_params,
+        {fqn: (placement,) for fqn, _ in named_params},
+        mesh,
+        torch.device(device),
+        bucket_spec,
+    )
+    infos = [bucket_storage.param_infos[fqn] for fqn, _ in named_params]
+    local_shards = [bucket_storage.get_local_view(fqn) for fqn, _ in named_params]
+    return placement, infos, local_shards
+
+
+class TestBucketedBlockShardEqualRanges(FSDPTestMultiThread):
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    def test_equal_ranges_unshard_and_reduce_without_staging_copies(self):
+        mesh = init_device_mesh("cpu", (self.world_size,), mesh_dim_names=("fsdp",))
+        model = _PaddedTinyModule()
+        originals = [param.detach().clone() for param in model.parameters()]
+        placement, infos, local_shards = _bucketed_block_storage(model, mesh, (1, 1))
+        self.assertEqual(infos[0].bucket_layout.rank_numels, (6, 6))
+
+        prepared = placement.prepare_unshard_bucket(local_shards, infos, mesh, None)
+        # The send view and the gathered bucket, without per-rank output views.
+        self.assertEqual(len(prepared.buffers), 2)
+        placement.run_prepared_unshard(prepared)
+        full_params = placement.finish_prepared_unshard(prepared).full_params
+        for full_param, original in zip(full_params, originals, strict=True):
+            self.assertEqual(full_param, original)
+
+        grads = [torch.full_like(original, 3.0) for original in originals]
+        prepared = placement.prepare_reduce_grad(grads, infos, mesh, None)
+        # The gradient bucket itself is the reduce-scatter input: params at
+        # their bucket offsets, zeroed tail padding.
+        (send_buf,) = prepared.buffers
+        self.assertEqual(send_buf.shape, (12,))
+        self.assertEqual(send_buf[:10], torch.full((10,), 3.0))
+        self.assertEqual(send_buf[10:], torch.zeros(2))
+        sharded_grads = placement.reduce_prepared_grad(
+            prepared, GradientReduction()
+        ).sharded_grads
+        for grad, sharded_grad, info in zip(grads, sharded_grads, infos, strict=True):
+            self.assertEqual(sharded_grad, _expected_bucketed_local(grad, info))
+
+
+class TestBucketedBlockShardCollectives(TestCase):
+    def test_equal_ranges_gather_into_the_bucket(self):
+        with single_rank_cpu_mesh() as mesh:
+            model = _PaddedTinyModule()
+            placement, infos, local_shards = _bucketed_block_storage(model, mesh, (1,))
+            prepared = placement.prepare_unshard_bucket(local_shards, infos, mesh, None)
+            with (
+                mock.patch.object(
+                    dist,
+                    "all_gather_into_tensor",
+                    wraps=dist.all_gather_into_tensor,
+                ) as all_gather_into_tensor,
+                mock.patch.object(
+                    dist, "all_gather", wraps=dist.all_gather
+                ) as all_gather,
+            ):
+                placement.run_prepared_unshard(prepared)
+            self.assertEqual(all_gather_into_tensor.call_count, 1)
+            self.assertEqual(all_gather.call_count, 0)
+            self.assertIs(all_gather_into_tensor.call_args.args[0], prepared.buffers[1])
+
+
 class TestBlockShardPlacement(TestCase):
     def test_local_shape_preserves_parameter_rank(self):
         placement = BlockShard(blocks_per_rank=(2, 1))

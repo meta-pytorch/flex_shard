@@ -64,6 +64,12 @@ def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def _has_equal_rank_numels(bucket_layout: BucketLayout) -> bool:
+    """Whether every rank's bucket range has the same size, so the bucket
+    is world size equal segments in rank order."""
+    return len(set(bucket_layout.rank_numels)) == 1
+
+
 class BlockShard(Placement):
     """Per-parameter block sharding in complete blocks along one dimension.
 
@@ -521,7 +527,9 @@ class BucketedBlockShard(Placement):
         infos: list[ParamInfo]
         pg: Any
         debug_fqn: str | None
-        num_gathered_views: int
+        rank_offsets: tuple[int, ...]
+        rank_numels: tuple[int, ...]
+        equal_rank_numels: bool
 
     @dataclass(frozen=True)
     class _ReduceGradState:
@@ -553,6 +561,12 @@ class BucketedBlockShard(Placement):
             )
         self.dims = dims
         self.blocks_per_rank = blocks_per_rank
+        # Gradient bucket padding per (bucket layout, reduced params); the
+        # layout is kept with its ranges, so its id is not reused meanwhile.
+        self._padding_ranges_cache: dict[
+            tuple[int, tuple[str, ...]],
+            tuple[BucketLayout, tuple[tuple[int, int], ...]],
+        ] = {}
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, BucketedBlockShard):
@@ -907,22 +921,16 @@ class BucketedBlockShard(Placement):
                 dtype=dtype,
                 device=device,
             )
-            gathered_views = [
-                gathered_bucket[offset : offset + numel]
-                for offset, numel in zip(
-                    bucket_layout.rank_offsets,
-                    bucket_layout.rank_numels,
-                    strict=True,
-                )
-            ]
         return PlacementPreparedUnshard(
             placement=self,
-            buffers=[send_buf, gathered_bucket, *gathered_views, *copy_in_scratch],
+            buffers=[send_buf, gathered_bucket, *copy_in_scratch],
             placement_state=BucketedBlockShard._UnshardState(
                 infos=infos,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
-                num_gathered_views=len(gathered_views),
+                rank_offsets=bucket_layout.rank_offsets,
+                rank_numels=bucket_layout.rank_numels,
+                equal_rank_numels=_has_equal_rank_numels(bucket_layout),
             ),
         )
 
@@ -933,15 +941,22 @@ class BucketedBlockShard(Placement):
                 "Expected BucketedBlockShard._UnshardState, "
                 f"got {type(prepared.placement_state).__name__}"
             )
+        state = prepared.placement_state
         send_buf = prepared.buffers[0]
-        gathered_views = prepared.buffers[
-            2 : 2 + prepared.placement_state.num_gathered_views
-        ]
-        with _record_comm_if_eager(
-            "FlexShard::all_gather",
-            prepared.placement_state.debug_fqn,
-        ):
-            dist.all_gather(gathered_views, send_buf, group=prepared.placement_state.pg)
+        gathered_bucket = prepared.buffers[1]
+        with _record_comm_if_eager("FlexShard::all_gather", state.debug_fqn):
+            if state.equal_rank_numels:
+                # Into the bucket directly: with a list of outputs,
+                # ProcessGroupNCCL gathers into a flat buffer and copies it out.
+                dist.all_gather_into_tensor(gathered_bucket, send_buf, group=state.pg)
+            else:
+                gathered_views = [
+                    gathered_bucket[offset : offset + numel]
+                    for offset, numel in zip(
+                        state.rank_offsets, state.rank_numels, strict=True
+                    )
+                ]
+                dist.all_gather(gathered_views, send_buf, group=state.pg)
 
     @override
     def finish_prepared_unshard(
@@ -979,6 +994,35 @@ class BucketedBlockShard(Placement):
             persistent_buffers=[bucket] if prepared.persistent else [],
         )
 
+    def _padding_ranges(
+        self,
+        bucket_layout: BucketLayout,
+        infos: list[ParamInfo],
+    ) -> tuple[tuple[int, int], ...]:
+        """The ranges of the gradient bucket that no reduced param covers:
+        alignment and tail padding, and params left out (e.g. frozen)."""
+        key = (id(bucket_layout), tuple(info.fqn for info in infos))
+        cached = self._padding_ranges_cache.get(key)
+        if cached is not None and cached[0] is bucket_layout:
+            return cached[1]
+        spans = sorted(
+            (
+                bucket_layout.param_layouts[info.fqn].param_offset,
+                bucket_layout.param_layouts[info.fqn].param_offset + info.global_numel,
+            )
+            for info in infos
+        )
+        ranges: list[tuple[int, int]] = []
+        cursor = 0
+        for start, end in spans:
+            if start > cursor:
+                ranges.append((cursor, start))
+            cursor = max(cursor, end)
+        if cursor < bucket_layout.global_numel:
+            ranges.append((cursor, bucket_layout.global_numel))
+        self._padding_ranges_cache[key] = (bucket_layout, tuple(ranges))
+        return tuple(ranges)
+
     @override
     def prepare_reduce_grad(
         self,
@@ -993,11 +1037,17 @@ class BucketedBlockShard(Placement):
         bucket_layout = self._bucket_layout(infos[0])
         padded_segment_numel = max(bucket_layout.rank_numels)
         with _record_function_if_eager("FlexShard::reduce_scatter_copy_in", debug_fqn):
-            global_grad_bucket = torch.zeros(
+            global_grad_bucket = torch.empty(
                 bucket_layout.global_numel,
                 dtype=dtype,
                 device=device,
             )
+            padding = [
+                global_grad_bucket[start:end]
+                for start, end in self._padding_ranges(bucket_layout, infos)
+            ]
+            if padding:
+                torch._foreach_zero_(padding)
             copy_dsts: list[torch.Tensor] = []
             copy_srcs: list[torch.Tensor] = []
             for tensor, info in zip(tensors, infos, strict=True):
@@ -1011,25 +1061,29 @@ class BucketedBlockShard(Placement):
                 )
             foreach_copy_(copy_dsts, copy_srcs)
 
-            send_buf = torch.zeros(
-                world_size * padded_segment_numel,
-                dtype=dtype,
-                device=device,
-            )
-            send_buf_by_rank = send_buf.view(world_size, padded_segment_numel)
-            copy_dsts = []
-            copy_srcs = []
-            for rank, (offset, numel) in enumerate(
-                zip(
-                    bucket_layout.rank_offsets,
-                    bucket_layout.rank_numels,
-                    strict=True,
+            if _has_equal_rank_numels(bucket_layout):
+                # Rank r's range is already row r of the reduce-scatter input.
+                send_buf = global_grad_bucket
+            else:
+                send_buf = torch.zeros(
+                    world_size * padded_segment_numel,
+                    dtype=dtype,
+                    device=device,
                 )
-            ):
-                if numel > 0:
-                    copy_srcs.append(global_grad_bucket[offset : offset + numel])
-                    copy_dsts.append(send_buf_by_rank[rank, :numel])
-            foreach_copy_(copy_dsts, copy_srcs)
+                send_buf_by_rank = send_buf.view(world_size, padded_segment_numel)
+                copy_dsts = []
+                copy_srcs = []
+                for rank, (offset, numel) in enumerate(
+                    zip(
+                        bucket_layout.rank_offsets,
+                        bucket_layout.rank_numels,
+                        strict=True,
+                    )
+                ):
+                    if numel > 0:
+                        copy_srcs.append(global_grad_bucket[offset : offset + numel])
+                        copy_dsts.append(send_buf_by_rank[rank, :numel])
+                foreach_copy_(copy_dsts, copy_srcs)
 
         return PlacementPreparedReduceGrad(
             placement=self,
