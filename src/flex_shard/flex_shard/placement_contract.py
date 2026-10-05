@@ -370,7 +370,10 @@ class PlacementUnshardResult:
     the storage backing ``full_params`` that the caller keeps across unshards:
     it frees their storage on reshard and re-allocates it before the next
     unshard refills them. They correspond to FSDP2's all-gather outputs and
-    unsharded inner tensors.
+    unsharded inner tensors. A refill (finish given the persistent buffers of an
+    earlier unshard) may return no ``full_params``: the caller keeps the full
+    params from the first unshard, which view those buffers, as FSDP2 builds its
+    unsharded parameters only at the first all-gather.
     """
 
     full_params: list[torch.Tensor]
