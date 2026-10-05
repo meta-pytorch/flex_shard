@@ -238,13 +238,18 @@ class BucketParamLayout:
 
 @dataclass(frozen=True)
 class BucketLayout:
-    """Bucket-global storage layout shared by parameters in one bucket."""
+    """Bucket-global storage layout shared by parameters in one bucket.
+
+    ``padding_ranges`` are the ``(offset, numel)`` ranges of the global bucket
+    that no parameter covers, such as alignment and tail padding.
+    """
 
     global_numel: int
     local_numel: int
     rank_offsets: tuple[int, ...]
     rank_numels: tuple[int, ...]
     param_layouts: dict[str, BucketParamLayout]
+    padding_ranges: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass
