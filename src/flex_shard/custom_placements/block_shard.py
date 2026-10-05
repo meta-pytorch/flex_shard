@@ -64,6 +64,12 @@ def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def _equal_rank_numels(rank_numels: tuple[int, ...]) -> bool:
+    """Whether every rank's bucket range has the same size, so the bucket is
+    world size equal segments in rank order."""
+    return len(set(rank_numels)) == 1
+
+
 class BlockShard(Placement):
     """Per-parameter block sharding in complete blocks along one dimension.
 
@@ -519,7 +525,6 @@ class BucketedBlockShard(Placement):
     @dataclass(frozen=True)
     class _UnshardState:
         infos: list[ParamInfo]
-        bucket_layout: BucketLayout
         pg: Any
         debug_fqn: str | None
 
@@ -912,7 +917,6 @@ class BucketedBlockShard(Placement):
             buffers=[send_buf, gathered_bucket, *copy_in_scratch],
             placement_state=BucketedBlockShard._UnshardState(
                 infos=infos,
-                bucket_layout=bucket_layout,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
             ),
@@ -926,11 +930,11 @@ class BucketedBlockShard(Placement):
                 f"got {type(prepared.placement_state).__name__}"
             )
         state = prepared.placement_state
-        bucket_layout = state.bucket_layout
+        bucket_layout = self._bucket_layout(state.infos[0])
         send_buf = prepared.buffers[0]
         gathered_bucket = prepared.buffers[1]
         with _record_comm_if_eager("FlexShard::all_gather", state.debug_fqn):
-            if bucket_layout.equal_rank_numels:
+            if _equal_rank_numels(bucket_layout.rank_numels):
                 # Into the bucket directly: with a list of outputs,
                 # ProcessGroupNCCL gathers into a flat buffer and copies it out.
                 dist.all_gather_into_tensor(gathered_bucket, send_buf, group=state.pg)
@@ -1013,7 +1017,7 @@ class BucketedBlockShard(Placement):
                 )
             foreach_copy_(copy_dsts, copy_srcs)
 
-            if bucket_layout.equal_rank_numels:
+            if _equal_rank_numels(bucket_layout.rank_numels):
                 # Rank r's range is already row r of the reduce-scatter input.
                 send_buf = global_grad_bucket
             else:
