@@ -470,9 +470,10 @@ class BucketRuntime:
     needs_sync: bool = False
     # Persistent unsharded params, created from the first unshard, and the
     # placement's persistent buffers backing them with their allocated storage
-    # size in bytes.
-    unsharded_params: list[nn.Parameter] | None = None
-    persistent_buffers: list[torch.Tensor] = field(default_factory=list)
+    # size in bytes. Left out of repr: their storage is freed while resharded,
+    # so printing them would read freed memory.
+    unsharded_params: list[nn.Parameter] | None = field(default=None, repr=False)
+    persistent_buffers: list[torch.Tensor] = field(default_factory=list, repr=False)
     persistent_buffer_nbytes: list[int] = field(default_factory=list)
     # Whether this bucket warned that its gradient bucket fell back to a copy.
     gradient_bucket_warned: bool = False
