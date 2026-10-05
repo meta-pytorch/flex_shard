@@ -283,11 +283,24 @@ class TestBucketedBlockShardDistributed(FSDPTestMultiThread):
 
         prepared = placement.prepare_unshard_bucket(local_shards, infos, mesh, None)
         send_buf = prepared.buffers[0]
-        self.assertEqual(
-            send_buf.untyped_storage().data_ptr(),
-            bucket_storage.byte_storage.untyped_storage().data_ptr(),
-        )
-        self.assertEqual(send_buf.data_ptr(), bucket_storage.byte_storage.data_ptr())
+        rank_numels = infos[0].bucket_layout.rank_numels
+        local_numel = rank_numels[mesh.get_local_rank()]
+        padded_numel = max(rank_numels)
+        if local_numel == padded_numel:
+            # The largest range is sent straight from the bucket storage.
+            self.assertEqual(
+                send_buf.untyped_storage().data_ptr(),
+                bucket_storage.byte_storage.untyped_storage().data_ptr(),
+            )
+            self.assertEqual(
+                send_buf.data_ptr(), bucket_storage.byte_storage.data_ptr()
+            )
+        else:
+            # A smaller range is zero-padded to the largest one.
+            self.assertEqual(send_buf.shape, (padded_numel,))
+            self.assertEqual(
+                send_buf[local_numel:], torch.zeros(padded_numel - local_numel)
+            )
 
         placement.run_prepared_unshard(prepared)
         result = placement.finish_prepared_unshard(prepared).full_params
