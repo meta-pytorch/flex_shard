@@ -36,7 +36,6 @@ from .utils import (
     foreach_copy_,
     pack_tensors_into_flat_buffer_with_scratch,
     reduce_scatter_grads,
-    zero_padding,
 )
 
 if TYPE_CHECKING:
@@ -63,12 +62,6 @@ def _align_up(value: int, alignment: int) -> int:
     if alignment <= 0:
         raise ValueError(f"Expected positive alignment, got {alignment}.")
     return ((value + alignment - 1) // alignment) * alignment
-
-
-def _has_equal_rank_numels(bucket_layout: BucketLayout) -> bool:
-    """Whether every rank's bucket range has the same size, so the bucket
-    is world size equal segments in rank order."""
-    return len(set(bucket_layout.rank_numels)) == 1
 
 
 class BlockShard(Placement):
@@ -526,11 +519,9 @@ class BucketedBlockShard(Placement):
     @dataclass(frozen=True)
     class _UnshardState:
         infos: list[ParamInfo]
+        bucket_layout: BucketLayout
         pg: Any
         debug_fqn: str | None
-        rank_offsets: tuple[int, ...]
-        rank_numels: tuple[int, ...]
-        equal_rank_numels: bool
 
     @dataclass(frozen=True)
     class _ReduceGradState:
@@ -754,8 +745,6 @@ class BucketedBlockShard(Placement):
 
         local_metadata: dict[str, tuple[torch.Size, int, int]] = {}
         param_layouts: dict[str, BucketParamLayout] = {}
-        padding_ranges: list[tuple[int, int]] = []
-        next_padding_start = 0
         has_local_param_data = False
         for fqn, param in named_params:
             if param.dtype != dtype:
@@ -772,11 +761,6 @@ class BucketedBlockShard(Placement):
                 )
             param_start = param_offsets[fqn]
             param_end = param_start + param.numel()
-            if next_padding_start < param_start:
-                padding_ranges.append(
-                    (next_padding_start, param_start - next_padding_start)
-                )
-            next_padding_start = param_end
             local_start = max(rank_start, param_start)
             local_end = min(rank_end, param_end)
             local_numel = max(0, local_end - local_start)
@@ -789,10 +773,6 @@ class BucketedBlockShard(Placement):
                 param_offset=param_start,
                 local_global_offset=local_start,
             )
-        if next_padding_start < padded_global_numel:
-            padding_ranges.append(
-                (next_padding_start, padded_global_numel - next_padding_start)
-            )
 
         bucket_layout = BucketLayout(
             global_numel=padded_global_numel,
@@ -800,7 +780,6 @@ class BucketedBlockShard(Placement):
             rank_offsets=rank_offsets,
             rank_numels=rank_numels,
             param_layouts=param_layouts,
-            padding_ranges=tuple(padding_ranges),
         )
         storage_layouts: dict[str, BucketParamStorageLayout] = {}
         for fqn, _ in named_params:
@@ -933,11 +912,9 @@ class BucketedBlockShard(Placement):
             buffers=[send_buf, gathered_bucket, *copy_in_scratch],
             placement_state=BucketedBlockShard._UnshardState(
                 infos=infos,
+                bucket_layout=bucket_layout,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
-                rank_offsets=bucket_layout.rank_offsets,
-                rank_numels=bucket_layout.rank_numels,
-                equal_rank_numels=_has_equal_rank_numels(bucket_layout),
             ),
         )
 
@@ -949,10 +926,11 @@ class BucketedBlockShard(Placement):
                 f"got {type(prepared.placement_state).__name__}"
             )
         state = prepared.placement_state
+        bucket_layout = state.bucket_layout
         send_buf = prepared.buffers[0]
         gathered_bucket = prepared.buffers[1]
         with _record_comm_if_eager("FlexShard::all_gather", state.debug_fqn):
-            if state.equal_rank_numels:
+            if bucket_layout.equal_rank_numels:
                 # Into the bucket directly: with a list of outputs,
                 # ProcessGroupNCCL gathers into a flat buffer and copies it out.
                 dist.all_gather_into_tensor(gathered_bucket, send_buf, group=state.pg)
@@ -960,7 +938,9 @@ class BucketedBlockShard(Placement):
                 gathered_views = [
                     gathered_bucket[offset : offset + numel]
                     for offset, numel in zip(
-                        state.rank_offsets, state.rank_numels, strict=True
+                        bucket_layout.rank_offsets,
+                        bucket_layout.rank_numels,
+                        strict=True,
                     )
                 ]
                 dist.all_gather(gathered_views, send_buf, group=state.pg)
@@ -1015,21 +995,11 @@ class BucketedBlockShard(Placement):
         bucket_layout = self._bucket_layout(infos[0])
         padded_segment_numel = max(bucket_layout.rank_numels)
         with _record_function_if_eager("FlexShard::reduce_scatter_copy_in", debug_fqn):
-            if len(infos) < len(bucket_layout.param_layouts):
-                # Params without a gradient in this reduction (e.g. frozen)
-                # keep zeros in their slots.
-                global_grad_bucket = torch.zeros(
-                    bucket_layout.global_numel,
-                    dtype=dtype,
-                    device=device,
-                )
-            else:
-                global_grad_bucket = torch.empty(
-                    bucket_layout.global_numel,
-                    dtype=dtype,
-                    device=device,
-                )
-                zero_padding(global_grad_bucket, bucket_layout.padding_ranges)
+            global_grad_bucket = torch.zeros(
+                bucket_layout.global_numel,
+                dtype=dtype,
+                device=device,
+            )
             copy_dsts: list[torch.Tensor] = []
             copy_srcs: list[torch.Tensor] = []
             for tensor, info in zip(tensors, infos, strict=True):
@@ -1043,7 +1013,7 @@ class BucketedBlockShard(Placement):
                 )
             foreach_copy_(copy_dsts, copy_srcs)
 
-            if _has_equal_rank_numels(bucket_layout):
+            if bucket_layout.equal_rank_numels:
                 # Rank r's range is already row r of the reduce-scatter input.
                 send_buf = global_grad_bucket
             else:

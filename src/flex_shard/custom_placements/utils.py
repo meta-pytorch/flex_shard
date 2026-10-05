@@ -36,19 +36,6 @@ def foreach_copy_(
         torch._foreach_copy_(dst_tensors, src_tensors)
 
 
-def zero_padding(
-    tensor: torch.Tensor,
-    ranges: tuple[tuple[int, int], ...],
-) -> None:
-    """Zero the ``(offset, numel)`` ranges of a flat tensor."""
-    slices = [tensor.narrow(0, offset, numel) for offset, numel in ranges]
-    if torch.compiler.is_compiling():
-        for slice_ in slices:
-            slice_.zero_()
-    elif slices:
-        torch._foreach_zero_(slices)
-
-
 def copy_tensor_to_dtype(
     tensor: torch.Tensor,
     dtype: torch.dtype,
