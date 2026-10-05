@@ -246,12 +246,6 @@ class BucketLayout:
     rank_numels: tuple[int, ...]
     param_layouts: dict[str, BucketParamLayout]
 
-    @functools.cached_property
-    def equal_rank_numels(self) -> bool:
-        """Whether every rank's range has the same size, so the bucket is
-        world size equal segments in rank order."""
-        return len(set(self.rank_numels)) == 1
-
 
 @dataclass
 class ParamInfo:
