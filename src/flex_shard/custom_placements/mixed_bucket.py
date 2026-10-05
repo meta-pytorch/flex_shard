@@ -517,6 +517,8 @@ class MixedBucketPlacement(Placement):
                 f"got {type(prepared.placement_state).__name__}"
             )
         state = prepared.placement_state
+        # A refill returns no full params (see PlacementUnshardResult).
+        refill = prepared.persistent_buffers is not None
         gathered_by_rank = prepared.buffers[1].view(
             state.world_size,
             state.row_numel,
@@ -571,15 +573,22 @@ class MixedBucketPlacement(Placement):
                     )
                     result = placement.finish_prepared_unshard(group_prepared)
                 buffers.append(gathered)
-                for index, full_param in zip(
-                    group.indices,
-                    result.full_params,
-                    strict=True,
-                ):
-                    full_params[index] = full_param
+                if not refill:
+                    for index, full_param in zip(
+                        group.indices,
+                        result.full_params,
+                        strict=True,
+                    ):
+                        full_params[index] = full_param
                 buffers.extend(result.buffers)
                 persistent_buffers.extend(result.persistent_buffers)
 
+        if refill:
+            return PlacementUnshardResult(
+                full_params=[],
+                buffers=buffers,
+                persistent_buffers=persistent_buffers,
+            )
         ordered_full_params: list[torch.Tensor] = []
         for full_param in full_params:
             if full_param is None:

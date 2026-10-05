@@ -225,7 +225,8 @@ class Shard(Placement):
         """Return full params and the padded buffers backing them.
 
         ``persistent_buffers`` are padded buffers from a previous persistent unshard
-        to write into instead of allocating.
+        to write into instead of allocating. Such a refill returns no full params:
+        the caller keeps the ones from the first unshard, which view these buffers.
         """
         full_params: list[torch.Tensor] = []
         padded_full_params: list[torch.Tensor] = []
@@ -243,9 +244,10 @@ class Shard(Placement):
                 )
             )
             padded_full_params.append(padded_full_param)
-            full_params.append(
-                padded_full_param[: info.global_numel].view(info.global_shape)
-            )
+            if persistent_buffers is None:
+                full_params.append(
+                    padded_full_param[: info.global_numel].view(info.global_shape)
+                )
             split_out.append(padded_full_param.view(world_size, padded_local_numel))
 
         torch.split_with_sizes_copy(
