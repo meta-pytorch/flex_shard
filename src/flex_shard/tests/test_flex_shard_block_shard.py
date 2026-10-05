@@ -363,6 +363,17 @@ class _PaddedTinyModule(nn.Module):
         self.bias = nn.Parameter(torch.arange(4, dtype=torch.float32) + 10)
 
 
+class _GappedTinyModule(nn.Module):
+    """3 + 6 + 3 elements at offsets 0, 4 and 10 in a bucket padded to 14:
+    alignment 2, so a 1-element gap after ``bias`` and 1 element of tail."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bias = nn.Parameter(torch.zeros(3))
+        self.weight = nn.Parameter(torch.zeros(3, 2))
+        self.scale = nn.Parameter(torch.zeros(3))
+
+
 def _bucketed_block_storage(model, mesh, blocks_per_rank, device="cpu"):
     placement = BucketedBlockShard(dims=(0,), blocks_per_rank=blocks_per_rank)
     named_params = list(model.named_parameters())
@@ -443,6 +454,36 @@ class TestBucketedBlockShardCollectives(TestCase):
             self.assertEqual(all_gather_into_tensor.call_count, 1)
             self.assertEqual(all_gather.call_count, 0)
             self.assertIs(all_gather_into_tensor.call_args.args[0], prepared.buffers[1])
+
+
+class TestBucketedBlockShardPadding(TestCase):
+    def test_reduce_zeroes_padding_and_params_left_out(self):
+        with single_rank_cpu_mesh() as mesh:
+            placement, infos, _ = _bucketed_block_storage(
+                _GappedTinyModule(), mesh, (1,)
+            )
+            self.assertEqual(infos[0].bucket_layout.padding_ranges, ((3, 1), (13, 1)))
+            grads = [
+                torch.full(info.global_shape, index + 1.0)
+                for index, info in enumerate(infos)
+            ]
+
+            def nan_empty(numel, **kwargs):
+                # Uninitialized memory, so that unzeroed padding shows.
+                return torch.full((numel,), float("nan"), **kwargs)
+
+            with mock.patch.object(torch, "empty", side_effect=nan_empty):
+                (send_buf,) = placement.prepare_reduce_grad(
+                    grads, infos, mesh, None
+                ).buffers
+                # ``bias`` left out of the reduction, e.g. frozen.
+                (send_buf_without_bias,) = placement.prepare_reduce_grad(
+                    grads[1:], infos[1:], mesh, None
+                ).buffers
+            expected = torch.tensor([1.0] * 3 + [0.0] + [2.0] * 6 + [3.0] * 3 + [0.0])
+            self.assertEqual(send_buf, expected)
+            expected[:3] = 0.0
+            self.assertEqual(send_buf_without_bias, expected)
 
 
 class TestBlockShardPlacement(TestCase):

@@ -36,6 +36,7 @@ from .utils import (
     foreach_copy_,
     pack_tensors_into_flat_buffer_with_scratch,
     reduce_scatter_grads,
+    zero_padding,
 )
 
 if TYPE_CHECKING:
@@ -561,12 +562,6 @@ class BucketedBlockShard(Placement):
             )
         self.dims = dims
         self.blocks_per_rank = blocks_per_rank
-        # Gradient bucket padding per (bucket layout, reduced params); the
-        # layout is kept with its ranges, so its id is not reused meanwhile.
-        self._padding_ranges_cache: dict[
-            tuple[int, tuple[str, ...]],
-            tuple[BucketLayout, tuple[tuple[int, int], ...]],
-        ] = {}
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, BucketedBlockShard):
@@ -759,6 +754,8 @@ class BucketedBlockShard(Placement):
 
         local_metadata: dict[str, tuple[torch.Size, int, int]] = {}
         param_layouts: dict[str, BucketParamLayout] = {}
+        padding_ranges: list[tuple[int, int]] = []
+        next_padding_start = 0
         has_local_param_data = False
         for fqn, param in named_params:
             if param.dtype != dtype:
@@ -775,6 +772,11 @@ class BucketedBlockShard(Placement):
                 )
             param_start = param_offsets[fqn]
             param_end = param_start + param.numel()
+            if next_padding_start < param_start:
+                padding_ranges.append(
+                    (next_padding_start, param_start - next_padding_start)
+                )
+            next_padding_start = param_end
             local_start = max(rank_start, param_start)
             local_end = min(rank_end, param_end)
             local_numel = max(0, local_end - local_start)
@@ -787,6 +789,10 @@ class BucketedBlockShard(Placement):
                 param_offset=param_start,
                 local_global_offset=local_start,
             )
+        if next_padding_start < padded_global_numel:
+            padding_ranges.append(
+                (next_padding_start, padded_global_numel - next_padding_start)
+            )
 
         bucket_layout = BucketLayout(
             global_numel=padded_global_numel,
@@ -794,6 +800,7 @@ class BucketedBlockShard(Placement):
             rank_offsets=rank_offsets,
             rank_numels=rank_numels,
             param_layouts=param_layouts,
+            padding_ranges=tuple(padding_ranges),
         )
         storage_layouts: dict[str, BucketParamStorageLayout] = {}
         for fqn, _ in named_params:
@@ -994,35 +1001,6 @@ class BucketedBlockShard(Placement):
             persistent_buffers=[bucket] if prepared.persistent else [],
         )
 
-    def _padding_ranges(
-        self,
-        bucket_layout: BucketLayout,
-        infos: list[ParamInfo],
-    ) -> tuple[tuple[int, int], ...]:
-        """The ranges of the gradient bucket that no reduced param covers:
-        alignment and tail padding, and params left out (e.g. frozen)."""
-        key = (id(bucket_layout), tuple(info.fqn for info in infos))
-        cached = self._padding_ranges_cache.get(key)
-        if cached is not None and cached[0] is bucket_layout:
-            return cached[1]
-        spans = sorted(
-            (
-                bucket_layout.param_layouts[info.fqn].param_offset,
-                bucket_layout.param_layouts[info.fqn].param_offset + info.global_numel,
-            )
-            for info in infos
-        )
-        ranges: list[tuple[int, int]] = []
-        cursor = 0
-        for start, end in spans:
-            if start > cursor:
-                ranges.append((cursor, start))
-            cursor = max(cursor, end)
-        if cursor < bucket_layout.global_numel:
-            ranges.append((cursor, bucket_layout.global_numel))
-        self._padding_ranges_cache[key] = (bucket_layout, tuple(ranges))
-        return tuple(ranges)
-
     @override
     def prepare_reduce_grad(
         self,
@@ -1037,17 +1015,21 @@ class BucketedBlockShard(Placement):
         bucket_layout = self._bucket_layout(infos[0])
         padded_segment_numel = max(bucket_layout.rank_numels)
         with _record_function_if_eager("FlexShard::reduce_scatter_copy_in", debug_fqn):
-            global_grad_bucket = torch.empty(
-                bucket_layout.global_numel,
-                dtype=dtype,
-                device=device,
-            )
-            padding = [
-                global_grad_bucket[start:end]
-                for start, end in self._padding_ranges(bucket_layout, infos)
-            ]
-            if padding:
-                torch._foreach_zero_(padding)
+            if len(infos) < len(bucket_layout.param_layouts):
+                # Params without a gradient in this reduction (e.g. frozen)
+                # keep zeros in their slots.
+                global_grad_bucket = torch.zeros(
+                    bucket_layout.global_numel,
+                    dtype=dtype,
+                    device=device,
+                )
+            else:
+                global_grad_bucket = torch.empty(
+                    bucket_layout.global_numel,
+                    dtype=dtype,
+                    device=device,
+                )
+                zero_padding(global_grad_bucket, bucket_layout.padding_ranges)
             copy_dsts: list[torch.Tensor] = []
             copy_srcs: list[torch.Tensor] = []
             for tensor, info in zip(tensors, infos, strict=True):
