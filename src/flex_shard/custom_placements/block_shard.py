@@ -64,6 +64,12 @@ def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def _equal_rank_numels(rank_numels: tuple[int, ...]) -> bool:
+    """Whether every rank's bucket range has the same size, so the bucket is
+    world size equal segments in rank order."""
+    return len(set(rank_numels)) == 1
+
+
 class BlockShard(Placement):
     """Per-parameter block sharding in complete blocks along one dimension.
 
@@ -523,7 +529,6 @@ class BucketedBlockShard(Placement):
     @dataclass(frozen=True)
     class _UnshardState:
         infos: list[ParamInfo]
-        bucket_layout: BucketLayout
         pg: Any
         debug_fqn: str | None
         # Whether the all-gather refills the persistent bucket in place.
@@ -919,7 +924,6 @@ class BucketedBlockShard(Placement):
             buffers=[send_buf, gathered_bucket, *copy_in_scratch],
             placement_state=BucketedBlockShard._UnshardState(
                 infos=infos,
-                bucket_layout=bucket_layout,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
             ),
@@ -976,7 +980,6 @@ class BucketedBlockShard(Placement):
             buffers=[send_buf, *copy_in_scratch],
             placement_state=BucketedBlockShard._UnshardState(
                 infos=infos,
-                bucket_layout=bucket_layout,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
                 in_place=True,
@@ -992,14 +995,14 @@ class BucketedBlockShard(Placement):
                 f"got {type(prepared.placement_state).__name__}"
             )
         state = prepared.placement_state
-        bucket_layout = state.bucket_layout
+        bucket_layout = self._bucket_layout(state.infos[0])
         send_buf = prepared.buffers[0]
         if state.in_place:
             gathered_bucket = prepared.persistent_buffers[0]
         else:
             gathered_bucket = prepared.buffers[1]
         with _record_comm_if_eager("FlexShard::all_gather", state.debug_fqn):
-            if bucket_layout.equal_rank_numels:
+            if _equal_rank_numels(bucket_layout.rank_numels):
                 # Into the bucket directly: with a list of outputs,
                 # ProcessGroupNCCL gathers into a flat buffer and copies it out.
                 dist.all_gather_into_tensor(gathered_bucket, send_buf, group=state.pg)
@@ -1066,7 +1069,7 @@ class BucketedBlockShard(Placement):
         device: torch.device,
     ) -> list[torch.Tensor] | None:
         bucket_layout = self._bucket_layout(infos[0])
-        if not bucket_layout.equal_rank_numels:
+        if not _equal_rank_numels(bucket_layout.rank_numels):
             # Uneven ranges pack a padded send buffer anyway.
             return None
         bucket = torch.zeros(bucket_layout.global_numel, dtype=dtype, device=device)
@@ -1082,7 +1085,7 @@ class BucketedBlockShard(Placement):
         self,
         tensors: list[torch.Tensor],
         infos: list[ParamInfo],
-        bucket_layout: BucketLayout,
+        global_numel: int,
         dtype: torch.dtype,
     ) -> torch.Tensor | None:
         """The gradient bucket ``tensors`` view at their layout offsets, if
@@ -1091,7 +1094,7 @@ class BucketedBlockShard(Placement):
         if (
             bucket is None
             or bucket.dtype != dtype
-            or bucket.shape != (bucket_layout.global_numel,)
+            or bucket.shape != (global_numel,)
             or not bucket.is_contiguous()
         ):
             return None
@@ -1120,8 +1123,10 @@ class BucketedBlockShard(Placement):
         device = tensors[0].device
         bucket_layout = self._bucket_layout(infos[0])
         padded_segment_numel = max(bucket_layout.rank_numels)
-        if bucket_layout.equal_rank_numels:
-            grad_bucket = self._gradient_bucket_of(tensors, infos, bucket_layout, dtype)
+        if _equal_rank_numels(bucket_layout.rank_numels):
+            grad_bucket = self._gradient_bucket_of(
+                tensors, infos, bucket_layout.global_numel, dtype
+            )
             if grad_bucket is not None:
                 # The grads are views of a gradient bucket in this layout
                 # (BucketSpec(gradient_bucket=True)): reduce it as is.
@@ -1155,7 +1160,7 @@ class BucketedBlockShard(Placement):
                 )
             foreach_copy_(copy_dsts, copy_srcs)
 
-            if bucket_layout.equal_rank_numels:
+            if _equal_rank_numels(bucket_layout.rank_numels):
                 # Rank r's range is already row r of the reduce-scatter input.
                 send_buf = global_grad_bucket
             else:
