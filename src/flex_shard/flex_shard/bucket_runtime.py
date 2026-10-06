@@ -822,8 +822,10 @@ class BucketRuntime:
 
     def _alloc_gradient_bucket(self) -> None:
         """For ``BucketSpec(gradient_bucket=True)``: make the unsharded grads
-        views of one buffer in the placement's gradient reduction layout, if
-        none exist yet (later backwards without sync accumulate into them)."""
+        views of zeroed buffers that mirror the persistent buffers the params
+        view, in the reduce dtype, if none exist yet (later backwards without
+        sync accumulate into them). A placement whose gradient reduction layout
+        is its parameter layout reduces such a buffer without copying."""
         if not self.bucket_storage._gradient_bucket or self.unsharded_params is None:
             return
         params = self.unsharded_params
@@ -831,18 +833,36 @@ class BucketRuntime:
             param.grad is not None for param in params
         ):
             return
-        info = self.infos[0]
-        views = info.placement.gradient_bucket_views(
-            self.infos, info.grad_reduce_dtype, params[0].device
-        )
-        if views is None:
-            self._warn_gradient_bucket_fallback(
-                f"its placement {info.placement!r} has no gradient bucket views"
-            )
-            return
-        for param, view in zip(params, views, strict=True):
-            if param.requires_grad:
-                param.grad = view
+        buffers = {_storage_ptr(buffer): buffer for buffer in self.persistent_buffers}
+        grad_buffers: dict[int | None, torch.Tensor] = {}
+        grads: list[torch.Tensor | None] = []
+        for param in params:
+            if not param.requires_grad:
+                grads.append(None)
+                continue
+            buffer = buffers.get(_storage_ptr(param))
+            if (
+                buffer is None
+                or buffer.dtype != param.dtype
+                or not param.is_contiguous()
+            ):
+                self._warn_gradient_bucket_fallback(
+                    "its params do not view its persistent buffers contiguously"
+                )
+                return
+            grad_buffer = grad_buffers.get(_storage_ptr(buffer))
+            if grad_buffer is None:
+                grad_buffer = torch.zeros(
+                    buffer.numel(),
+                    dtype=self.infos[0].grad_reduce_dtype,
+                    device=buffer.device,
+                )
+                grad_buffers[_storage_ptr(buffer)] = grad_buffer
+            offset = param.storage_offset() - buffer.storage_offset()
+            grads.append(grad_buffer[offset : offset + param.numel()].view(param.shape))
+        for param, grad in zip(params, grads, strict=True):
+            if grad is not None:
+                param.grad = grad
 
     def _check_gradient_bucket(
         self, grads: list[torch.Tensor | None], infos: list[ParamInfo]

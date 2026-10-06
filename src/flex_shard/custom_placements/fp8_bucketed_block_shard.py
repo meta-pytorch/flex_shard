@@ -1044,15 +1044,6 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         )
 
     @override
-    def gradient_bucket_views(
-        self,
-        infos: list[ParamInfo],
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> list[torch.Tensor] | None:
-        return None
-
-    @override
     def prepare_unshard_bucket(
         self,
         tensors: list[torch.Tensor],

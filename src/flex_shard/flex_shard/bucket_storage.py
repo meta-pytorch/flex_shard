@@ -202,16 +202,17 @@ class BucketSpec:
             ``delay_wgrad_compute``, whose ``backward_dw()`` runs later. A
             syncing backward that runs the module's backward but ends with the
             bucket unfinished raises. Eager only.
-        gradient_bucket: Whether this bucket's unsharded grads are views of one
-            zeroed buffer in the placement's gradient reduction layout, set in
-            its pre-backward hook (before ``pre_backward_hook``) when they do not
-            exist yet, so the reduce-scatter reads that buffer without copying
-            the grads in. They take the bucket's reduce dtype from the start of
-            its backward, instead of the compute dtype until the copy-in. Grads
-            that end up elsewhere (e.g. allocated before the pre-backward hook)
-            fall back to the copy, with a warning. Requires a placement with
-            ``gradient_bucket_views`` (``BucketedBlockShard`` with equal rank
-            ranges). Eager only.
+        gradient_bucket: Whether this bucket's unsharded grads are views of
+            zeroed buffers that mirror the persistent buffers the unsharded
+            params view, in the reduce dtype, set in its pre-backward hook
+            (before ``pre_backward_hook``) when they do not exist yet. A
+            placement whose gradient reduction layout is its parameter layout
+            (``BucketedBlockShard`` with equal rank ranges) then reduce-scatters
+            that buffer without copying the grads in. They take the bucket's
+            reduce dtype from the start of its backward, instead of the compute
+            dtype until the copy-in. Grads that end up elsewhere (e.g. allocated
+            before the pre-backward hook, or in more than one buffer) fall back
+            to the copy, with a warning. Eager only.
     """
 
     patterns: list[str]

@@ -637,8 +637,9 @@ class TestFlexShardEagerRuntime(TestCase):
                         self.assertTrue(all(reduced_bucket), reduced_bucket)
 
     def test_gradient_bucket_fallback_warns(self):
-        # Grads replaced after the pre-backward hook, or a placement without
-        # gradient bucket views, fall back to copying them in, once warned.
+        # Grads replaced after the pre-backward hook, or grads that view no
+        # single bucket (Shard(0) backs each param with its own buffer), fall
+        # back to copying them in, once warned.
         with single_rank_cuda_mesh() as mesh:
             for case in ("replaced", "shard"):
                 with self.subTest(case=case):
