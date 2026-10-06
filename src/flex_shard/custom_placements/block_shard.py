@@ -64,6 +64,23 @@ def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def _rank_range_views(
+    bucket: torch.Tensor,
+    padded_segments: torch.Tensor,
+    rank_offsets: tuple[int, ...],
+    rank_numels: tuple[int, ...],
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Each nonempty rank range of ``bucket``, and the start of that rank's row
+    in ``padded_segments`` (world size by the largest range)."""
+    bucket_views: list[torch.Tensor] = []
+    segment_views: list[torch.Tensor] = []
+    for rank, (offset, numel) in enumerate(zip(rank_offsets, rank_numels, strict=True)):
+        if numel > 0:
+            bucket_views.append(bucket[offset : offset + numel])
+            segment_views.append(padded_segments[rank, :numel])
+    return bucket_views, segment_views
+
+
 class BlockShard(Placement):
     """Per-parameter block sharding in complete blocks along one dimension.
 
@@ -514,6 +531,9 @@ class BucketedBlockShard(Placement):
     rank-local ranges so the all-gather output is laid out as the full
     parameters. In eager mode it is copied into one persistent bucket buffer
     that the full parameters view; during graph capture they view it directly.
+    Collectives zero-pad ranks with smaller ranges to the largest one; with
+    equal ranges (the default) nothing is padded, so the bucket itself is the
+    all-gather output and the reduce-scatter input.
     """
 
     @dataclass(frozen=True)
@@ -521,7 +541,6 @@ class BucketedBlockShard(Placement):
         infos: list[ParamInfo]
         pg: Any
         debug_fqn: str | None
-        num_gathered_views: int
 
     @dataclass(frozen=True)
     class _ReduceGradState:
@@ -902,27 +921,21 @@ class BucketedBlockShard(Placement):
             else:
                 send_buf = copy_tensor_to_dtype(send_buf, dtype)
             bucket_layout = self._bucket_layout(infos[0])
+            padding = max(bucket_layout.rank_numels) - send_buf.numel()
+            if padding > 0:
+                send_buf = nn.functional.pad(send_buf, (0, padding))
             gathered_bucket = torch.empty(
                 bucket_layout.global_numel,
                 dtype=dtype,
                 device=device,
             )
-            gathered_views = [
-                gathered_bucket[offset : offset + numel]
-                for offset, numel in zip(
-                    bucket_layout.rank_offsets,
-                    bucket_layout.rank_numels,
-                    strict=True,
-                )
-            ]
         return PlacementPreparedUnshard(
             placement=self,
-            buffers=[send_buf, gathered_bucket, *gathered_views, *copy_in_scratch],
+            buffers=[send_buf, gathered_bucket, *copy_in_scratch],
             placement_state=BucketedBlockShard._UnshardState(
                 infos=infos,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
-                num_gathered_views=len(gathered_views),
             ),
         )
 
@@ -933,15 +946,27 @@ class BucketedBlockShard(Placement):
                 "Expected BucketedBlockShard._UnshardState, "
                 f"got {type(prepared.placement_state).__name__}"
             )
+        state = prepared.placement_state
         send_buf = prepared.buffers[0]
-        gathered_views = prepared.buffers[
-            2 : 2 + prepared.placement_state.num_gathered_views
-        ]
-        with _record_comm_if_eager(
-            "FlexShard::all_gather",
-            prepared.placement_state.debug_fqn,
-        ):
-            dist.all_gather(gathered_views, send_buf, group=prepared.placement_state.pg)
+        gathered_bucket = prepared.buffers[1]
+        world_size = dist.get_world_size(state.pg)
+        # Each rank sends its padded range, so the output is that many padded
+        # segments: the bucket itself unless some range is padded.
+        output = gathered_bucket
+        if world_size * send_buf.numel() != gathered_bucket.numel():
+            output = gathered_bucket.new_empty(world_size * send_buf.numel())
+        with _record_comm_if_eager("FlexShard::all_gather", state.debug_fqn):
+            dist.all_gather_into_tensor(output, send_buf, group=state.pg)
+        if output is not gathered_bucket:
+            bucket_layout = self._bucket_layout(state.infos[0])
+            bucket_views, segment_views = _rank_range_views(
+                gathered_bucket,
+                output.view(world_size, -1),
+                bucket_layout.rank_offsets,
+                bucket_layout.rank_numels,
+            )
+            with _record_copy_out_if_eager():
+                foreach_copy_(bucket_views, segment_views)
 
     @override
     def finish_prepared_unshard(
@@ -967,13 +992,16 @@ class BucketedBlockShard(Placement):
         else:
             bucket = gathered_bucket
         full_params: list[torch.Tensor] = []
-        for info in prepared.placement_state.infos:
-            param_offset = self._param_layout(info).param_offset
-            full_params.append(
-                bucket[param_offset : param_offset + info.global_numel].view(
-                    info.global_shape
+        if prepared.persistent_buffers is None:
+            # A refill returns no full params: the caller keeps the ones from
+            # the first unshard, which view the persistent bucket.
+            for info in prepared.placement_state.infos:
+                param_offset = self._param_layout(info).param_offset
+                full_params.append(
+                    bucket[param_offset : param_offset + info.global_numel].view(
+                        info.global_shape
+                    )
                 )
-            )
         return PlacementUnshardResult(
             full_params=full_params,
             persistent_buffers=[bucket] if prepared.persistent else [],
@@ -1011,25 +1039,22 @@ class BucketedBlockShard(Placement):
                 )
             foreach_copy_(copy_dsts, copy_srcs)
 
-            send_buf = torch.zeros(
-                world_size * padded_segment_numel,
-                dtype=dtype,
-                device=device,
-            )
-            send_buf_by_rank = send_buf.view(world_size, padded_segment_numel)
-            copy_dsts = []
-            copy_srcs = []
-            for rank, (offset, numel) in enumerate(
-                zip(
+            # The reduce-scatter input is world size padded segments: the
+            # gradient bucket itself unless some range is padded.
+            send_buf = global_grad_bucket
+            if world_size * padded_segment_numel != bucket_layout.global_numel:
+                send_buf = torch.zeros(
+                    world_size * padded_segment_numel,
+                    dtype=dtype,
+                    device=device,
+                )
+                bucket_views, segment_views = _rank_range_views(
+                    global_grad_bucket,
+                    send_buf.view(world_size, padded_segment_numel),
                     bucket_layout.rank_offsets,
                     bucket_layout.rank_numels,
-                    strict=True,
                 )
-            ):
-                if numel > 0:
-                    copy_srcs.append(global_grad_bucket[offset : offset + numel])
-                    copy_dsts.append(send_buf_by_rank[rank, :numel])
-            foreach_copy_(copy_dsts, copy_srcs)
+                foreach_copy_(segment_views, bucket_views)
 
         return PlacementPreparedReduceGrad(
             placement=self,

@@ -283,11 +283,16 @@ class TestBucketedBlockShardDistributed(FSDPTestMultiThread):
 
         prepared = placement.prepare_unshard_bucket(local_shards, infos, mesh, None)
         send_buf = prepared.buffers[0]
-        self.assertEqual(
-            send_buf.untyped_storage().data_ptr(),
-            bucket_storage.byte_storage.untyped_storage().data_ptr(),
-        )
-        self.assertEqual(send_buf.data_ptr(), bucket_storage.byte_storage.data_ptr())
+        rank_numels = infos[0].bucket_layout.rank_numels
+        if rank_numels[mesh.get_local_rank()] == max(rank_numels):
+            # Smaller ranges are sent zero-padded to the largest one.
+            self.assertEqual(
+                send_buf.untyped_storage().data_ptr(),
+                bucket_storage.byte_storage.untyped_storage().data_ptr(),
+            )
+            self.assertEqual(
+                send_buf.data_ptr(), bucket_storage.byte_storage.data_ptr()
+            )
 
         placement.run_prepared_unshard(prepared)
         result = placement.finish_prepared_unshard(prepared).full_params
