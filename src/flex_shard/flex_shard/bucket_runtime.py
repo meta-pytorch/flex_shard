@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any
@@ -1131,6 +1132,10 @@ class BucketRuntime:
                 "FlexShard BucketSpec gradient_bucket is eager-only; the traced "
                 "backward owns its gradient buffers."
             )
+        if len(self.bucket_storage._hook_module_fqns or ()) > 1:
+            raise NotImplementedError(
+                "FlexShard buckets of patterns naming several modules are eager-only."
+            )
         full_params = _BucketUnshard.apply(self, *self._local_shards(use_autograd=True))
         self._swap_in_params(list(full_params))
 
@@ -1299,16 +1304,16 @@ def _install_bucket_unshard_hooks(
             raise AssertionError("Expected FlexShard bucket storage to be on CUDA.")
 
         bucket_runtime = BucketRuntime.from_bucket_storage(bucket_storage)
-        target = bucket_runtime.forward_hook_module()
-        # Prepended so earlier user pre-forward hooks see the unsharded params.
-        target.register_forward_pre_hook(
+        # A bucket whose patterns name modules hooks those (BucketSpec.patterns).
+        _register_forward_hooks(
+            [
+                _unwrap_checkpoint(bucket_storage._module.get_submodule(fqn))
+                for fqn in bucket_storage._hook_module_fqns
+            ]
+            if bucket_storage._hook_module_fqns
+            else [bucket_runtime.forward_hook_module()],
             bucket_runtime.pre_forward_hook,
-            prepend=True,
-            with_kwargs=True,
-        )
-        target.register_forward_hook(
             bucket_runtime.post_forward_hook,
-            always_call=True,
         )
         bucket_runtime.context.buckets.append(bucket_runtime)
         for bucket_param in bucket_runtime.bucket_params:
@@ -1320,6 +1325,40 @@ def _install_bucket_unshard_hooks(
         reshard_hook = functools.partial(_reshard_buckets, tuple(buckets.values()))
         module.register_state_dict_pre_hook(reshard_hook)
         module._register_load_state_dict_pre_hook(reshard_hook)
+
+
+def _register_forward_hooks(
+    modules: list[nn.Module],
+    pre_hook: Callable[..., None],
+    post_hook: Callable[..., None],
+) -> None:
+    """Run ``pre_hook`` when the first of ``modules`` starts its forward and
+    ``post_hook`` once all of them have finished theirs, as FSDP2's
+    ``_register_group_forward_hooks`` does for ``fully_shard`` on a list of
+    modules. With one module, these are its plain forward hooks."""
+    if len(modules) == 1:
+        group_pre_hook, group_post_hook = pre_hook, post_hook
+    else:
+        to_run: set[nn.Module] = set()
+
+        def group_pre_hook(module: nn.Module, args: Any, kwargs: Any) -> None:
+            if not to_run:
+                to_run.update(modules)
+                pre_hook(module, args, kwargs)
+
+        def group_post_hook(module: nn.Module, args: Any, output: Any) -> None:
+            to_run.discard(module)
+            if not to_run:
+                post_hook(module, args, output)
+
+    for module in modules:
+        # Prepended so earlier user pre-forward hooks see the unsharded params.
+        module.register_forward_pre_hook(group_pre_hook, prepend=True, with_kwargs=True)
+        module.register_forward_hook(group_post_hook, always_call=True)
+
+
+def _unwrap_checkpoint(module: nn.Module) -> nn.Module:
+    return getattr(module, "_checkpoint_wrapped_module", module)
 
 
 def _reshard_buckets(

@@ -288,6 +288,67 @@ class TestFlexShardEagerRuntime(TestCase):
                 model.tok_embeddings.weight.grad, reference.tok_embeddings.weight.grad
             )
 
+    def test_module_patterns(self):
+        # Patterns naming sibling modules make a bucket of their params, hooked
+        # on them rather than on their parent: it unshards in the first one's
+        # forward and reshards after the last one's, before the next module
+        # runs. Backward re-gathers it from the last one's outputs and reduces
+        # once the first one's input grads are computed; training matches an
+        # unsharded reference. Patterns may not mix modules with parameters or
+        # name a container without a forward.
+        with single_rank_cuda_mesh() as mesh:
+            torch.manual_seed(0)
+            model = nn.Sequential(
+                nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8)
+            )
+            reference = copy.deepcopy(model).cuda()
+            for invalid, bucket_patterns, error in (
+                (copy.deepcopy(model), (["0", "2.*"], ["4.*"]), "mix module FQNs"),
+                (
+                    nn.Sequential(nn.ModuleList([nn.Linear(8, 8)])),
+                    (["0"],),
+                    "no forward",
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, error):
+                    flex_shard(
+                        invalid,
+                        buckets=[
+                            _bucket(patterns, mesh, reshard_after_forward=True)
+                            for patterns in bucket_patterns
+                        ],
+                    )
+            flex_shard(
+                model,
+                buckets=[
+                    _bucket(["0", "2"], mesh, reshard_after_forward=True),
+                    _bucket(["4"], mesh, reshard_after_forward=True),
+                ],
+            )
+            layers, _ = _buckets(model)
+            unsharded_in = {}
+            for idx in (2, 4):
+                model[idx].register_forward_pre_hook(
+                    lambda module, args, idx=idx: unsharded_in.update(
+                        {idx: layers.is_unsharded}
+                    )
+                )
+            optim = torch.optim.SGD(model.parameters(), lr=0.1)
+            ref_optim = torch.optim.SGD(reference.parameters(), lr=0.1)
+            for _ in range(2):
+                optim.zero_grad()
+                ref_optim.zero_grad()
+                x = torch.randn(4, 8, device="cuda", requires_grad=True)
+                model(x * 2).sum().backward()
+                reference(x * 2).sum().backward()
+                self.assertEqual(unsharded_in, {2: True, 4: False})
+                for param, ref_param in zip(
+                    model.parameters(), reference.parameters(), strict=True
+                ):
+                    torch.testing.assert_close(param.grad, ref_param.grad)
+                optim.step()
+                ref_optim.step()
+
     def test_persistent_unsharded_params(self):
         for reshard_after_forward in (False, True):
             with (
