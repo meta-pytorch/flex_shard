@@ -1068,13 +1068,16 @@ class BucketedBlockShard(Placement):
         else:
             bucket = gathered_bucket
         full_params: list[torch.Tensor] = []
-        for info in prepared.placement_state.infos:
-            param_offset = self._param_layout(info).param_offset
-            full_params.append(
-                bucket[param_offset : param_offset + info.global_numel].view(
-                    info.global_shape
+        if prepared.persistent_buffers is None:
+            # A refill returns no full params: the caller keeps the ones from
+            # the first unshard, which view the persistent bucket.
+            for info in prepared.placement_state.infos:
+                param_offset = self._param_layout(info).param_offset
+                full_params.append(
+                    bucket[param_offset : param_offset + info.global_numel].view(
+                        info.global_shape
+                    )
                 )
-            )
         return PlacementUnshardResult(
             full_params=full_params,
             persistent_buffers=[bucket] if prepared.persistent else [],
