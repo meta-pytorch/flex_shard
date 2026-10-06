@@ -25,9 +25,6 @@ if TYPE_CHECKING:
 class UnshardHandle:
     """Handle for a FlexShard bucket unshard operation."""
 
-    # Whether the unshard refills the persistent buffers of an earlier one.
-    refill: bool = False
-
     def finish(self) -> PlacementUnshardResult:
         """Wait for the unshard and return its full params (once)."""
         raise NotImplementedError
@@ -211,10 +208,6 @@ class AsyncUnshardResult(UnshardHandle):
 
     def __post_init__(self) -> None:
         self._device = _first_tensor_device(self.prepared.buffers)
-
-    @property
-    def refill(self) -> bool:
-        return self.prepared.persistent_buffers is not None
 
     def finish(self) -> PlacementUnshardResult:
         if self._finished:
