@@ -403,19 +403,26 @@ class BlockShard(Placement):
         tensors: list[torch.Tensor],
         infos: list[ParamInfo],
         world_size: int,
+        send_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, BlockShard._PaddedBucketLayout]:
+        """Copy each rank's blocks of the full grads into its row of a zeroed
+        send buffer, or of ``send_rows`` (world size x padded segment), where
+        the caller zeroes the padding and the rows of ranks without blocks."""
         self._validate_world_size(world_size)
         layout = self._padded_bucket_layout(infos)
         dtype = _grad_reduce_dtype(infos[0])
         device = tensors[0].device
         if any(_grad_reduce_dtype(info) != dtype for info in infos):
             raise ValueError("BlockShard requires one reduce dtype per bucket.")
-        send_buf = torch.zeros(
-            world_size * layout.padded_segment_numel,
-            dtype=dtype,
-            device=device,
-        )
-        send_rows = send_buf.view(world_size, layout.padded_segment_numel)
+        if send_rows is None:
+            send_buf = torch.zeros(
+                world_size * layout.padded_segment_numel,
+                dtype=dtype,
+                device=device,
+            )
+            send_rows = send_buf.view(world_size, layout.padded_segment_numel)
+        else:
+            send_buf = send_rows
         copy_dsts: list[torch.Tensor] = []
         copy_srcs: list[torch.Tensor] = []
         for tensor, info in zip(tensors, infos, strict=True):
