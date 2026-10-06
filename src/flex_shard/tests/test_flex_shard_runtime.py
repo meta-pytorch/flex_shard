@@ -496,21 +496,16 @@ class TestFlexShardEagerRuntime(TestCase):
             # All but the first unshard of forward and of backward were prefetched.
             self.assertEqual(sum(hits), 4)
 
-    def test_released_in_place_refill_frees_storage(self):
-        # A prefetch that refills a bucket's persistent storage in place and is
-        # then released unused frees that storage, and later steps still match.
+    def test_released_refill_frees_storage(self):
+        # A prefetch that refills a bucket's persistent storage, which begin
+        # re-allocates, and is then released unused frees that storage; later
+        # steps still match.
         with single_rank_cuda_mesh() as mesh:
             model = _SkipNet(8)
             reference = copy.deepcopy(model).cuda()
-            placement_fn = make_bucketed_block_placement_fn(
-                dims=(0,), blocks_per_rank=(1,)
-            )
             flex_shard(
                 model,
-                buckets=[
-                    _bucket([f"layers.{idx}.*"], mesh, True, placement_fn)
-                    for idx in range(3)
-                ],
+                buckets=[_bucket([f"layers.{idx}.*"], mesh, True) for idx in range(3)],
             )
             buckets = _buckets(model)
             optim = torch.optim.SGD(model.parameters(), lr=0.1)

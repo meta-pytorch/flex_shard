@@ -23,22 +23,13 @@ if TYPE_CHECKING:
 
 
 class UnshardHandle:
-    """Handle for a FlexShard bucket unshard operation.
+    """Handle for a FlexShard bucket unshard operation."""
 
-    ``refilled_in_place`` marks an unshard that gathered straight into the
-    persistent buffers it was given (see ``begin_bucket_unshard``).
-    """
+    # Whether the unshard refills the persistent buffers of an earlier one.
+    refill: bool = False
 
-    refilled_in_place: bool = False
-
-    def finish(
-        self, persistent_buffers: list[torch.Tensor] | None = None
-    ) -> PlacementUnshardResult:
-        """Wait for the unshard and return its full params (once).
-
-        For a persistent unshard, ``persistent_buffers`` are the buffers from
-        the first one to refill (see ``PlacementPreparedUnshard``).
-        """
+    def finish(self) -> PlacementUnshardResult:
+        """Wait for the unshard and return its full params (once)."""
         raise NotImplementedError
 
     def wait(self) -> None:
@@ -113,11 +104,10 @@ def begin_bucket_unshard(
     """Begin a bucket unshard and return a handle for full params.
 
     Eager unshards are persistent (see ``PlacementPreparedUnshard``); during
-    graph capture the traced graph owns buffer lifetimes. Given
-    ``persistent_buffers``, which the placement must
-    ``refills_persistent_buffers_in_place()``, the unshard gathers straight
-    into them, without bumping their version counters. Their storage must
-    already be re-allocated on the current stream, before this call.
+    graph capture the traced graph owns buffer lifetimes. Given the
+    ``persistent_buffers`` of an earlier unshard, with storage already
+    re-allocated on the current stream, the unshard refills them, in run or in
+    finish as the placement chooses.
     """
     placement = _get_bucket_placement(infos, "unshard")
 
@@ -132,24 +122,20 @@ def begin_bucket_unshard(
     copy_in_done.record(device_handle.current_stream(device))
     with device_handle.stream(unshard_stream):
         unshard_stream.wait_event(copy_in_done)
+        prepared = placement.prepare_unshard_bucket(tensors, infos, mesh, debug_fqn)
+        prepared.persistent = True
+        prepared.persistent_buffers = persistent_buffers
         if persistent_buffers is None:
-            prepared = placement.prepare_unshard_bucket(tensors, infos, mesh, debug_fqn)
-            prepared.persistent = True
             prepared.placement.run_prepared_unshard(prepared)
         else:
-            prepared = placement.prepare_unshard_bucket(
-                tensors,
-                infos,
-                mesh,
-                debug_fqn,
-                persistent_buffers=persistent_buffers,
-            )
-            prepared.persistent = True
-            prepared.persistent_buffers = persistent_buffers
-            # Autograd may have saved the unsharded params, which view these
-            # buffers, before a reshard (as in finish_unshard).
-            with torch.autograd._unsafe_preserve_version_counter(
-                tuple(persistent_buffers)
+            # Run may write the persistent buffers, which the unsharded params
+            # view; autograd may have saved those before a reshard.
+            with (
+                torch.inference_mode(False),
+                torch.no_grad(),
+                torch.autograd._unsafe_preserve_version_counter(
+                    tuple(persistent_buffers)
+                ),
             ):
                 prepared.placement.run_prepared_unshard(prepared)
         event = device_handle.Event()
@@ -159,7 +145,6 @@ def begin_bucket_unshard(
         event=event,
         unshard_stream=unshard_stream,
         device_handle=device_handle,
-        refilled_in_place=persistent_buffers is not None,
     )
 
 
@@ -203,11 +188,7 @@ class SyncUnshardResult(UnshardHandle):
 
     full_params: list[torch.Tensor]
 
-    def finish(
-        self, persistent_buffers: list[torch.Tensor] | None = None
-    ) -> PlacementUnshardResult:
-        if persistent_buffers is not None:
-            raise AssertionError("Persistent unshards are eager-only.")
+    def finish(self) -> PlacementUnshardResult:
         return PlacementUnshardResult(self.full_params)
 
     def wait(self) -> None:
@@ -225,21 +206,21 @@ class AsyncUnshardResult(UnshardHandle):
     event: torch.Event
     unshard_stream: torch.Stream
     device_handle: ModuleType
-    refilled_in_place: bool = False
     _device: torch.device | None = field(default=None, init=False)
     _finished: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         self._device = _first_tensor_device(self.prepared.buffers)
 
-    def finish(
-        self, persistent_buffers: list[torch.Tensor] | None = None
-    ) -> PlacementUnshardResult:
+    @property
+    def refill(self) -> bool:
+        return self.prepared.persistent_buffers is not None
+
+    def finish(self) -> PlacementUnshardResult:
         if self._finished:
             raise RuntimeError("An unshard may only be finished once.")
         self._finished = True
         self.wait()
-        self.prepared.persistent_buffers = persistent_buffers
         result = self.prepared.placement.finish_prepared_unshard(self.prepared)
         # Only work queued so far on the current stream (the copy-out) reads
         # the prepare and finish buffers.

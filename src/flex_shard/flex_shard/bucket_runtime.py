@@ -279,9 +279,7 @@ class BucketCommContext:
         ):
             pending.result.wait()
             pending.result.release_buffers()
-            if pending.result.refilled_in_place:
-                # The all-gather refilled the persistent storage, which the
-                # current stream now waits on before the allocator reuses it.
+            if pending.result.refill:
                 pending.bucket.free_persistent_storage()
         return None
 
@@ -580,21 +578,20 @@ class BucketRuntime:
     ) -> UnshardHandle:
         """Begin this bucket's unshard on the shared stream.
 
-        A refill whose placement ``refills_persistent_buffers_in_place()``
-        re-allocates the persistent storage here, on the current stream (the
-        one that frees it on reshard) and before the unshard stream waits on
-        it, and gathers straight into it.
+        A refill re-allocates the persistent storage here, on the current
+        stream (the one that frees it on reshard) and before the unshard stream
+        waits on it, and the placement writes the new values into it, during
+        the unshard or when it is finished.
         """
         if local_shards is None:
             local_shards = self._local_shards(use_autograd=False)
         persistent_buffers = None
-        if (
-            self.unsharded_params is not None
-            and not torch.compiler.is_compiling()
-            and self.infos[0].placement.refills_persistent_buffers_in_place()
-        ):
+        if self.unsharded_params is not None and not torch.compiler.is_compiling():
             with torch.inference_mode(False):
-                self._alloc_persistent_storage()
+                for persistent_buffer, nbytes in zip(
+                    self.persistent_buffers, self.persistent_buffer_nbytes, strict=True
+                ):
+                    _alloc_storage(persistent_buffer, nbytes)
             persistent_buffers = self.persistent_buffers
         return begin_bucket_unshard(
             local_shards,
@@ -658,12 +655,11 @@ class BucketRuntime:
 
         The first unshard creates the unsharded params from the placement's
         full params and keeps the persistent buffers backing them. Later ones
-        re-allocate those buffers and the placement refills them in place
-        without bumping their version counters, which the unsharded params
-        share (autograd may have saved them in forward before a reshard), as
-        FSDP2 does for its all-gather outputs. The storage is created outside
-        inference mode, so a model first run under ``torch.inference_mode()``
-        can still train.
+        (see ``begin_unshard``) write those buffers without bumping their
+        version counters, which the unsharded params share (autograd may have
+        saved them in forward before a reshard), as FSDP2 does for its
+        all-gather outputs. The storage is created outside inference mode, so a
+        model first run under ``torch.inference_mode()`` can still train.
         """
         with torch.inference_mode(False), torch.no_grad():
             if self.unsharded_params is None:
@@ -672,12 +668,10 @@ class BucketRuntime:
                     unshard.full_params, unshard.persistent_buffers
                 )
             else:
-                # A no-op for an in-place refill, which allocated in begin.
-                self._alloc_persistent_storage()
                 with torch.autograd._unsafe_preserve_version_counter(
                     tuple(self.persistent_buffers)
                 ):
-                    refill = result.finish(persistent_buffers=self.persistent_buffers)
+                    refill = result.finish()
                 if len(refill.persistent_buffers) != len(
                     self.persistent_buffers
                 ) or any(
@@ -754,18 +748,12 @@ class BucketRuntime:
         self.free_persistent_storage()
         self.is_unsharded = False
 
-    def _alloc_persistent_storage(self) -> None:
-        for persistent_buffer, nbytes in zip(
-            self.persistent_buffers, self.persistent_buffer_nbytes, strict=True
-        ):
-            _alloc_storage(persistent_buffer, nbytes)
-
     def free_persistent_storage(self) -> None:
         """Free the storage behind the unsharded params.
 
         Consumers of the storage were queued on this stream, which also
-        allocated it (an in-place refill's unshard stream writes it only after
-        waiting on this stream), so the caching allocator orders the reuse.
+        allocated it (a refill's unshard stream writes it only after waiting on
+        this stream), so the caching allocator orders the reuse.
         """
         for persistent_buffer in self.persistent_buffers:
             _free_storage(persistent_buffer)

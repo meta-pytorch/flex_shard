@@ -287,18 +287,6 @@ class Placement(ABC):
             f"{self!r} does not support distributed checkpointing."
         )
 
-    def refills_persistent_buffers_in_place(self) -> bool:
-        """Whether a refill can gather straight into the persistent buffers.
-
-        If so, ``prepare_unshard_bucket`` also accepts ``persistent_buffers``:
-        those of an earlier persistent unshard, with storage the caller
-        re-allocated on the current stream before the unshard stream waits on
-        it. The collective then writes them in place, so finish copies nothing.
-        A refill that is never finished leaves the caller to free their storage
-        once the collective is done.
-        """
-        return False
-
     def gradient_bucket_views(
         self,
         infos: list[ParamInfo],
@@ -373,11 +361,13 @@ class PlacementPreparedUnshard:
     parameters). On the first persistent unshard ``persistent_buffers`` is
     None: the placement allocates fresh buffers on the current stream, backs
     the full params with them only, and returns them as
-    ``PlacementUnshardResult.persistent_buffers``. On later unshards
-    ``persistent_buffers`` holds those buffers, with storage re-allocated by
-    the caller, and finish writes the new values into them in the same layout;
-    a placement that ``refills_persistent_buffers_in_place()`` receives them in
-    prepare instead and gathers straight into them.
+    ``PlacementUnshardResult.persistent_buffers``. On later unshards (refills)
+    the caller sets ``persistent_buffers`` to those buffers before run, with
+    storage it re-allocated on the current stream before the unshard stream
+    waited on it. The placement writes the new values into them, in the same
+    layout, where it chooses: run may gather straight into them on the unshard
+    stream, or finish may copy into them on the current stream. Finish returns
+    them.
     Eager unshards are persistent. During graph capture they are not, and the
     full params may view gathered buffers whose lifetime the traced graph owns.
     """
@@ -399,10 +389,9 @@ class PlacementUnshardResult:
     the storage backing ``full_params`` that the caller keeps across unshards:
     it frees their storage on reshard and re-allocates it before the next
     unshard refills them. They correspond to FSDP2's all-gather outputs and
-    unsharded inner tensors. A refill (finish given the persistent buffers of an
-    earlier unshard) may return no ``full_params``: the caller keeps the full
-    params from the first unshard, which view those buffers, as FSDP2 builds its
-    unsharded parameters only at the first all-gather.
+    unsharded inner tensors. A refill may return no ``full_params``: the caller
+    keeps the full params from the first unshard, which view those buffers, as
+    FSDP2 builds its unsharded parameters only at the first all-gather.
     """
 
     full_params: list[torch.Tensor]

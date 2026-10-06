@@ -532,11 +532,11 @@ class BucketedBlockShard(Placement):
     parameters. In eager mode the first unshard copies it into one persistent
     bucket buffer that the full parameters view, and later unshards gather
     straight into that buffer; during graph capture they view the gathered
-    bucket directly. With ``BucketSpec(gradient_bucket=True)`` the gradients are
-    views of one bucket in the same layout, which the reduce-scatter reads as
-    is. Collectives zero-pad ranks with smaller ranges to the largest one; with
-    equal ranges (the default) nothing is padded, so the bucket itself is the
-    all-gather output and the reduce-scatter input.
+    bucket directly. Collectives zero-pad ranks with smaller ranges to the
+    largest one; with equal ranges (the default) nothing is padded, so the
+    bucket itself is the all-gather output and the reduce-scatter input. With
+    ``BucketSpec(gradient_bucket=True)`` the gradients are views of one bucket
+    in the same layout, which the reduce-scatter reads as is.
     """
 
     @dataclass(frozen=True)
@@ -544,8 +544,6 @@ class BucketedBlockShard(Placement):
         infos: list[ParamInfo]
         pg: Any
         debug_fqn: str | None
-        # Whether the all-gather refills the persistent bucket in place.
-        in_place: bool = False
 
     @dataclass(frozen=True)
     class _ReduceGradState:
@@ -902,96 +900,32 @@ class BucketedBlockShard(Placement):
         )
 
     @override
-    def refills_persistent_buffers_in_place(self) -> bool:
-        return True
-
-    @override
     def prepare_unshard_bucket(
         self,
         tensors: list[torch.Tensor],
         infos: list[ParamInfo],
         mesh: DeviceMesh,
         debug_fqn: str | None,
-        persistent_buffers: list[torch.Tensor] | None = None,
     ) -> PlacementPreparedUnshard:
         dtype = _unsharded_dtype(infos[0])
-        device = tensors[0].device
         if any(_unsharded_dtype(info) != dtype for info in infos):
             raise ValueError(
                 "BucketedBlockShard requires one unsharded dtype per bucket."
             )
-        if persistent_buffers is not None:
-            return self._prepare_unshard_in_place(
-                tensors, infos, mesh, debug_fqn, persistent_buffers
-            )
         with _record_copy_in_if_eager():
-            send_buf, copy_in_scratch = self._unshard_send_buffer(tensors, infos, dtype)
+            send_buf = self._make_local_bucket_view(tensors, infos)
+            copy_in_scratch: list[torch.Tensor] = []
+            if send_buf.dtype != dtype:
+                send_buf, copy_in_scratch = pack_tensors_into_flat_buffer_with_scratch(
+                    [send_buf],
+                    dtype,
+                )
+            else:
+                send_buf = copy_tensor_to_dtype(send_buf, dtype)
             bucket_layout = self._bucket_layout(infos[0])
-            gathered_bucket = torch.empty(
-                bucket_layout.global_numel,
-                dtype=dtype,
-                device=device,
-            )
-        return PlacementPreparedUnshard(
-            placement=self,
-            buffers=[send_buf, gathered_bucket, *copy_in_scratch],
-            placement_state=BucketedBlockShard._UnshardState(
-                infos=infos,
-                pg=mesh.get_group(),
-                debug_fqn=debug_fqn,
-            ),
-        )
-
-    def _unshard_send_buffer(
-        self,
-        tensors: list[torch.Tensor],
-        infos: list[ParamInfo],
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """This rank's range in ``dtype``, zero-padded to the largest range."""
-        send_buf = self._make_local_bucket_view(tensors, infos)
-        copy_in_scratch: list[torch.Tensor] = []
-        if send_buf.dtype != dtype:
-            send_buf, copy_in_scratch = pack_tensors_into_flat_buffer_with_scratch(
-                [send_buf],
-                dtype,
-            )
-        else:
-            send_buf = copy_tensor_to_dtype(send_buf, dtype)
-        padding = max(self._bucket_layout(infos[0]).rank_numels) - send_buf.numel()
-        if padding > 0:
-            send_buf = nn.functional.pad(send_buf, (0, padding))
-        return send_buf, copy_in_scratch
-
-    def _prepare_unshard_in_place(
-        self,
-        tensors: list[torch.Tensor],
-        infos: list[ParamInfo],
-        mesh: DeviceMesh,
-        debug_fqn: str | None,
-        persistent_buffers: list[torch.Tensor],
-    ) -> PlacementPreparedUnshard:
-        """Prepare a refill that gathers straight into the persistent bucket."""
-        dtype = _unsharded_dtype(infos[0])
-        bucket_layout = self._bucket_layout(infos[0])
-        if len(persistent_buffers) != 1:
-            raise AssertionError(
-                "BucketedBlockShard expects one persistent bucket, got "
-                f"{len(persistent_buffers)} buffers."
-            )
-        bucket = persistent_buffers[0]
-        if (
-            bucket.dtype != dtype
-            or bucket.shape != (bucket_layout.global_numel,)
-            or not bucket.is_contiguous()
-        ):
-            raise AssertionError(
-                "BucketedBlockShard persistent bucket does not match the bucket "
-                f"layout: {tuple(bucket.shape)} {bucket.dtype}, expected "
-                f"({bucket_layout.global_numel},) {dtype}."
-            )
-        with _record_copy_in_if_eager():
-            send_buf, copy_in_scratch = self._unshard_send_buffer(tensors, infos, dtype)
+            padding = max(bucket_layout.rank_numels) - send_buf.numel()
+            if padding > 0:
+                send_buf = nn.functional.pad(send_buf, (0, padding))
         return PlacementPreparedUnshard(
             placement=self,
             buffers=[send_buf, *copy_in_scratch],
@@ -999,9 +933,7 @@ class BucketedBlockShard(Placement):
                 infos=infos,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
-                in_place=True,
             ),
-            persistent_buffers=persistent_buffers,
         )
 
     @override
@@ -1013,10 +945,14 @@ class BucketedBlockShard(Placement):
             )
         state = prepared.placement_state
         send_buf = prepared.buffers[0]
-        if state.in_place:
+        if prepared.persistent_buffers is not None:
+            # A refill gathers straight into the persistent bucket.
             gathered_bucket = prepared.persistent_buffers[0]
         else:
-            gathered_bucket = prepared.buffers[1]
+            gathered_bucket = send_buf.new_empty(
+                self._bucket_layout(state.infos[0]).global_numel
+            )
+            prepared.buffers.insert(1, gathered_bucket)
         world_size = dist.get_world_size(state.pg)
         # Each rank sends its padded range, so the output is that many padded
         # segments: the bucket itself unless some range is padded.
@@ -1046,9 +982,8 @@ class BucketedBlockShard(Placement):
                 "Expected BucketedBlockShard._UnshardState, "
                 f"got {type(prepared.placement_state).__name__}"
             )
-        if prepared.placement_state.in_place:
-            # The all-gather refilled the persistent bucket; the caller keeps
-            # the full params from the first unshard, which view it.
+        if prepared.persistent_buffers is not None:
+            # Run refilled the persistent bucket.
             return PlacementUnshardResult(
                 full_params=[],
                 persistent_buffers=list(prepared.persistent_buffers),
@@ -1057,27 +992,20 @@ class BucketedBlockShard(Placement):
         if prepared.persistent:
             # The first unshard: the gathered bucket comes from the unshard
             # stream, and persistent storage lives on the current stream, so
-            # copy into it. Later unshards gather into it in place.
-            bucket = (
-                prepared.persistent_buffers[0]
-                if prepared.persistent_buffers is not None
-                else torch.empty_like(gathered_bucket)
-            )
+            # copy into it. Refills gather into it.
+            bucket = torch.empty_like(gathered_bucket)
             with _record_copy_out_if_eager():
                 bucket.copy_(gathered_bucket)
         else:
             bucket = gathered_bucket
         full_params: list[torch.Tensor] = []
-        if prepared.persistent_buffers is None:
-            # A refill returns no full params: the caller keeps the ones from
-            # the first unshard, which view the persistent bucket.
-            for info in prepared.placement_state.infos:
-                param_offset = self._param_layout(info).param_offset
-                full_params.append(
-                    bucket[param_offset : param_offset + info.global_numel].view(
-                        info.global_shape
-                    )
+        for info in prepared.placement_state.infos:
+            param_offset = self._param_layout(info).param_offset
+            full_params.append(
+                bucket[param_offset : param_offset + info.global_numel].view(
+                    info.global_shape
                 )
+            )
         return PlacementUnshardResult(
             full_params=full_params,
             persistent_buffers=[bucket] if prepared.persistent else [],
