@@ -288,33 +288,44 @@ class TestFlexShardEagerRuntime(TestCase):
                 model.tok_embeddings.weight.grad, reference.tok_embeddings.weight.grad
             )
 
-    def test_bucket_modules(self):
-        # BucketSpec.modules hooks a bucket on sibling modules instead of their
-        # parent: it unshards in the first one's forward and reshards after the
-        # last one's, before the next module runs, rather than after the
-        # parent's whole forward. Backward re-gathers it from the last one's
-        # outputs and reduces once the first one's input grads are computed;
-        # training matches an unsharded reference.
+    def test_module_patterns(self):
+        # Patterns naming sibling modules make a bucket of their params, hooked
+        # on them rather than on their parent: it unshards in the first one's
+        # forward and reshards after the last one's, before the next module
+        # runs. Backward re-gathers it from the last one's outputs and reduces
+        # once the first one's input grads are computed; training matches an
+        # unsharded reference. Patterns may not mix modules with parameters or
+        # name a container without a forward.
         with single_rank_cuda_mesh() as mesh:
             torch.manual_seed(0)
             model = nn.Sequential(
                 nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8)
             )
             reference = copy.deepcopy(model).cuda()
+            for invalid, bucket_patterns, error in (
+                (copy.deepcopy(model), (["0", "2.*"], ["4.*"]), "mix module FQNs"),
+                (
+                    nn.Sequential(nn.ModuleList([nn.Linear(8, 8)])),
+                    (["0"],),
+                    "no forward",
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, error):
+                    flex_shard(
+                        invalid,
+                        buckets=[
+                            _bucket(patterns, mesh, reshard_after_forward=True)
+                            for patterns in bucket_patterns
+                        ],
+                    )
             flex_shard(
                 model,
                 buckets=[
-                    BucketSpec(
-                        ["0.*", "2.*"],
-                        placement_fn=per_param_placements,
-                        mesh=mesh,
-                        modules=["0", "2"],
-                    ),
-                    _bucket(["4.*"], mesh, reshard_after_forward=True),
+                    _bucket(["0", "2"], mesh, reshard_after_forward=True),
+                    _bucket(["4"], mesh, reshard_after_forward=True),
                 ],
             )
             layers, _ = _buckets(model)
-            self.assertEqual(layers.forward_hook_modules(), [model[0], model[2]])
             unsharded_in = {}
             for idx in (2, 4):
                 model[idx].register_forward_pre_hook(
@@ -389,7 +400,7 @@ class TestFlexShardEagerRuntime(TestCase):
         for bucket, hook_module in zip(
             buckets, (model.layers[0], model, model.head), strict=True
         ):
-            self.assertEqual(bucket.forward_hook_modules(), [hook_module])
+            self.assertIs(bucket.forward_hook_module(), hook_module)
         head_resharded = []
 
         def probe(module, args, output):

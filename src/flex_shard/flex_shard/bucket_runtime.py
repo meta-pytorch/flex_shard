@@ -541,21 +541,15 @@ class BucketRuntime:
             for bucket_param in self.bucket_params
         ]
 
-    def forward_hook_modules(self) -> list[nn.Module]:
-        """Return the modules whose forwards trigger this bucket.
+    def forward_hook_module(self) -> nn.Module:
+        """Return the module whose forward triggers this bucket.
 
-        ``BucketSpec.modules`` if given; otherwise the deepest common ancestor
-        of the bucket's params, so one pre-forward unshard covers their
-        accesses: a bucket with "layers.0.attn.wq.weight" and
-        "layers.0.mlp.w1.weight" hooks "layers.0". Containers without a
-        forward, such as ``ModuleList``, give way to their nearest ancestor that
-        runs one.
+        It is the deepest common ancestor of the bucket's params, so one
+        pre-forward unshard covers their accesses: a bucket with
+        "layers.0.attn.wq.weight" and "layers.0.mlp.w1.weight" hooks "layers.0".
+        Containers without a forward, such as ``ModuleList``, give way to their
+        nearest ancestor that runs one.
         """
-        if self.bucket_storage._hook_module_fqns is not None:
-            return [
-                _unwrap_checkpoint(self.bucket_storage._module.get_submodule(fqn))
-                for fqn in self.bucket_storage._hook_module_fqns
-            ]
         # Every name of a shared parameter counts, so the hooked module contains
         # each of its uses.
         path = _module_path_common_prefix(
@@ -576,7 +570,7 @@ class BucketRuntime:
             ),
             modules[0],
         )
-        return [_unwrap_checkpoint(target)]
+        return getattr(target, "_checkpoint_wrapped_module", target)
 
     def begin_unshard(
         self,
@@ -1138,8 +1132,10 @@ class BucketRuntime:
                 "FlexShard BucketSpec gradient_bucket is eager-only; the traced "
                 "backward owns its gradient buffers."
             )
-        if self.bucket_storage._hook_module_fqns is not None:
-            raise NotImplementedError("FlexShard BucketSpec modules is eager-only.")
+        if len(self.bucket_storage._hook_module_fqns or ()) > 1:
+            raise NotImplementedError(
+                "FlexShard buckets of patterns naming several modules are eager-only."
+            )
         full_params = _BucketUnshard.apply(self, *self._local_shards(use_autograd=True))
         self._swap_in_params(list(full_params))
 
@@ -1308,8 +1304,14 @@ def _install_bucket_unshard_hooks(
             raise AssertionError("Expected FlexShard bucket storage to be on CUDA.")
 
         bucket_runtime = BucketRuntime.from_bucket_storage(bucket_storage)
+        # A bucket whose patterns name modules hooks those (BucketSpec.patterns).
         _register_forward_hooks(
-            bucket_runtime.forward_hook_modules(),
+            [
+                _unwrap_checkpoint(bucket_storage._module.get_submodule(fqn))
+                for fqn in bucket_storage._hook_module_fqns
+            ]
+            if bucket_storage._hook_module_fqns
+            else [bucket_runtime.forward_hook_module()],
             bucket_runtime.pre_forward_hook,
             bucket_runtime.post_forward_hook,
         )

@@ -143,12 +143,22 @@ class BucketSpec:
     """Specification for a parameter communication bucket.
 
     Args:
-        patterns: fnmatch glob patterns matched against parameter FQNs.
-            A parameter matches this bucket if its FQN matches any pattern. A
+        patterns: fnmatch glob patterns matched against parameter FQNs, or
+            module FQNs, which match all of the module's parameters. A
+            parameter matches this bucket if its FQN matches any pattern. A
             parameter registered under several names (e.g. tied embedding and
             output weights) must match one bucket with every name, as FSDP2
             requires one FSDP group per parameter; the bucket's hooks then sit
-            on a module that contains every use.
+            on a module that contains every use: the deepest module containing
+            its params. A bucket whose patterns all name modules hooks those
+            modules instead, as one group, as FSDP2's ``fully_shard`` does for a
+            list of modules: it unshards when the first of them starts its
+            forward, runs its post-forward once all of them have finished, and
+            reduce-scatters once the first one's input grads are computed. For
+            a bucket of sibling modules, e.g. consecutive transformer layers,
+            whose parent would gather it for its whole forward and
+            reduce-scatter it only after its whole backward. Each of them must
+            run a forward of its own, once per forward. Eager only.
         placement_fn: Required callable that maps this bucket's
             ``(named_params, mesh)`` to per-parameter placements.
             The minimal eager path expects one ``Placement`` per parameter.
@@ -214,17 +224,6 @@ class BucketSpec:
             dtype until the copy-in. Grads that end up elsewhere (e.g. allocated
             before the pre-backward hook, or in more than one buffer) fall back
             to the copy, with a warning. Eager only.
-        modules: Optional FQNs of the modules whose forwards this bucket's hooks
-            bracket, instead of the deepest module containing its params, as
-            FSDP2's ``fully_shard`` does for a list of modules: the bucket
-            unshards when the first of them starts its forward, runs its
-            post-forward (reshard-after-forward and the pre-backward hooks on
-            the outputs) once all of them have finished, and reduce-scatters
-            once the first one's input grads are computed. For a bucket that
-            spans sibling modules, e.g. consecutive transformer layers, whose
-            parent would gather it for the parent's whole forward and
-            reduce-scatter it only after the parent's whole backward. Each of
-            them must run once per forward. Eager only.
     """
 
     patterns: list[str]
@@ -239,7 +238,6 @@ class BucketSpec:
     post_reduce_hook: BucketHook | None = None
     defer_post_backward: bool = False
     gradient_bucket: bool = False
-    modules: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -351,7 +349,7 @@ class ShardedBucketStorage:
         gradient_divide_factor: float | None = None,
         defer_post_backward: bool = False,
         gradient_bucket: bool = False,
-        modules: list[str] | None = None,
+        hook_module_fqns: list[str] | None = None,
     ) -> None:
         if byte_storage.dtype != torch.uint8:
             raise ValueError(f"Expected uint8 storage, got {byte_storage.dtype}")
@@ -365,7 +363,8 @@ class ShardedBucketStorage:
         self._post_reduce_hook = post_reduce_hook
         self._defer_post_backward = defer_post_backward
         self._gradient_bucket = gradient_bucket
-        self._hook_module_fqns = modules
+        # The modules a bucket of module patterns hooks (BucketSpec.patterns).
+        self._hook_module_fqns = hook_module_fqns
         # See set_requires_gradient_sync and set_reshard_after_backward.
         self._requires_gradient_sync = True
         self._reshard_after_backward = True
@@ -419,7 +418,7 @@ class ShardedBucketStorage:
             gradient_divide_factor=bucket_spec.gradient_divide_factor,
             defer_post_backward=bucket_spec.defer_post_backward,
             gradient_bucket=bucket_spec.gradient_bucket,
-            modules=bucket_spec.modules,
+            hook_module_fqns=_hook_module_fqns(module, bucket_spec.patterns),
         )
         bucket_storage.copy_params_from(named_params)
         bucket_storage.install_sharded_params(expected_param_device)
@@ -863,8 +862,39 @@ def _assign_params_to_buckets(
 
 
 def _matching_buckets(fqn: str, buckets: list[BucketSpec]) -> list[int]:
+    # A pattern naming a module matches the params under it.
     return [
         bucket_idx
         for bucket_idx, bucket in enumerate(buckets)
-        if any(fnmatch.fnmatch(fqn, pattern) for pattern in bucket.patterns)
+        if any(
+            fnmatch.fnmatch(fqn, pattern) or fnmatch.fnmatch(fqn, f"{pattern}.*")
+            for pattern in bucket.patterns
+        )
     ]
+
+
+def _hook_module_fqns(module: nn.Module, patterns: list[str]) -> list[str] | None:
+    """The modules a bucket hooks when all its patterns name modules, else None
+    (see ``BucketSpec.patterns``)."""
+    named = []
+    for pattern in patterns:
+        try:
+            named.append(module.get_submodule(pattern))
+        except AttributeError:
+            pass
+    if not named:
+        return None
+    if len(named) != len(patterns):
+        raise ValueError(
+            f"BucketSpec patterns {patterns} mix module FQNs with parameter "
+            "patterns; a bucket's patterns must all name modules, whose forwards "
+            "then carry its hooks, or all match parameters."
+        )
+    for pattern, submodule in zip(patterns, named, strict=True):
+        if type(submodule).forward is nn.Module.forward:
+            raise ValueError(
+                f"BucketSpec pattern {pattern!r} names a "
+                f"{type(submodule).__name__}, which has no forward to hook; name "
+                "the modules it contains instead."
+            )
+    return list(patterns)
