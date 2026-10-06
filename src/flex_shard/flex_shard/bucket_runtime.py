@@ -473,8 +473,6 @@ class BucketRuntime:
     unsharded_params: list[nn.Parameter] | None = field(default=None, repr=False)
     persistent_buffers: list[torch.Tensor] = field(default_factory=list, repr=False)
     persistent_buffer_nbytes: list[int] = field(default_factory=list)
-    # Whether this bucket warned that its gradient bucket fell back to a copy.
-    gradient_bucket_warned: bool = False
 
     @classmethod
     def from_bucket_storage(
@@ -868,9 +866,9 @@ class BucketRuntime:
     def _check_gradient_bucket(
         self, grads: list[torch.Tensor | None], infos: list[ParamInfo]
     ) -> None:
-        """Warn once if a gradient bucket's grads will not be reduced as is:
+        """Warn if a gradient bucket's grads will not be reduced as is:
         not all views of one bucket, or not in this backward's reduce dtype."""
-        if not self.bucket_storage._gradient_bucket or self.gradient_bucket_warned:
+        if not self.bucket_storage._gradient_bucket:
             return
         bucket = grads[0]._base if grads[0] is not None else None
         if bucket is None or any(
@@ -890,9 +888,7 @@ class BucketRuntime:
         self._warn_gradient_bucket_fallback(reason)
 
     def _warn_gradient_bucket_fallback(self, reason: str) -> None:
-        if self.gradient_bucket_warned:
-            return
-        self.gradient_bucket_warned = True
+        # The default warning filter shows each bucket's message once.
         warnings.warn(
             f"FlexShard bucket {self.debug_fqn} has gradient_bucket=True, but "
             f"{reason}, so its reduce-scatter copies the grads in.",
