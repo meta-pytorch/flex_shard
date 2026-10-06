@@ -6,6 +6,7 @@
 
 import copy
 import dataclasses
+import warnings
 from unittest.mock import Mock, patch
 
 import torch
@@ -16,7 +17,10 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 from .. import BucketSpec, flex_shard, is_flex_shard_param
-from ..custom_placements.block_shard import make_bucketed_block_placement_fn
+from ..custom_placements.block_shard import (
+    BucketedBlockShard,
+    make_bucketed_block_placement_fn,
+)
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..custom_placements.shard import per_param_placements
 from ..flex_shard import bucket_runtime
@@ -121,6 +125,34 @@ class _SkipNet(nn.Module):
         if not self.skip:
             x = self.layers[1](x)
         return self.layers[2](x)
+
+
+class _TiedNet(nn.Module):
+    """The head shares the embedding's weight, so one bucket holds both names."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.embed = nn.Linear(dim, dim, bias=False)
+        self.mid = nn.Linear(dim, dim)
+        self.head = nn.Linear(dim, dim, bias=False)
+        self.head.weight = self.embed.weight
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(torch.relu(self.mid(self.embed(x))))
+
+
+class _ReentrantCheckpointNet(nn.Module):
+    """A block under reentrant activation checkpointing: its forward runs
+    without grad, and backward recomputes it, as Megatron's recompute does."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.block = _TwoStageBlock(dim)
+        self.head = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.utils.checkpoint.checkpoint(self.block, x, use_reentrant=True)
+        return self.head(x)
 
 
 def _bucket(patterns, mesh, reshard_after_forward, placement_fn=per_param_placements):
@@ -511,6 +543,144 @@ class TestFlexShardEagerRuntime(TestCase):
                 )
             # Skipping layers.1, layers.0's prefetch of it is released.
             self.assertIn(buckets[1], released)
+
+    def test_gradient_bucket_matches_reference(self):
+        # The reduce-scatter reads the grads' gradient bucket as is, and grads
+        # match an unsharded reference: with a param or a whole bucket frozen
+        # after the first step, a shared (tied) param, and a reentrant activation
+        # checkpoint,
+        # whose forward runs without grad so only its recompute allocates the
+        # gradient bucket.
+        placement_fn = make_bucketed_block_placement_fn(dims=(0,), blocks_per_rank=(1,))
+        cases = {
+            "plain": (lambda: nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8)), ["*"]),
+            "frozen": (lambda: nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8)), ["*"]),
+            # A whole bucket frozen: its post-backward reduces no grads.
+            "frozen_bucket": (
+                lambda: nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8)),
+                ["0.*", "1.*"],
+            ),
+            "tied": (lambda: _TiedNet(8), ["*"]),
+            "reentrant_checkpoint": (
+                lambda: _ReentrantCheckpointNet(8),
+                ["block.*", "head.*"],
+            ),
+        }
+        gradient_bucket_of = BucketedBlockShard._gradient_bucket_of
+        with single_rank_cuda_mesh() as mesh:
+            for case, (make_model, patterns) in cases.items():
+                for reshard_after_forward in (False, True):
+                    with self.subTest(
+                        case=case, reshard_after_forward=reshard_after_forward
+                    ):
+                        torch.manual_seed(0)
+                        model = make_model()
+                        reference = copy.deepcopy(model).cuda()
+                        flex_shard(
+                            model,
+                            buckets=[
+                                BucketSpec(
+                                    [pattern],
+                                    placement_fn=placement_fn,
+                                    mesh=mesh,
+                                    reshard_after_forward=reshard_after_forward,
+                                    gradient_bucket=True,
+                                )
+                                for pattern in patterns
+                            ],
+                        )
+                        optim = torch.optim.SGD(model.parameters(), lr=0.1)
+                        ref_optim = torch.optim.SGD(reference.parameters(), lr=0.1)
+                        reduced_bucket = []
+
+                        def recording(placement, *args):
+                            bucket = gradient_bucket_of(placement, *args)
+                            reduced_bucket.append(bucket is not None)
+                            return bucket
+
+                        with (
+                            patch.object(
+                                BucketedBlockShard, "_gradient_bucket_of", recording
+                            ),
+                            warnings.catch_warnings(),
+                        ):
+                            warnings.simplefilter("error", UserWarning)
+                            for step in range(3):
+                                if case == "frozen" and step == 1:
+                                    model[0].weight.requires_grad_(False)
+                                    reference[0].weight.requires_grad_(False)
+                                if case == "frozen_bucket" and step == 1:
+                                    for param in (
+                                        *model[0].parameters(),
+                                        *reference[0].parameters(),
+                                    ):
+                                        param.requires_grad_(False)
+                                optim.zero_grad()
+                                ref_optim.zero_grad()
+                                x = torch.randn(4, 8, device="cuda", requires_grad=True)
+                                output = model(x)
+                                reference_output = reference(x)
+                                torch.testing.assert_close(output, reference_output)
+                                output.square().sum().backward()
+                                reference_output.square().sum().backward()
+                                for param, ref_param in zip(
+                                    model.parameters(),
+                                    reference.parameters(),
+                                    strict=True,
+                                ):
+                                    torch.testing.assert_close(
+                                        param.grad, ref_param.grad
+                                    )
+                                optim.step()
+                                ref_optim.step()
+                        self.assertTrue(reduced_bucket)
+                        self.assertTrue(all(reduced_bucket), reduced_bucket)
+
+    def test_gradient_bucket_fallback_warns(self):
+        # Grads replaced after the pre-backward hook, or grads that view no
+        # single bucket (Shard(0) backs each param with its own buffer), fall
+        # back to copying them in, once warned.
+        with single_rank_cuda_mesh() as mesh:
+            for case in ("replaced", "shard"):
+                with self.subTest(case=case):
+                    torch.manual_seed(0)
+                    model = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8))
+                    reference = copy.deepcopy(model).cuda()
+
+                    def replace_grads(named_params):
+                        for _, param in named_params:
+                            param.grad = torch.zeros_like(param)
+
+                    placement_fn = (
+                        per_param_placements
+                        if case == "shard"
+                        else make_bucketed_block_placement_fn(
+                            dims=(0,), blocks_per_rank=(1,)
+                        )
+                    )
+                    flex_shard(
+                        model,
+                        buckets=[
+                            BucketSpec(
+                                ["*"],
+                                placement_fn=placement_fn,
+                                mesh=mesh,
+                                reshard_after_forward=False,
+                                gradient_bucket=True,
+                                pre_backward_hook=(
+                                    replace_grads if case == "replaced" else None
+                                ),
+                            )
+                        ],
+                    )
+                    x = torch.randn(4, 8, device="cuda")
+                    with self.assertWarnsRegex(UserWarning, "gradient_bucket=True"):
+                        model(x).sum().backward()
+                    reference(x).sum().backward()
+                    for param, ref_param in zip(
+                        model.parameters(), reference.parameters(), strict=True
+                    ):
+                        torch.testing.assert_close(param.grad, ref_param.grad)
 
     def test_torch_compile_forward_backward_on_cuda_mesh(self):
         with single_rank_cuda_mesh() as mesh:

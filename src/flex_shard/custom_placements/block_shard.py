@@ -534,7 +534,9 @@ class BucketedBlockShard(Placement):
     straight into that buffer; during graph capture they view the gathered
     bucket directly. Collectives zero-pad ranks with smaller ranges to the
     largest one; with equal ranges (the default) nothing is padded, so the
-    bucket itself is the all-gather output and the reduce-scatter input.
+    bucket itself is the all-gather output and the reduce-scatter input. With
+    ``BucketSpec(gradient_bucket=True)`` the gradients are views of one bucket
+    in the same layout, which the reduce-scatter reads as is.
     """
 
     @dataclass(frozen=True)
@@ -1009,6 +1011,35 @@ class BucketedBlockShard(Placement):
             persistent_buffers=[bucket] if prepared.persistent else [],
         )
 
+    def _gradient_bucket_of(
+        self,
+        tensors: list[torch.Tensor],
+        infos: list[ParamInfo],
+        global_numel: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """The gradient bucket ``tensors`` view at their layout offsets, if
+        they all view one (see ``BucketSpec.gradient_bucket``)."""
+        bucket = tensors[0]._base
+        if (
+            bucket is None
+            or bucket.dtype != dtype
+            or bucket.shape != (global_numel,)
+            or not bucket.is_contiguous()
+        ):
+            return None
+        bucket_offset = bucket.storage_offset()
+        for tensor, info in zip(tensors, infos, strict=True):
+            if (
+                tensor._base is not bucket
+                or tensor.shape != info.global_shape
+                or not tensor.is_contiguous()
+                or tensor.storage_offset() - bucket_offset
+                != self._param_layout(info).param_offset
+            ):
+                return None
+        return bucket
+
     @override
     def prepare_reduce_grad(
         self,
@@ -1022,6 +1053,24 @@ class BucketedBlockShard(Placement):
         device = tensors[0].device
         bucket_layout = self._bucket_layout(infos[0])
         padded_segment_numel = max(bucket_layout.rank_numels)
+        if world_size * padded_segment_numel == bucket_layout.global_numel:
+            grad_bucket = self._gradient_bucket_of(
+                tensors, infos, bucket_layout.global_numel, dtype
+            )
+            if grad_bucket is not None:
+                # The grads are views of a gradient bucket in this layout
+                # (BucketSpec(gradient_bucket=True)): reduce it as is.
+                return PlacementPreparedReduceGrad(
+                    placement=self,
+                    buffers=[grad_bucket],
+                    placement_state=BucketedBlockShard._ReduceGradState(
+                        infos=infos,
+                        rank=mesh.get_local_rank(),
+                        pg=mesh.get_group(),
+                        debug_fqn=debug_fqn,
+                        padded_segment_numel=padded_segment_numel,
+                    ),
+                )
         with _record_function_if_eager("FlexShard::reduce_scatter_copy_in", debug_fqn):
             global_grad_bucket = torch.zeros(
                 bucket_layout.global_numel,
