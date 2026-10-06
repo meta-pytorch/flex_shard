@@ -1044,12 +1044,6 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         )
 
     @override
-    def refills_persistent_buffers_in_place(self) -> bool:
-        # Its persistent buffers hold the compact FP8 data and scales, which the
-        # gathered rank rows are unpacked into.
-        return False
-
-    @override
     def gradient_bucket_views(
         self,
         infos: list[ParamInfo],

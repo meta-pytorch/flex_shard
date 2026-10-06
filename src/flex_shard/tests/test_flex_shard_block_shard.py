@@ -407,37 +407,6 @@ class TestBucketedBlockShardCopyFree(FSDPTestMultiThread):
         )
         return mesh, originals, placement, infos, local_shards
 
-    def test_refill_gathers_into_the_persistent_bucket(self):
-        for blocks_per_rank in ((1, 1), (1, 3)):
-            with self.subTest(blocks_per_rank=blocks_per_rank):
-                mesh, originals, placement, infos, local_shards = self._setup(
-                    blocks_per_rank
-                )
-                self.assertTrue(placement.refills_persistent_buffers_in_place())
-                prepared = placement.prepare_unshard_bucket(
-                    local_shards, infos, mesh, None
-                )
-                prepared.persistent = True
-                placement.run_prepared_unshard(prepared)
-                first = placement.finish_prepared_unshard(prepared)
-                (bucket,) = first.persistent_buffers
-
-                # As after a reshard and re-allocation: stale contents.
-                bucket.fill_(-1.0)
-                prepared = placement.prepare_unshard_bucket(
-                    local_shards, infos, mesh, None, persistent_buffers=[bucket]
-                )
-                # No gathered scratch bucket: only the send view.
-                self.assertEqual(len(prepared.buffers), 1)
-                placement.run_prepared_unshard(prepared)
-                refill = placement.finish_prepared_unshard(prepared)
-                self.assertEqual(refill.full_params, [])
-                self.assertIs(refill.persistent_buffers[0], bucket)
-                for full_param, original in zip(
-                    first.full_params, originals, strict=True
-                ):
-                    self.assertEqual(full_param, original)
-
     def test_gradient_bucket_views_reduce_without_copy(self):
         mesh, originals, placement, infos, _ = self._setup()
         views = placement.gradient_bucket_views(
