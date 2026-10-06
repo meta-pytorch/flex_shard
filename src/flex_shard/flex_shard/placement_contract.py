@@ -346,9 +346,13 @@ class PlacementPreparedUnshard:
     parameters). On the first persistent unshard ``persistent_buffers`` is
     None: the placement allocates fresh buffers on the current stream, backs
     the full params with them only, and returns them as
-    ``PlacementUnshardResult.persistent_buffers``. On later unshards
-    ``persistent_buffers`` holds those buffers, with storage re-allocated by
-    the caller, and finish writes the new values into them in the same layout.
+    ``PlacementUnshardResult.persistent_buffers``. On later unshards (refills)
+    the caller sets ``persistent_buffers`` to those buffers before run, with
+    storage it re-allocated on the current stream before the unshard stream
+    waited on it. The placement writes the new values into them, in the same
+    layout, where it chooses: run may gather straight into them on the unshard
+    stream, or finish may copy into them on the current stream. Finish returns
+    them.
     Eager unshards are persistent. During graph capture they are not, and the
     full params may view gathered buffers whose lifetime the traced graph owns.
     """
@@ -370,10 +374,9 @@ class PlacementUnshardResult:
     the storage backing ``full_params`` that the caller keeps across unshards:
     it frees their storage on reshard and re-allocates it before the next
     unshard refills them. They correspond to FSDP2's all-gather outputs and
-    unsharded inner tensors. A refill (finish given the persistent buffers of an
-    earlier unshard) may return no ``full_params``: the caller keeps the full
-    params from the first unshard, which view those buffers, as FSDP2 builds its
-    unsharded parameters only at the first all-gather.
+    unsharded inner tensors. A refill may return no ``full_params``: the caller
+    keeps the full params from the first unshard, which view those buffers, as
+    FSDP2 builds its unsharded parameters only at the first all-gather.
     """
 
     full_params: list[torch.Tensor]

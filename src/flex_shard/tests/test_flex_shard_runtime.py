@@ -108,6 +108,21 @@ class _TwoStageBlock(nn.Module):
         return self.second(self.first(x))
 
 
+class _SkipNet(nn.Module):
+    """Three linears; ``skip`` leaves the middle one out of the forward."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(nn.Linear(dim, dim) for _ in range(3))
+        self.skip = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.layers[0](x)
+        if not self.skip:
+            x = self.layers[1](x)
+        return self.layers[2](x)
+
+
 def _bucket(patterns, mesh, reshard_after_forward, placement_fn=per_param_placements):
     return BucketSpec(
         patterns,
@@ -448,6 +463,54 @@ class TestFlexShardEagerRuntime(TestCase):
             self.assertEqual(unshards.call_count, 6)
             # All but the first unshard of forward and of backward were prefetched.
             self.assertEqual(sum(hits), 4)
+
+    def test_released_refill_frees_storage(self):
+        # A prefetch that refills a bucket's persistent storage, which begin
+        # re-allocates, and is then released unused frees that storage; later
+        # steps still match.
+        with single_rank_cuda_mesh() as mesh:
+            model = _SkipNet(8)
+            reference = copy.deepcopy(model).cuda()
+            flex_shard(
+                model,
+                buckets=[_bucket([f"layers.{idx}.*"], mesh, True) for idx in range(3)],
+            )
+            buckets = _buckets(model)
+            optim = torch.optim.SGD(model.parameters(), lr=0.1)
+            ref_optim = torch.optim.SGD(reference.parameters(), lr=0.1)
+            x = torch.randn(4, 8, device="cuda")
+            release = bucket_runtime.BucketRuntime.free_persistent_storage
+            released = []
+
+            def recording_release(bucket):
+                released.append(bucket)
+                return release(bucket)
+
+            for skip in (False, True, False):
+                model.skip = reference.skip = skip
+                optim.zero_grad()
+                ref_optim.zero_grad()
+                with patch.object(
+                    bucket_runtime.BucketRuntime,
+                    "free_persistent_storage",
+                    recording_release,
+                ):
+                    output = model(x)
+                    reference_output = reference(x)
+                    torch.testing.assert_close(output, reference_output)
+                    output.sum().backward()
+                reference_output.sum().backward()
+                optim.step()
+                ref_optim.step()
+                self.assertTrue(
+                    all(
+                        buffer.untyped_storage().size() == 0
+                        for bucket in buckets
+                        for buffer in bucket.persistent_buffers
+                    )
+                )
+            # Skipping layers.1, layers.0's prefetch of it is released.
+            self.assertIn(buckets[1], released)
 
     def test_torch_compile_forward_backward_on_cuda_mesh(self):
         with single_rank_cuda_mesh() as mesh:
