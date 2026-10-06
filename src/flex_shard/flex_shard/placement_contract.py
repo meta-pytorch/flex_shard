@@ -287,21 +287,6 @@ class Placement(ABC):
             f"{self!r} does not support distributed checkpointing."
         )
 
-    def gradient_bucket_views(
-        self,
-        infos: list[ParamInfo],
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> list[torch.Tensor] | None:
-        """Views, one per param, of one zeroed buffer in this placement's
-        gradient reduction layout, or None if it has none.
-
-        For ``BucketSpec(gradient_bucket=True)``, the runtime makes them the
-        unsharded params' grads before backward, so ``prepare_reduce_grad`` can
-        reduce the buffer without copying the grads in.
-        """
-        return None
-
     def prepare_unshard_bucket(
         self,
         tensors: list[torch.Tensor],

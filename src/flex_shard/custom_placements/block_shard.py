@@ -1011,29 +1011,6 @@ class BucketedBlockShard(Placement):
             persistent_buffers=[bucket] if prepared.persistent else [],
         )
 
-    @override
-    def gradient_bucket_views(
-        self,
-        infos: list[ParamInfo],
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> list[torch.Tensor] | None:
-        bucket_layout = self._bucket_layout(infos[0])
-        if (
-            len(bucket_layout.rank_numels) * max(bucket_layout.rank_numels)
-            != bucket_layout.global_numel
-        ):
-            # Padded ranges reduce from a padded copy anyway.
-            return None
-        bucket = torch.zeros(bucket_layout.global_numel, dtype=dtype, device=device)
-        views = []
-        for info in infos:
-            offset = self._param_layout(info).param_offset
-            views.append(
-                bucket[offset : offset + info.global_numel].view(info.global_shape)
-            )
-        return views
-
     def _gradient_bucket_of(
         self,
         tensors: list[torch.Tensor],
@@ -1042,7 +1019,7 @@ class BucketedBlockShard(Placement):
         dtype: torch.dtype,
     ) -> torch.Tensor | None:
         """The gradient bucket ``tensors`` view at their layout offsets, if
-        they all view one (see ``gradient_bucket_views``)."""
+        they all view one (see ``BucketSpec.gradient_bucket``)."""
         bucket = tensors[0]._base
         if (
             bucket is None
