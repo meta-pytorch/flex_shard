@@ -468,6 +468,30 @@ class TestBucketedBlockShardCollectives(TestCase):
             self.assertEqual(all_gather.call_count, 0)
             self.assertIs(all_gather_into_tensor.call_args.args[0], prepared.buffers[1])
 
+    def test_refill_returns_no_full_params(self):
+        with single_rank_cpu_mesh() as mesh:
+            model = _PaddedTinyModule()
+            originals = [param.detach().clone() for param in model.parameters()]
+            placement, infos, local_shards = _bucketed_block_storage(model, mesh, (1,))
+            prepared = placement.prepare_unshard_bucket(local_shards, infos, mesh, None)
+            prepared.persistent = True
+            placement.run_prepared_unshard(prepared)
+            first = placement.finish_prepared_unshard(prepared)
+            (bucket,) = first.persistent_buffers
+            bucket.zero_()
+
+            # The refill writes the bucket that the first unshard's full
+            # params view, and builds no new views.
+            prepared = placement.prepare_unshard_bucket(local_shards, infos, mesh, None)
+            prepared.persistent = True
+            prepared.persistent_buffers = [bucket]
+            placement.run_prepared_unshard(prepared)
+            refill = placement.finish_prepared_unshard(prepared)
+            self.assertEqual(refill.full_params, [])
+            self.assertIs(refill.persistent_buffers[0], bucket)
+            for full_param, original in zip(first.full_params, originals, strict=True):
+                self.assertEqual(full_param, original)
+
 
 class TestBucketedBlockShardPadding(TestCase):
     def test_reduce_zeroes_padding_and_params_left_out(self):
