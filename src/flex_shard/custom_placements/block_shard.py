@@ -529,11 +529,12 @@ class BucketedBlockShard(Placement):
     a number of contiguous bucket-global blocks. The placement plans the whole
     bucket as one param-major logical buffer, then shards that buffer into
     rank-local ranges so the all-gather output is laid out as the full
-    parameters. In eager mode it is copied into one persistent bucket buffer
-    that the full parameters view; during graph capture they view it directly.
-    Collectives zero-pad ranks with smaller ranges to the largest one; with
-    equal ranges (the default) nothing is padded, so the bucket itself is the
-    all-gather output and the reduce-scatter input.
+    parameters. In eager mode the first unshard copies it into one persistent
+    bucket buffer that the full parameters view, and later unshards gather
+    straight into that buffer; during graph capture they view the gathered
+    bucket directly. Collectives zero-pad ranks with smaller ranges to the
+    largest one; with equal ranges (the default) nothing is padded, so the
+    bucket itself is the all-gather output and the reduce-scatter input.
     """
 
     @dataclass(frozen=True)
@@ -905,7 +906,6 @@ class BucketedBlockShard(Placement):
         debug_fqn: str | None,
     ) -> PlacementPreparedUnshard:
         dtype = _unsharded_dtype(infos[0])
-        device = tensors[0].device
         if any(_unsharded_dtype(info) != dtype for info in infos):
             raise ValueError(
                 "BucketedBlockShard requires one unsharded dtype per bucket."
@@ -924,14 +924,9 @@ class BucketedBlockShard(Placement):
             padding = max(bucket_layout.rank_numels) - send_buf.numel()
             if padding > 0:
                 send_buf = nn.functional.pad(send_buf, (0, padding))
-            gathered_bucket = torch.empty(
-                bucket_layout.global_numel,
-                dtype=dtype,
-                device=device,
-            )
         return PlacementPreparedUnshard(
             placement=self,
-            buffers=[send_buf, gathered_bucket, *copy_in_scratch],
+            buffers=[send_buf, *copy_in_scratch],
             placement_state=BucketedBlockShard._UnshardState(
                 infos=infos,
                 pg=mesh.get_group(),
@@ -948,7 +943,14 @@ class BucketedBlockShard(Placement):
             )
         state = prepared.placement_state
         send_buf = prepared.buffers[0]
-        gathered_bucket = prepared.buffers[1]
+        if prepared.persistent_buffers is not None:
+            # A refill gathers straight into the persistent bucket.
+            gathered_bucket = prepared.persistent_buffers[0]
+        else:
+            gathered_bucket = send_buf.new_empty(
+                self._bucket_layout(state.infos[0]).global_numel
+            )
+            prepared.buffers.insert(1, gathered_bucket)
         world_size = dist.get_world_size(state.pg)
         # Each rank sends its padded range, so the output is that many padded
         # segments: the bucket itself unless some range is padded.
@@ -978,30 +980,30 @@ class BucketedBlockShard(Placement):
                 "Expected BucketedBlockShard._UnshardState, "
                 f"got {type(prepared.placement_state).__name__}"
             )
+        if prepared.persistent_buffers is not None:
+            # Run refilled the persistent bucket.
+            return PlacementUnshardResult(
+                full_params=[],
+                persistent_buffers=list(prepared.persistent_buffers),
+            )
         gathered_bucket = prepared.buffers[1]
         if prepared.persistent:
-            # The gathered bucket comes from the unshard stream; persistent
-            # storage lives on the current stream, so copy into it.
-            bucket = (
-                prepared.persistent_buffers[0]
-                if prepared.persistent_buffers is not None
-                else torch.empty_like(gathered_bucket)
-            )
+            # The first unshard: the gathered bucket comes from the unshard
+            # stream, and persistent storage lives on the current stream, so
+            # copy into it. Refills gather into it.
+            bucket = torch.empty_like(gathered_bucket)
             with _record_copy_out_if_eager():
                 bucket.copy_(gathered_bucket)
         else:
             bucket = gathered_bucket
         full_params: list[torch.Tensor] = []
-        if prepared.persistent_buffers is None:
-            # A refill returns no full params: the caller keeps the ones from
-            # the first unshard, which view the persistent bucket.
-            for info in prepared.placement_state.infos:
-                param_offset = self._param_layout(info).param_offset
-                full_params.append(
-                    bucket[param_offset : param_offset + info.global_numel].view(
-                        info.global_shape
-                    )
+        for info in prepared.placement_state.infos:
+            param_offset = self._param_layout(info).param_offset
+            full_params.append(
+                bucket[param_offset : param_offset + info.global_numel].view(
+                    info.global_shape
                 )
+            )
         return PlacementUnshardResult(
             full_params=full_params,
             persistent_buffers=[bucket] if prepared.persistent else [],
