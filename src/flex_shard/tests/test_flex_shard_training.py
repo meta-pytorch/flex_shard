@@ -6,6 +6,7 @@
 
 import copy
 import dataclasses
+import warnings
 import weakref
 from collections import Counter
 from unittest import mock
@@ -896,7 +897,10 @@ class TestFlexShardTraining(FSDPTest):
         # Megatron-LM's EP overlap schedule does. It also splits each backward
         # into two calls, so backward finalization is manual: the buckets keep
         # their grads until finalize_backward after the last microbatch. Two
-        # steps, so the second unshard gathers the updated shards.
+        # steps, so the second unshard gathers the updated shards, which its
+        # outputs check. The first layer's bucket has a gradient bucket, which
+        # unshard() sets up in place of its bypassed pre-backward hook, so it
+        # reduces without copying.
         mesh = init_device_mesh(device_type.type, (self.world_size,))
         torch.manual_seed(0)
         model = torch.nn.Sequential(
@@ -907,38 +911,50 @@ class TestFlexShardTraining(FSDPTest):
             model,
             buckets=[
                 BucketSpec(
-                    [f"{idx}.*"],
+                    ["0.*"],
+                    placement_fn=make_bucketed_block_placement_fn(
+                        dims=(0,), blocks_per_rank=(1,) * self.world_size
+                    ),
+                    mesh=mesh,
+                    reshard_after_forward=False,
+                    gradient_bucket=True,
+                ),
+                BucketSpec(
+                    ["2.*"],
                     placement_fn=per_param_placements,
                     mesh=mesh,
                     reshard_after_forward=False,
-                )
-                for idx in (0, 2)
+                ),
             ],
         )
         model.set_manual_backward_finalization(True)
         optimizer = make_test_sgd(model.parameters(), lr=0.1)
         reference_optimizer = make_test_sgd(reference.parameters(), lr=0.1)
         torch.manual_seed(1 + self.rank)
-        for _ in range(2):
-            optimizer.zero_grad(set_to_none=True)
-            reference_optimizer.zero_grad(set_to_none=True)
-            model.unshard()
-            for microbatch in range(2):
-                model.set_requires_gradient_sync(microbatch == 1)
-                x = torch.randn(4, 8, device=device_type)
-                # The first layer's forward hooks never run.
-                hidden = torch.relu(
-                    torch.nn.functional.linear(x, model[0].weight, model[0].bias)
-                )
-                detached = hidden.detach().requires_grad_()
-                model[2](detached).sum().backward()
-                hidden.backward(detached.grad)
-                reference(x).sum().backward()
-            model.finalize_backward()
-            _average_reference_grads(reference)
-            optimizer.step()
-            reference_optimizer.step()
-            check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", "FlexShard bucket .* gradient_bucket=True")
+            for _ in range(2):
+                optimizer.zero_grad(set_to_none=True)
+                reference_optimizer.zero_grad(set_to_none=True)
+                model.unshard()
+                for microbatch in range(2):
+                    model.set_requires_gradient_sync(microbatch == 1)
+                    x = torch.randn(4, 8, device=device_type)
+                    # The first layer's forward hooks never run.
+                    hidden = torch.relu(
+                        torch.nn.functional.linear(x, model[0].weight, model[0].bias)
+                    )
+                    detached = hidden.detach().requires_grad_()
+                    output = model[2](detached)
+                    reference_output = reference(x)
+                    self.assertEqual(output, reference_output)
+                    output.sum().backward()
+                    hidden.backward(detached.grad)
+                    reference_output.sum().backward()
+                model.finalize_backward()
+                _average_reference_grads(reference)
+                optimizer.step()
+                reference_optimizer.step()
 
     @skip_if_lt_x_gpu(2)
     def test_gradient_accumulation(self):
