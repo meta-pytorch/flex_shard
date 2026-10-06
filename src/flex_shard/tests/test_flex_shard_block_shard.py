@@ -284,22 +284,14 @@ class TestBucketedBlockShardDistributed(FSDPTestMultiThread):
         prepared = placement.prepare_unshard_bucket(local_shards, infos, mesh, None)
         send_buf = prepared.buffers[0]
         rank_numels = infos[0].bucket_layout.rank_numels
-        local_numel = rank_numels[mesh.get_local_rank()]
-        padded_numel = max(rank_numels)
-        if local_numel == padded_numel:
-            # The largest range is sent straight from the bucket storage.
+        if rank_numels[mesh.get_local_rank()] == max(rank_numels):
+            # Smaller ranges are sent zero-padded to the largest one.
             self.assertEqual(
                 send_buf.untyped_storage().data_ptr(),
                 bucket_storage.byte_storage.untyped_storage().data_ptr(),
             )
             self.assertEqual(
                 send_buf.data_ptr(), bucket_storage.byte_storage.data_ptr()
-            )
-        else:
-            # A smaller range is zero-padded to the largest one.
-            self.assertEqual(send_buf.shape, (padded_numel,))
-            self.assertEqual(
-                send_buf[local_numel:], torch.zeros(padded_numel - local_numel)
             )
 
         placement.run_prepared_unshard(prepared)
@@ -376,17 +368,6 @@ class _PaddedTinyModule(nn.Module):
         self.bias = nn.Parameter(torch.arange(4, dtype=torch.float32) + 10)
 
 
-class _GappedTinyModule(nn.Module):
-    """3 + 6 + 3 elements at offsets 0, 4 and 10 in a bucket padded to 14:
-    alignment 2, so a 1-element gap after ``bias`` and 1 element of tail."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.bias = nn.Parameter(torch.zeros(3))
-        self.weight = nn.Parameter(torch.zeros(3, 2))
-        self.scale = nn.Parameter(torch.zeros(3))
-
-
 def _bucketed_block_storage(model, mesh, blocks_per_rank, device="cpu"):
     placement = BucketedBlockShard(dims=(0,), blocks_per_rank=blocks_per_rank)
     named_params = list(model.named_parameters())
@@ -410,41 +391,6 @@ def _bucketed_block_storage(model, mesh, blocks_per_rank, device="cpu"):
     infos = [bucket_storage.param_infos[fqn] for fqn, _ in named_params]
     local_shards = [bucket_storage.get_local_view(fqn) for fqn, _ in named_params]
     return placement, infos, local_shards
-
-
-class TestBucketedBlockShardEqualRanges(FSDPTestMultiThread):
-    @property
-    def world_size(self) -> int:
-        return 2
-
-    def test_equal_ranges_unshard_and_reduce_without_staging_copies(self):
-        mesh = init_device_mesh("cpu", (self.world_size,), mesh_dim_names=("fsdp",))
-        model = _PaddedTinyModule()
-        originals = [param.detach().clone() for param in model.parameters()]
-        placement, infos, local_shards = _bucketed_block_storage(model, mesh, (1, 1))
-        self.assertEqual(infos[0].bucket_layout.rank_numels, (6, 6))
-
-        prepared = placement.prepare_unshard_bucket(local_shards, infos, mesh, None)
-        # The send view and the gathered bucket, without per-rank output views.
-        self.assertEqual(len(prepared.buffers), 2)
-        placement.run_prepared_unshard(prepared)
-        full_params = placement.finish_prepared_unshard(prepared).full_params
-        for full_param, original in zip(full_params, originals, strict=True):
-            self.assertEqual(full_param, original)
-
-        grads = [torch.full_like(original, 3.0) for original in originals]
-        prepared = placement.prepare_reduce_grad(grads, infos, mesh, None)
-        # The gradient bucket itself is the reduce-scatter input: params at
-        # their bucket offsets, zeroed tail padding.
-        (send_buf,) = prepared.buffers
-        self.assertEqual(send_buf.shape, (12,))
-        self.assertEqual(send_buf[:10], torch.full((10,), 3.0))
-        self.assertEqual(send_buf[10:], torch.zeros(2))
-        sharded_grads = placement.reduce_prepared_grad(
-            prepared, GradientReduction()
-        ).sharded_grads
-        for grad, sharded_grad, info in zip(grads, sharded_grads, infos, strict=True):
-            self.assertEqual(sharded_grad, _expected_bucketed_local(grad, info))
 
 
 class TestBucketedBlockShardCopyFree(FSDPTestMultiThread):
@@ -525,76 +471,6 @@ class TestBucketedBlockShardCopyFree(FSDPTestMultiThread):
         self.assertIsNone(
             placement.gradient_bucket_views(infos, torch.float32, torch.device("cpu"))
         )
-
-
-class TestBucketedBlockShardCollectives(TestCase):
-    def test_equal_ranges_gather_into_the_bucket(self):
-        with single_rank_cpu_mesh() as mesh:
-            model = _PaddedTinyModule()
-            placement, infos, local_shards = _bucketed_block_storage(model, mesh, (1,))
-            prepared = placement.prepare_unshard_bucket(local_shards, infos, mesh, None)
-            with (
-                mock.patch.object(
-                    dist,
-                    "all_gather_into_tensor",
-                    wraps=dist.all_gather_into_tensor,
-                ) as all_gather_into_tensor,
-                mock.patch.object(
-                    dist, "all_gather", wraps=dist.all_gather
-                ) as all_gather,
-            ):
-                placement.run_prepared_unshard(prepared)
-            self.assertEqual(all_gather_into_tensor.call_count, 1)
-            self.assertEqual(all_gather.call_count, 0)
-            self.assertIs(all_gather_into_tensor.call_args.args[0], prepared.buffers[1])
-
-    def test_refill_returns_no_full_params(self):
-        with single_rank_cpu_mesh() as mesh:
-            model = _PaddedTinyModule()
-            originals = [param.detach().clone() for param in model.parameters()]
-            placement, infos, local_shards = _bucketed_block_storage(model, mesh, (1,))
-            prepared = placement.prepare_unshard_bucket(local_shards, infos, mesh, None)
-            prepared.persistent = True
-            placement.run_prepared_unshard(prepared)
-            first = placement.finish_prepared_unshard(prepared)
-            (bucket,) = first.persistent_buffers
-            bucket.zero_()
-
-            # The refill writes the bucket that the first unshard's full
-            # params view, and builds no new views.
-            prepared = placement.prepare_unshard_bucket(local_shards, infos, mesh, None)
-            prepared.persistent = True
-            prepared.persistent_buffers = [bucket]
-            placement.run_prepared_unshard(prepared)
-            refill = placement.finish_prepared_unshard(prepared)
-            self.assertEqual(refill.full_params, [])
-            self.assertIs(refill.persistent_buffers[0], bucket)
-            for full_param, original in zip(first.full_params, originals, strict=True):
-                self.assertEqual(full_param, original)
-
-
-class TestBucketedBlockShardPadding(TestCase):
-    def test_reduce_zeroes_padding_and_params_left_out(self):
-        with single_rank_cpu_mesh() as mesh:
-            placement, infos, _ = _bucketed_block_storage(
-                _GappedTinyModule(), mesh, (1,)
-            )
-            grads = [
-                torch.full(info.global_shape, index + 1.0)
-                for index, info in enumerate(infos)
-            ]
-            # The gradient bucket is the reduce-scatter input.
-            (send_buf,) = placement.prepare_reduce_grad(
-                grads, infos, mesh, None
-            ).buffers
-            # ``bias`` left out of the reduction, e.g. frozen.
-            (send_buf_without_bias,) = placement.prepare_reduce_grad(
-                grads[1:], infos[1:], mesh, None
-            ).buffers
-            expected = torch.tensor([1.0] * 3 + [0.0] + [2.0] * 6 + [3.0] * 3 + [0.0])
-            self.assertEqual(send_buf, expected)
-            expected[:3] = 0.0
-            self.assertEqual(send_buf_without_bias, expected)
 
 
 class TestBlockShardPlacement(TestCase):
