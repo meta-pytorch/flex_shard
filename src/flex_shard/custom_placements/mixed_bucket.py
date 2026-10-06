@@ -28,7 +28,7 @@ from ..flex_shard.utils import (
     _record_copy_out_if_eager,
     _record_function_if_eager,
 )
-from .block_shard import BlockShard
+from .block_shard import _grad_reduce_dtype, BlockShard
 from .fp8_bucketed_block_shard import _align_up, _VEC_ALIGN_BYTES, Fp8BucketedBlockShard
 from .owned import BucketedOwned
 from .shard import Shard
@@ -620,29 +620,52 @@ class MixedBucketPlacement(Placement):
             debug_fqn,
         ):
             for group in groups:
-                prepared = group.placement.prepare_reduce_grad(
-                    group.tensors,
-                    group.infos,
-                    mesh,
-                    debug_fqn,
-                )
-                send = prepared.buffers[0]
-                if send.numel() % world_size != 0:
-                    raise AssertionError(
-                        "Mixed reduce-scatter subgroup send size must be "
-                        f"divisible by world size {world_size}, got "
-                        f"{send.numel()}."
+                if _one_hot_block_owner(group.placement, world_size) is not None:
+                    # A group with one owner fills only the owner's row: it is
+                    # packed straight into the bucket's send buffer below,
+                    # rather than into a world-size buffer of its own, which
+                    # would be zeros but for that row.
+                    group.placement._validate_bucket_inputs(group.tensors, group.infos)
+                    layout = group.placement._padded_bucket_layout(group.infos)
+                    prepared = PlacementPreparedReduceGrad(
+                        placement=group.placement,
+                        buffers=[],
+                        placement_state=BlockShard._ReduceGradState(
+                            infos=group.infos,
+                            layout=layout,
+                            pg=mesh.get_group(),
+                            debug_fqn=debug_fqn,
+                        ),
                     )
+                    group_numel = layout.padded_segment_numel
+                    group_dtype = _grad_reduce_dtype(group.infos[0])
+                    group_device = group.tensors[0].device
+                else:
+                    prepared = group.placement.prepare_reduce_grad(
+                        group.tensors,
+                        group.infos,
+                        mesh,
+                        debug_fqn,
+                    )
+                    send = prepared.buffers[0]
+                    if send.numel() % world_size != 0:
+                        raise AssertionError(
+                            "Mixed reduce-scatter subgroup send size must be "
+                            f"divisible by world size {world_size}, got "
+                            f"{send.numel()}."
+                        )
+                    group_numel = send.numel() // world_size
+                    group_dtype = send.dtype
+                    group_device = send.device
                 if dtype is None:
-                    dtype = send.dtype
-                    device = send.device
-                elif send.dtype != dtype or send.device != device:
+                    dtype = group_dtype
+                    device = group_device
+                elif group_dtype != dtype or group_device != device:
                     raise ValueError(
                         "Mixed FlexShard reduce-grad requires one send dtype "
                         f"and device per bucket, but got {dtype}/{device} and "
-                        f"{send.dtype}/{send.device}."
+                        f"{group_dtype}/{group_device}."
                     )
-                group_numel = send.numel() // world_size
                 prepared_groups.append((prepared, group.indices, group_numel))
                 group_buffers.extend(prepared.buffers)
 
@@ -679,17 +702,26 @@ class MixedBucketPlacement(Placement):
             send_rows = send.view(world_size, row_numel)
             if max_exclusive_payload_numel:
                 send_rows[:, :max_exclusive_payload_numel].zero_()
-            for group_state, owner_rank in zip(
+            for group, group_state, owner_rank in zip(
+                groups,
                 group_states,
                 owner_ranks,
                 strict=True,
             ):
+                start = group_state.offset
+                end = start + group_state.numel
+                if not group_state.prepared.buffers:
+                    group.placement._pack_reduce_scatter_grad(
+                        group.tensors,
+                        group.infos,
+                        world_size,
+                        send_rows[:, start:end],
+                    )
+                    continue
                 group_send = group_state.prepared.buffers[0].view(
                     world_size,
                     group_state.numel,
                 )
-                start = group_state.offset
-                end = start + group_state.numel
                 if owner_rank is None:
                     send_rows[:, start:end].copy_(group_send)
                 else:
