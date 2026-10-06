@@ -214,6 +214,17 @@ class BucketSpec:
             dtype until the copy-in. Grads that end up elsewhere (e.g. allocated
             before the pre-backward hook, or in more than one buffer) fall back
             to the copy, with a warning. Eager only.
+        modules: Optional FQNs of the modules whose forwards this bucket's hooks
+            bracket, instead of the deepest module containing its params, as
+            FSDP2's ``fully_shard`` does for a list of modules: the bucket
+            unshards when the first of them starts its forward, runs its
+            post-forward (reshard-after-forward and the pre-backward hooks on
+            the outputs) once all of them have finished, and reduce-scatters
+            once the first one's input grads are computed. For a bucket that
+            spans sibling modules, e.g. consecutive transformer layers, whose
+            parent would gather it for the parent's whole forward and
+            reduce-scatter it only after the parent's whole backward. Each of
+            them must run once per forward. Eager only.
     """
 
     patterns: list[str]
@@ -228,6 +239,7 @@ class BucketSpec:
     post_reduce_hook: BucketHook | None = None
     defer_post_backward: bool = False
     gradient_bucket: bool = False
+    modules: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -339,6 +351,7 @@ class ShardedBucketStorage:
         gradient_divide_factor: float | None = None,
         defer_post_backward: bool = False,
         gradient_bucket: bool = False,
+        modules: list[str] | None = None,
     ) -> None:
         if byte_storage.dtype != torch.uint8:
             raise ValueError(f"Expected uint8 storage, got {byte_storage.dtype}")
@@ -352,6 +365,7 @@ class ShardedBucketStorage:
         self._post_reduce_hook = post_reduce_hook
         self._defer_post_backward = defer_post_backward
         self._gradient_bucket = gradient_bucket
+        self._hook_module_fqns = modules
         # See set_requires_gradient_sync and set_reshard_after_backward.
         self._requires_gradient_sync = True
         self._reshard_after_backward = True
@@ -405,6 +419,7 @@ class ShardedBucketStorage:
             gradient_divide_factor=bucket_spec.gradient_divide_factor,
             defer_post_backward=bucket_spec.defer_post_backward,
             gradient_bucket=bucket_spec.gradient_bucket,
+            modules=bucket_spec.modules,
         )
         bucket_storage.copy_params_from(named_params)
         bucket_storage.install_sharded_params(expected_param_device)

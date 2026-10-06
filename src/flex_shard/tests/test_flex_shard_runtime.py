@@ -288,6 +288,56 @@ class TestFlexShardEagerRuntime(TestCase):
                 model.tok_embeddings.weight.grad, reference.tok_embeddings.weight.grad
             )
 
+    def test_bucket_modules(self):
+        # BucketSpec.modules hooks a bucket on sibling modules instead of their
+        # parent: it unshards in the first one's forward and reshards after the
+        # last one's, before the next module runs, rather than after the
+        # parent's whole forward. Backward re-gathers it from the last one's
+        # outputs and reduces once the first one's input grads are computed;
+        # training matches an unsharded reference.
+        with single_rank_cuda_mesh() as mesh:
+            torch.manual_seed(0)
+            model = nn.Sequential(
+                nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8)
+            )
+            reference = copy.deepcopy(model).cuda()
+            flex_shard(
+                model,
+                buckets=[
+                    BucketSpec(
+                        ["0.*", "2.*"],
+                        placement_fn=per_param_placements,
+                        mesh=mesh,
+                        modules=["0", "2"],
+                    ),
+                    _bucket(["4.*"], mesh, reshard_after_forward=True),
+                ],
+            )
+            layers, _ = _buckets(model)
+            self.assertEqual(layers.forward_hook_modules(), [model[0], model[2]])
+            unsharded_in = {}
+            for idx in (2, 4):
+                model[idx].register_forward_pre_hook(
+                    lambda module, args, idx=idx: unsharded_in.update(
+                        {idx: layers.is_unsharded}
+                    )
+                )
+            optim = torch.optim.SGD(model.parameters(), lr=0.1)
+            ref_optim = torch.optim.SGD(reference.parameters(), lr=0.1)
+            for _ in range(2):
+                optim.zero_grad()
+                ref_optim.zero_grad()
+                x = torch.randn(4, 8, device="cuda", requires_grad=True)
+                model(x * 2).sum().backward()
+                reference(x * 2).sum().backward()
+                self.assertEqual(unsharded_in, {2: True, 4: False})
+                for param, ref_param in zip(
+                    model.parameters(), reference.parameters(), strict=True
+                ):
+                    torch.testing.assert_close(param.grad, ref_param.grad)
+                optim.step()
+                ref_optim.step()
+
     def test_persistent_unsharded_params(self):
         for reshard_after_forward in (False, True):
             with (
@@ -339,7 +389,7 @@ class TestFlexShardEagerRuntime(TestCase):
         for bucket, hook_module in zip(
             buckets, (model.layers[0], model, model.head), strict=True
         ):
-            self.assertIs(bucket.forward_hook_module(), hook_module)
+            self.assertEqual(bucket.forward_hook_modules(), [hook_module])
         head_resharded = []
 
         def probe(module, args, output):
