@@ -278,8 +278,8 @@ class BucketCommContext:
         ):
             pending.result.wait()
             pending.result.release_buffers()
-            if pending.result.refill:
-                pending.bucket.free_persistent_storage()
+            # A refill's begin re-allocated the storage (a first unshard has none).
+            pending.bucket.free_persistent_storage()
         return None
 
     def queue_post_backward_callback(self) -> None:
