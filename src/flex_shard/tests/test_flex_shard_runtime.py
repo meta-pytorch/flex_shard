@@ -543,6 +543,10 @@ class TestFlexShardEagerRuntime(TestCase):
                 )
             # Skipping layers.1, layers.0's prefetch of it is released.
             self.assertIn(buckets[1], released)
+            # Printing resharded buckets reads no freed storage.
+            for bucket in buckets:
+                repr(bucket)
+            torch.cuda.synchronize()
 
     def test_gradient_bucket_matches_reference(self):
         # The reduce-scatter reads the grads' gradient bucket as is, and grads
