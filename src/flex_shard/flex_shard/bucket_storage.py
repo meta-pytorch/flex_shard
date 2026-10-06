@@ -205,7 +205,8 @@ class BucketSpec:
         gradient_bucket: Whether this bucket's unsharded grads are views of
             zeroed buffers that mirror the persistent buffers the unsharded
             params view, in the reduce dtype, set in its pre-backward hook
-            (before ``pre_backward_hook``) when they do not exist yet. A
+            (before ``pre_backward_hook``), or by ``FlexShardModule.unshard()``,
+            when they do not exist yet. A
             placement whose gradient reduction layout is its parameter layout
             (``BucketedBlockShard`` with equal rank ranges) then reduce-scatters
             that buffer without copying the grads in. They take the bucket's
