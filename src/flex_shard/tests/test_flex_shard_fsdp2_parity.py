@@ -9,8 +9,10 @@
 import contextlib
 import copy
 import itertools
+import math
 from collections import defaultdict
 from collections.abc import Callable, Iterator
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -29,6 +31,7 @@ from torch.testing._internal.common_fsdp import FSDPTest, get_devtype
 from torch.testing._internal.common_utils import run_tests
 
 from .. import BucketSpec, flex_shard, MixedPrecisionPolicy
+from ..custom_placements import shard as shard_module
 from ..custom_placements.shard import Shard
 
 device_type = torch.device(get_devtype())
@@ -235,6 +238,58 @@ def _train(
     return history
 
 
+def _all_gather_copy_out_reference(
+    out: list[torch.Tensor],
+    src: torch.Tensor,
+    split_sizes: list[int],
+    outer_sizes: list[int],
+    num_chunks: int,
+) -> None:
+    """The composite kernel of ``fsdp::_all_gather_copy_out_`` from
+    pytorch/pytorch#197701, for PyTorch builds without it."""
+    chunks = src.view(num_chunks, -1)
+    offset = 0
+    for output, split_size, outer_size in zip(
+        out, split_sizes, outer_sizes, strict=True
+    ):
+        inner_size = split_size // outer_size
+        output.view(outer_size, num_chunks, inner_size).copy_(
+            chunks.narrow(1, offset, split_size)
+            .view(num_chunks, outer_size, inner_size)
+            .transpose(0, 1)
+        )
+        offset += split_size
+
+
+def _reduce_scatter_copy_in_reference(
+    out: torch.Tensor,
+    tensors: list[torch.Tensor],
+    num_leading_dims: list[int],
+    num_chunks: int,
+) -> torch.Tensor:
+    """The composite kernel of ``fsdp::_reduce_scatter_copy_in_`` from
+    pytorch/pytorch#197701, for PyTorch builds without it."""
+    chunks = out.view(num_chunks, -1)
+    if all(dim == 0 for dim in num_leading_dims):
+        torch._chunk_cat(tensors, 0, num_chunks, out=chunks)
+        return out
+    offset = 0
+    for tensor, dim in zip(tensors, num_leading_dims, strict=True):
+        outer_size = math.prod(tensor.shape[:dim])
+        inner_size = -(-tensor.shape[dim] // num_chunks) * math.prod(
+            tensor.shape[dim + 1 :]
+        )
+        chunk = chunks.narrow(1, offset, outer_size * inner_size)
+        if dim == 0:
+            chunk.copy_(torch._chunk_cat([tensor], 0, num_chunks))
+        else:
+            chunk.view(num_chunks, outer_size, inner_size).copy_(
+                tensor.view(outer_size, num_chunks, inner_size).transpose(0, 1)
+            )
+        offset += outer_size * inner_size
+    return out
+
+
 class TestFlexShardFSDP2Parity(FSDPTest):
     @property
     def world_size(self) -> int:
@@ -307,6 +362,28 @@ class TestFlexShardFSDP2Parity(FSDPTest):
 
     @skip_if_lt_x_gpu(4)
     def test_matches_fully_shard(self):
+        with mock.patch.object(
+            shard_module, "_native_collective_copy_ops", return_value=None
+        ):
+            self._check_matches_fully_shard()
+
+    @skip_if_lt_x_gpu(4)
+    def test_matches_fully_shard_with_native_copies(self):
+        """Shard(1) params copied directly between their layout and the
+        collective buffers fill the same buffers as FSDP2's default copies."""
+        native_ops = shard_module._native_collective_copy_ops() or (
+            _all_gather_copy_out_reference,
+            _reduce_scatter_copy_in_reference,
+        )
+        counted_ops = tuple(mock.Mock(wraps=op) for op in native_ops)
+        with mock.patch.object(
+            shard_module, "_native_collective_copy_ops", return_value=counted_ops
+        ):
+            self._check_matches_fully_shard()
+        for op in counted_ops:
+            self.assertGreater(op.call_count, 0)
+
+    def _check_matches_fully_shard(self):
         mesh = init_device_mesh(device_type.type, (self.world_size,))
         torch.manual_seed(0)
         reference = _Decoder()

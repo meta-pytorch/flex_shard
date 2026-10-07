@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import functools
+import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
@@ -40,13 +43,37 @@ if TYPE_CHECKING:
     from ..flex_shard.placement_contract import GradientReduction
 
 
+@functools.cache
+def _native_collective_copy_ops() -> (
+    tuple[Callable[..., Any], Callable[..., Any]] | None
+):
+    """FSDP's native collective copies, ``(all-gather copy-out, reduce-scatter
+    copy-in)``, or None if this PyTorch lacks them (pytorch/pytorch#197701).
+
+    They copy shards on a nonzero dim directly between parameter layouts and
+    collective buffers, with each output's or input's leading size, where the
+    default copies reorder the chunks through temporaries.
+    """
+    fsdp_ops = torch.ops.fsdp
+    if not (
+        hasattr(fsdp_ops, "_all_gather_copy_out_")
+        and hasattr(fsdp_ops, "_reduce_scatter_copy_in_")
+    ):
+        return None
+    return fsdp_ops._all_gather_copy_out_, fsdp_ops._reduce_scatter_copy_in_
+
+
 class Shard(Placement):
     """Symmetric sharding — parameter split along dim across all ranks.
 
     Parameters sharded on different dims share one bucket. As in FSDP2, a
     ``Shard(i)`` parameter with ``i > 0`` must split evenly; its chunks are
     reordered to dim 0 around the collectives, and only ``Shard(0)`` pads uneven
-    chunks.
+    chunks. With FSDP's native collective copies (pytorch/pytorch#197701), a
+    bucket with such parameters copies them directly between their layout and
+    the collective buffers, as FSDP2's ``with_native_copy`` functions do;
+    without them, it reorders their chunks through temporaries, as FSDP2's
+    default copies do. Both produce the same buffers.
     """
 
     @dataclass(frozen=True)
@@ -245,13 +272,9 @@ class Shard(Placement):
         ``persistent_buffers`` are padded buffers from a previous persistent unshard
         to write into instead of allocating. Such a refill returns no full params:
         the caller keeps the ones from the first unshard, which view these buffers.
-        As in FSDP2, a ``Shard(i)`` param with ``i > 0`` is copied out rank-major
-        into a temporary, then concatenated along its shard dim.
         """
         full_params: list[torch.Tensor] = []
         padded_full_params: list[torch.Tensor] = []
-        split_out: list[torch.Tensor] = []
-        shard_i_copies: list[tuple[ParamInfo, torch.Tensor, torch.Tensor]] = []
         for idx, (info, padded_local_numel) in enumerate(
             zip(infos, layout.padded_local_numels, strict=True)
         ):
@@ -269,6 +292,28 @@ class Shard(Placement):
                 full_params.append(
                     padded_full_param[: info.global_numel].view(info.global_shape)
                 )
+
+        has_shard_i = any(info.placement.dim > 0 for info in infos)
+        if has_shard_i and (native_ops := _native_collective_copy_ops()) is not None:
+            # One copy places every rank's chunk: each padded param is a
+            # [leading size, world size, rest] view of its full layout.
+            all_gather_copy_out, _ = native_ops
+            all_gather_copy_out(
+                padded_full_params,
+                gathered,
+                list(layout.padded_local_numels),
+                [math.prod(info.global_shape[: info.placement.dim]) for info in infos],
+                world_size,
+            )
+            return full_params, padded_full_params
+
+        # A Shard(i) param with i > 0 is copied out rank-major into a temporary,
+        # then concatenated along its shard dim.
+        split_out: list[torch.Tensor] = []
+        shard_i_copies: list[tuple[ParamInfo, torch.Tensor, torch.Tensor]] = []
+        for info, padded_local_numel, padded_full_param in zip(
+            infos, layout.padded_local_numels, padded_full_params, strict=True
+        ):
             if info.placement.dim == 0:
                 split_out.append(padded_full_param.view(world_size, padded_local_numel))
             else:
@@ -389,34 +434,52 @@ class Shard(Placement):
     ) -> tuple[torch.Tensor, Shard._ReduceGradLayout]:
         dtype = infos[0].grad_reduce_dtype
         device = tensors[0].device
+        # The native copy-in takes one grad dtype, like FSDP2's.
+        native_ops = (
+            _native_collective_copy_ops()
+            if world_size > 1
+            and any(info.placement.dim > 0 for info in infos)
+            and len({tensor.dtype for tensor in tensors}) == 1
+            else None
+        )
+        # Per grad: the dims before its shard dim, which the native copy-in
+        # chunks along directly, or 0 to chunk along dim 0.
+        num_leading_dims = [0] * len(tensors)
         if world_size > 1:
-            # As FSDP2 does, reorder a Shard(i > 0) grad along dim 0 so that
-            # each rank's chunk is contiguous, then pack every grad along dim 0.
-            tensors = [
-                tensor
-                if info.placement.dim == 0
-                else torch.cat(
-                    torch.chunk(tensor, world_size, dim=info.placement.dim), dim=0
-                )
-                for tensor, info in zip(tensors, infos, strict=True)
-            ]
+            tensors = list(tensors)
+            for idx, (tensor, info) in enumerate(zip(tensors, infos, strict=True)):
+                if (shard_dim := info.placement.dim) == 0:
+                    continue
+                if native_ops is not None and tensor.is_contiguous():
+                    num_leading_dims[idx] = shard_dim
+                else:
+                    # As FSDP2 does, reorder the grad along dim 0 so that each
+                    # rank's chunk is contiguous.
+                    tensors[idx] = torch.cat(
+                        torch.chunk(tensor, world_size, dim=shard_dim), dim=0
+                    )
         padded_sizes: list[torch.Size] = []
-        for tensor in tensors:
+        for tensor, leading_dims in zip(tensors, num_leading_dims, strict=True):
             padded_size = list(tensor.shape)
-            padded_size[0] = (
-                (tensor.size(0) + world_size - 1) // world_size
-            ) * world_size
+            if leading_dims == 0:
+                padded_size[0] = (
+                    (tensor.size(0) + world_size - 1) // world_size
+                ) * world_size
             padded_sizes.append(torch.Size(padded_size))
 
         input_numel = sum(s.numel() for s in padded_sizes)
         send_buf = torch.empty(input_numel, dtype=dtype, device=device)
         send_buf_2d = send_buf.view(world_size, -1)
-        # Grads may differ in dtype (per-parameter grad_dtype). The copy-in
-        # casts each to the reduce dtype as it copies, one fused kernel for
-        # CUDA bf16 + fp32 (fsdp::chunk_cat_mixed_dtype, pytorch/pytorch#194434).
-        torch.ops.fsdp.chunk_cat_mixed_dtype(
-            tensors, dim=0, num_chunks=world_size, out=send_buf_2d
-        )
+        if native_ops is not None:
+            _, reduce_scatter_copy_in = native_ops
+            reduce_scatter_copy_in(send_buf_2d, tensors, num_leading_dims, world_size)
+        else:
+            # Grads may differ in dtype (per-parameter grad_dtype). The copy-in
+            # casts each to the reduce dtype as it copies, one fused kernel for
+            # CUDA bf16 + fp32 (fsdp::chunk_cat_mixed_dtype, pytorch/pytorch#194434).
+            torch.ops.fsdp.chunk_cat_mixed_dtype(
+                tensors, dim=0, num_chunks=world_size, out=send_buf_2d
+            )
         return send_buf, Shard._ReduceGradLayout(padded_sizes)
 
     def _unpack_reduce_scatter_grad(
