@@ -644,9 +644,10 @@ class TestFlexShardTraining(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_copy_free_matches_reference(self):
-        # Refills gather straight into the persistent buckets, and with
-        # gradient_bucket=True the reduce-scatter reads the grads' bucket as
-        # is; training matches an unsharded reference, with and without
+        # The all-gather sends the local storage as is, refills gather straight
+        # into the persistent buckets, and with gradient_bucket=True the
+        # reduce-scatter reads the grads' bucket as is; training matches an
+        # unsharded reference, with and without
         # reshard-after-forward and no-sync. Whole-parameter BucketedOwned
         # buckets (Muon's) do so in their owners' rows of the gathered bucket.
         mesh = init_device_mesh(device_type.type, (self.world_size,))
@@ -703,11 +704,20 @@ class TestFlexShardTraining(FSDPTest):
                 optimizer = make_test_sgd(model.parameters(), lr=0.1)
                 reference_optimizer = make_test_sgd(reference.parameters(), lr=0.1)
                 in_place: list[bool] = []
+                sent_storage: list[bool] = []
                 reduced_bucket: list[bool] = []
 
-                def recording_begin(*args, **kwargs):
+                def recording_begin(local_shards, *args, **kwargs):
                     in_place.append(kwargs.get("persistent_buffers") is not None)
-                    return begin_bucket_unshard(*args, **kwargs)
+                    handle = begin_bucket_unshard(local_shards, *args, **kwargs)
+                    send = handle.prepared.buffers[0]
+                    sent_storage.append(
+                        send.untyped_storage().data_ptr()
+                        in {
+                            shard.untyped_storage().data_ptr() for shard in local_shards
+                        }
+                    )
+                    return handle
 
                 def recording_find_gradient_bucket(*args):
                     found = find_gradient_bucket(*args)
@@ -744,6 +754,7 @@ class TestFlexShardTraining(FSDPTest):
                 self.assertEqual(in_place[:3], [False] * 3)
                 self.assertTrue(all(in_place[3:]))
                 self.assertGreater(len(in_place), 3)
+                self.assertTrue(all(sent_storage), sent_storage)
                 self.assertTrue(reduced_bucket)
                 self.assertTrue(
                     all(found == gradient_bucket for found in reduced_bucket)
