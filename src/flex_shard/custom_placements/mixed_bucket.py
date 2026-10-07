@@ -28,11 +28,11 @@ from ..flex_shard.utils import (
     _record_copy_out_if_eager,
     _record_function_if_eager,
 )
-from .block_shard import _grad_reduce_dtype, BlockShard
+from .block_shard import _grad_reduce_dtype, _unsharded_dtype, BlockShard
 from .fp8_bucketed_block_shard import _align_up, _VEC_ALIGN_BYTES, Fp8BucketedBlockShard
 from .owned import BucketedOwned
 from .shard import Shard
-from .utils import reduce_scatter_grads
+from .utils import foreach_copy_, reduce_scatter_grads
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -82,6 +82,9 @@ class _MixedUnshardState:
     requires_dtype_reinterpretation: bool
     pg: Any
     debug_fqn: str | None
+    # Every group lives whole on one owner, so the params view the gathered rows
+    # (see MixedBucketPlacement._prepare_owner_rows_unshard).
+    owner_rows: bool = False
 
 
 @dataclass(frozen=True)
@@ -411,6 +414,9 @@ class MixedBucketPlacement(Placement):
             lambda info: info.unsharded_dtype,
         )
         _validate_mixed_groups(groups)
+        owner_rows = self._prepare_owner_rows_unshard(groups, mesh, debug_fqn)
+        if owner_rows is not None:
+            return owner_rows
 
         prepared_groups: list[tuple[PlacementPreparedUnshard, tuple[int, ...]]] = []
         group_buffers: list[torch.Tensor] = []
@@ -497,14 +503,20 @@ class MixedBucketPlacement(Placement):
                 "Expected _MixedUnshardState, "
                 f"got {type(prepared.placement_state).__name__}"
             )
-        with _record_comm_if_eager(
-            "FlexShard::mixed_all_gather",
-            prepared.placement_state.debug_fqn,
-        ):
+        state = prepared.placement_state
+        if not state.owner_rows:
+            gathered = prepared.buffers[1]
+        elif prepared.persistent_buffers is not None:
+            # A refill gathers straight into the persistent rows.
+            gathered = prepared.persistent_buffers[0]
+        else:
+            gathered = prepared.buffers[0].new_empty(state.world_size * state.row_numel)
+            prepared.buffers.insert(1, gathered)
+        with _record_comm_if_eager("FlexShard::mixed_all_gather", state.debug_fqn):
             dist.all_gather_into_tensor(
-                output_tensor=prepared.buffers[1],
+                output_tensor=gathered,
                 input_tensor=prepared.buffers[0],
-                group=prepared.placement_state.pg,
+                group=state.pg,
             )
 
     def finish_prepared_unshard(
@@ -517,6 +529,8 @@ class MixedBucketPlacement(Placement):
                 f"got {type(prepared.placement_state).__name__}"
             )
         state = prepared.placement_state
+        if state.owner_rows:
+            return self._finish_owner_rows_unshard(prepared, state)
         # A refill returns no full params (see PlacementUnshardResult).
         refill = prepared.persistent_buffers is not None
         gathered_by_rank = prepared.buffers[1].view(
@@ -600,6 +614,205 @@ class MixedBucketPlacement(Placement):
             persistent_buffers=persistent_buffers,
         )
 
+    def _prepare_owner_rows_unshard(
+        self,
+        groups: list[_PlacementGroup],
+        mesh: DeviceMesh,
+        debug_fqn: str | None,
+    ) -> PlacementPreparedUnshard | None:
+        """Unshard a bucket whose groups each live whole on one owner, as
+        BucketedOwned's whole parameters do, in one dtype: each rank sends its
+        own groups' params, and every param lies contiguously in its owner's
+        row of the gathered buffer, so the full params view those rows, as
+        BucketedBlockShard's view its bucket, and refills gather straight into
+        them. None for any other bucket."""
+        rank = mesh.get_local_rank()
+        world_size = mesh.size()
+        dtype = _unsharded_dtype(groups[0].infos[0])
+        if any(
+            _one_hot_block_owner(group.placement, world_size) is None
+            for group in groups
+        ) or any(
+            _unsharded_dtype(info) != dtype for group in groups for info in group.infos
+        ):
+            return None
+        layouts = []
+        for group in groups:
+            group.placement._validate_bucket_inputs(group.tensors, group.infos)
+            layouts.append(group.placement._padded_bucket_layout(group.infos))
+        offsets, owner_ranks, row_numel, _ = _plan_group_offsets(
+            [group.placement for group in groups],
+            [layout.padded_segment_numel for layout in layouts],
+            world_size,
+        )
+        with _record_copy_in_if_eager():
+            send = torch.zeros(
+                row_numel, dtype=dtype, device=groups[0].tensors[0].device
+            )
+            copy_dsts: list[torch.Tensor] = []
+            copy_srcs: list[torch.Tensor] = []
+            for group, layout, offset, owner_rank in zip(
+                groups, layouts, offsets, owner_ranks, strict=True
+            ):
+                if owner_rank != rank:
+                    continue
+                for index, (tensor, info) in enumerate(
+                    zip(group.tensors, group.infos, strict=True)
+                ):
+                    start = offset + layout.param_offsets[index]
+                    copy_dsts.append(send[start : start + info.local_numel])
+                    copy_srcs.append(tensor.reshape(-1))
+            foreach_copy_(copy_dsts, copy_srcs)
+        group_states = [
+            _MixedUnshardGroupState(
+                prepared=PlacementPreparedUnshard(
+                    placement=group.placement,
+                    buffers=[],
+                    placement_state=BlockShard._UnshardState(
+                        infos=group.infos,
+                        layout=layout,
+                        pg=mesh.get_group(),
+                        debug_fqn=debug_fqn,
+                    ),
+                ),
+                indices=tuple(group.indices),
+                offset=offset,
+                numel=layout.padded_segment_numel,
+            )
+            for group, layout, offset in zip(groups, layouts, offsets, strict=True)
+        ]
+        return PlacementPreparedUnshard(
+            placement=self,
+            buffers=[send],
+            placement_state=_MixedUnshardState(
+                groups=group_states,
+                world_size=world_size,
+                row_numel=row_numel,
+                requires_dtype_reinterpretation=False,
+                pg=mesh.get_group(),
+                debug_fqn=debug_fqn,
+                owner_rows=True,
+            ),
+        )
+
+    def _finish_owner_rows_unshard(
+        self,
+        prepared: PlacementPreparedUnshard,
+        state: _MixedUnshardState,
+    ) -> PlacementUnshardResult:
+        if prepared.persistent_buffers is not None:
+            # Run refilled the persistent rows.
+            return PlacementUnshardResult(
+                full_params=[],
+                persistent_buffers=list(prepared.persistent_buffers),
+            )
+        gathered = prepared.buffers[1]
+        if prepared.persistent:
+            # The first unshard, as for BucketedBlockShard: the gathered rows
+            # come from the unshard stream, and persistent storage lives on the
+            # current stream, so copy into it. Refills gather into it.
+            rows = torch.empty_like(gathered)
+            with _record_copy_out_if_eager():
+                rows.copy_(gathered)
+        else:
+            rows = gathered
+        rows_by_rank = rows.view(state.world_size, state.row_numel)
+        full_params: list[torch.Tensor | None] = [None] * sum(
+            len(group.indices) for group in state.groups
+        )
+        for group in state.groups:
+            owner_rank = _one_hot_block_owner(
+                group.prepared.placement, state.world_size
+            )
+            group_state = group.prepared.placement_state
+            for index, (param_index, info) in enumerate(
+                zip(group.indices, group_state.infos, strict=True)
+            ):
+                start = group.offset + group_state.layout.param_offsets[index]
+                full_params[param_index] = rows_by_rank[
+                    owner_rank, start : start + info.global_numel
+                ].view(info.global_shape)
+        return PlacementUnshardResult(
+            full_params=full_params,
+            persistent_buffers=[rows] if prepared.persistent else [],
+        )
+
+    def _prepare_owner_rows_reduce_grad(
+        self,
+        groups: list[_PlacementGroup],
+        mesh: DeviceMesh,
+        debug_fqn: str | None,
+    ) -> PlacementPreparedReduceGrad | None:
+        """Reduce-scatter the grads' gradient bucket as is, if they view one
+        that mirrors the owner rows the params view
+        (``BucketSpec.gradient_bucket``; see _prepare_owner_rows_unshard):
+        each grad already sits in its owner's row. None otherwise."""
+        world_size = mesh.size()
+        bucket = groups[0].tensors[0]._base
+        if bucket is None or any(
+            _one_hot_block_owner(group.placement, world_size) is None
+            for group in groups
+        ):
+            return None
+        layouts = [
+            group.placement._padded_bucket_layout(group.infos) for group in groups
+        ]
+        offsets, owner_ranks, row_numel, _ = _plan_group_offsets(
+            [group.placement for group in groups],
+            [layout.padded_segment_numel for layout in layouts],
+            world_size,
+        )
+        if (
+            bucket.dtype != _grad_reduce_dtype(groups[0].infos[0])
+            or bucket.shape != (world_size * row_numel,)
+            or not bucket.is_contiguous()
+        ):
+            return None
+        for group, layout, offset, owner_rank in zip(
+            groups, layouts, offsets, owner_ranks, strict=True
+        ):
+            for index, (tensor, info) in enumerate(
+                zip(group.tensors, group.infos, strict=True)
+            ):
+                if (
+                    tensor._base is not bucket
+                    or tensor.shape != info.global_shape
+                    or not tensor.is_contiguous()
+                    or tensor.storage_offset() - bucket.storage_offset()
+                    != owner_rank * row_numel + offset + layout.param_offsets[index]
+                ):
+                    return None
+        return PlacementPreparedReduceGrad(
+            placement=self,
+            buffers=[bucket],
+            placement_state=_MixedReduceGradState(
+                groups=[
+                    _MixedReduceGradGroupState(
+                        prepared=PlacementPreparedReduceGrad(
+                            placement=group.placement,
+                            buffers=[],
+                            placement_state=BlockShard._ReduceGradState(
+                                infos=group.infos,
+                                layout=layout,
+                                pg=mesh.get_group(),
+                                debug_fqn=debug_fqn,
+                            ),
+                        ),
+                        indices=group.indices,
+                        offset=offset,
+                        numel=layout.padded_segment_numel,
+                    )
+                    for group, layout, offset in zip(
+                        groups, layouts, offsets, strict=True
+                    )
+                ],
+                world_size=world_size,
+                row_numel=row_numel,
+                pg=mesh.get_group(),
+                debug_fqn=debug_fqn,
+            ),
+        )
+
     def prepare_reduce_grad(
         self,
         tensors: list[torch.Tensor],
@@ -610,6 +823,9 @@ class MixedBucketPlacement(Placement):
         world_size = mesh.size()
         groups = _group_tensors_by_placement(tensors, infos, world_size)
         _validate_mixed_groups(groups)
+        owner_rows = self._prepare_owner_rows_reduce_grad(groups, mesh, debug_fqn)
+        if owner_rows is not None:
+            return owner_rows
         prepared_groups: list[tuple[PlacementPreparedReduceGrad, list[int], int]] = []
         group_buffers: list[torch.Tensor] = []
         dtype: torch.dtype | None = None

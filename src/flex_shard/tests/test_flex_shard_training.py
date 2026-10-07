@@ -32,6 +32,7 @@ from ..custom_placements.block_shard import (
     make_bucketed_block_placement_fn,
 )
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
+from ..custom_placements.owned import make_bucketed_owned_full_param_placement_fn
 from ..custom_placements.shard import per_param_placements, Shard
 from ..flex_shard import bucket_runtime
 from ..flex_shard.checkpoint import get_flex_shard_global_layouts
@@ -642,23 +643,38 @@ class TestFlexShardTraining(FSDPTest):
             )
 
     @skip_if_lt_x_gpu(2)
-    def test_bucketed_block_copy_free_matches_reference(self):
+    def test_copy_free_matches_reference(self):
         # Refills gather straight into the persistent buckets, and with
         # gradient_bucket=True the reduce-scatter reads the grads' bucket as
         # is; training matches an unsharded reference, with and without
-        # reshard-after-forward and no-sync.
+        # reshard-after-forward and no-sync. Whole-parameter BucketedOwned
+        # buckets (Muon's) do so in their owners' rows of the gathered bucket.
         mesh = init_device_mesh(device_type.type, (self.world_size,))
-        placement_fn = make_bucketed_block_placement_fn(
-            dims=(0,), blocks_per_rank=(1,) * self.world_size
-        )
+        placement_fns = {
+            "bucketed_block": make_bucketed_block_placement_fn(
+                dims=(0,), blocks_per_rank=(1,) * self.world_size
+            ),
+            "owned": make_bucketed_owned_full_param_placement_fn(),
+        }
+        # Where each placement's reduce looks for the gradient bucket.
+        gradient_bucket_lookups = {
+            "bucketed_block": (BucketedBlockShard, "_gradient_bucket_of"),
+            "owned": (MixedBucketPlacement, "_prepare_owner_rows_reduce_grad"),
+        }
         begin_bucket_unshard = bucket_runtime.begin_bucket_unshard
-        gradient_bucket_of = BucketedBlockShard._gradient_bucket_of
-        for reshard_after_forward, gradient_bucket in (
-            (False, True),
-            (True, True),
-            (True, False),
+        for placement, reshard_after_forward, gradient_bucket in (
+            ("bucketed_block", False, True),
+            ("bucketed_block", True, True),
+            ("bucketed_block", True, False),
+            ("owned", False, True),
+            ("owned", True, True),
+            ("owned", True, False),
         ):
+            placement_fn = placement_fns[placement]
+            lookup = gradient_bucket_lookups[placement]
+            find_gradient_bucket = getattr(*lookup)
             with self.subTest(
+                placement=placement,
                 reshard_after_forward=reshard_after_forward,
                 gradient_bucket=gradient_bucket,
             ):
@@ -693,21 +709,17 @@ class TestFlexShardTraining(FSDPTest):
                     in_place.append(kwargs.get("persistent_buffers") is not None)
                     return begin_bucket_unshard(*args, **kwargs)
 
-                def recording_gradient_bucket_of(placement, *args):
-                    bucket = gradient_bucket_of(placement, *args)
-                    reduced_bucket.append(bucket is not None)
-                    return bucket
+                def recording_find_gradient_bucket(*args):
+                    found = find_gradient_bucket(*args)
+                    reduced_bucket.append(found is not None)
+                    return found
 
                 torch.manual_seed(1 + self.rank)
                 with (
                     mock.patch.object(
                         bucket_runtime, "begin_bucket_unshard", recording_begin
                     ),
-                    mock.patch.object(
-                        BucketedBlockShard,
-                        "_gradient_bucket_of",
-                        recording_gradient_bucket_of,
-                    ),
+                    mock.patch.object(*lookup, recording_find_gradient_bucket),
                 ):
                     for step in range(4):
                         optimizer.zero_grad(set_to_none=True)
