@@ -224,6 +224,16 @@ class BucketSpec:
             dtype until the copy-in. Grads that end up elsewhere (e.g. allocated
             before the pre-backward hook, or in more than one buffer) fall back
             to the copy, with a warning. Eager only.
+        fsdp2_compatible: Whether this bucket's collectives match those of the
+            FSDP2 ``fully_shard`` group it replaces, byte for byte, so training
+            is bitwise identical to FSDP2. The parameters take FSDP2's order: a
+            post-order walk over the modules the patterns name, in pattern
+            order, or over the whole module for parameter patterns, keeping
+            each module's own parameters. The reduce-scatter groups them by
+            sharded grad dtype, as FSDP2 does, and includes only the parameters
+            that got a grad, as FSDP2 does by default: every rank must then get
+            grads for the same parameters. Requires ``Shard`` placements and
+            ``gradient_bucket=False``. Eager only.
     """
 
     patterns: list[str]
@@ -238,6 +248,7 @@ class BucketSpec:
     post_reduce_hook: BucketHook | None = None
     defer_post_backward: bool = False
     gradient_bucket: bool = False
+    fsdp2_compatible: bool = False
 
 
 @dataclass(frozen=True)
@@ -350,6 +361,7 @@ class ShardedBucketStorage:
         defer_post_backward: bool = False,
         gradient_bucket: bool = False,
         hook_module_fqns: list[str] | None = None,
+        fsdp2_compatible: bool = False,
     ) -> None:
         if byte_storage.dtype != torch.uint8:
             raise ValueError(f"Expected uint8 storage, got {byte_storage.dtype}")
@@ -363,6 +375,7 @@ class ShardedBucketStorage:
         self._post_reduce_hook = post_reduce_hook
         self._defer_post_backward = defer_post_backward
         self._gradient_bucket = gradient_bucket
+        self._fsdp2_compatible = fsdp2_compatible
         # The modules a bucket of module patterns hooks (BucketSpec.patterns).
         self._hook_module_fqns = hook_module_fqns
         # See set_requires_gradient_sync and set_reshard_after_backward.
@@ -419,6 +432,7 @@ class ShardedBucketStorage:
             defer_post_backward=bucket_spec.defer_post_backward,
             gradient_bucket=bucket_spec.gradient_bucket,
             hook_module_fqns=_hook_module_fqns(module, bucket_spec.patterns),
+            fsdp2_compatible=bucket_spec.fsdp2_compatible,
         )
         bucket_storage.copy_params_from(named_params)
         bucket_storage.install_sharded_params(expected_param_device)
@@ -898,3 +912,36 @@ def _hook_module_fqns(module: nn.Module, patterns: list[str]) -> list[str] | Non
                 "the modules it contains instead."
             )
     return list(patterns)
+
+
+def _fsdp2_param_order(
+    module: nn.Module,
+    patterns: list[str],
+    named_params: list[tuple[str, nn.Parameter]],
+) -> list[tuple[str, nn.Parameter]]:
+    """Order a bucket's params as ``fully_shard`` orders its group's params.
+
+    FSDP2 walks the modules it is given in post-order and takes each module's
+    own params when it first meets them. A bucket of module patterns walks
+    those modules, in pattern order. For parameter patterns, any module that
+    contains the bucket gives the same relative order, so walk the root.
+    """
+    hook_fqns = _hook_module_fqns(module, patterns)
+    roots = [module.get_submodule(fqn) for fqn in hook_fqns] if hook_fqns else [module]
+    bucket_param_ids = {id(param) for _, param in named_params}
+    positions: dict[int, int] = {}
+    visited: set[nn.Module] = set()
+
+    def visit(submodule: nn.Module) -> None:
+        visited.add(submodule)
+        for child in submodule.children():
+            if child not in visited:
+                visit(child)
+        for param in submodule.parameters(recurse=False):
+            if id(param) in bucket_param_ids:
+                positions.setdefault(id(param), len(positions))
+
+    for root in roots:
+        if root not in visited:
+            visit(root)
+    return sorted(named_params, key=lambda named_param: positions[id(named_param[1])])
