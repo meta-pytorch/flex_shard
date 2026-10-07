@@ -40,6 +40,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 from .. import (
     BucketSpec,
     flex_shard,
+    get_mesh,
     GradientReduction,
     is_flex_shard_param,
     Placement,
@@ -418,6 +419,7 @@ class TestBucketPlacementValidation(TestCase):
             self.assertEqual(len(model.sharded_bucket_storages), 1)
             for name, param in model.named_parameters():
                 self.assertEqual(param, expected[name])
+                self.assertIs(get_mesh(param), mesh)
 
     def test_rejects_uneven_shard_on_nonzero_dim(self):
         """As in FSDP2, only Shard(0) pads; Shard(1) must split evenly."""
