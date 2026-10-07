@@ -47,10 +47,11 @@ class Shard(Placement):
     Parameters sharded on different dims share one bucket. As in FSDP2, a
     ``Shard(i)`` parameter with ``i > 0`` must split evenly; its chunks are
     reordered to dim 0 around the collectives, and only ``Shard(0)`` pads uneven
-    chunks. A bucket with such parameters copies them directly between their
-    layout and the collective buffers with FSDP's native collective copies, as
-    FSDP2's ``with_native_copy`` functions do. These need a PyTorch with
-    pytorch/pytorch#197204.
+    chunks. A bucket copies its parameters directly between their layouts and
+    the collective buffers with FSDP's native collective copies, which take
+    each tensor's leading size, the product of the dims before its shard dim
+    (1 for ``Shard(0)``), as FSDP2's ``with_native_copy`` functions do. These
+    need a PyTorch with pytorch/pytorch#197204.
     """
 
     @dataclass(frozen=True)
@@ -270,28 +271,15 @@ class Shard(Placement):
                     padded_full_param[: info.global_numel].view(info.global_shape)
                 )
 
-        if any(info.placement.dim > 0 for info in infos):
-            # One copy places every rank's chunk: each padded param is a
-            # [leading size, world size, rest] view of its full layout.
-            torch.ops.fsdp._all_gather_copy_out_(
-                padded_full_params,
-                gathered,
-                list(layout.padded_local_numels),
-                [math.prod(info.global_shape[: info.placement.dim]) for info in infos],
-                world_size,
-            )
-        else:
-            torch.split_with_sizes_copy(
-                gathered.view(world_size, -1),
-                layout.padded_local_numels,
-                dim=1,
-                out=[
-                    padded_full_param.view(world_size, padded_local_numel)
-                    for padded_full_param, padded_local_numel in zip(
-                        padded_full_params, layout.padded_local_numels, strict=True
-                    )
-                ],
-            )
+        # One copy places every rank's chunk: each padded param is a
+        # [leading size, world size, rest] view of its full layout.
+        torch.ops.fsdp._all_gather_copy_out_(
+            padded_full_params,
+            gathered,
+            list(layout.padded_local_numels),
+            [math.prod(info.global_shape[: info.placement.dim]) for info in infos],
+            world_size,
+        )
         return full_params, padded_full_params
 
     @override
@@ -388,13 +376,12 @@ class Shard(Placement):
     ) -> tuple[torch.Tensor, Shard._ReduceGradLayout]:
         dtype = infos[0].grad_reduce_dtype
         device = tensors[0].device
-        has_shard_i = world_size > 1 and any(info.placement.dim > 0 for info in infos)
         # The native copy-in takes one grad dtype, like FSDP2's.
-        native_copy_in = has_shard_i and len({tensor.dtype for tensor in tensors}) == 1
+        native_copy_in = len({tensor.dtype for tensor in tensors}) == 1
         # Per grad: the dims before its shard dim, which the native copy-in
         # chunks along directly, or 0 to chunk along dim 0.
         num_leading_dims = [0] * len(tensors)
-        if has_shard_i:
+        if world_size > 1:
             tensors = list(tensors)
             for idx, (tensor, info) in enumerate(zip(tensors, infos, strict=True)):
                 if (shard_dim := info.placement.dim) == 0:

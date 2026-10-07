@@ -30,10 +30,8 @@ from torch.testing._internal.common_utils import run_tests
 
 from .. import BucketSpec, flex_shard, MixedPrecisionPolicy
 from ..custom_placements.shard import Shard
-from .common import register_native_collective_copy_reference_ops
 
 device_type = torch.device(get_devtype())
-register_native_collective_copy_reference_ops()
 
 _VOCAB = 11
 # Uneven over four ranks: every Shard(0) parameter below pads its last chunks.

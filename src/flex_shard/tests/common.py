@@ -309,7 +309,7 @@ _NATIVE_COLLECTIVE_COPY_LIBRARIES: list[torch.library.Library] = []
 def register_native_collective_copy_reference_ops() -> None:
     """Register ports of FSDP's native collective copies if PyTorch lacks them.
 
-    FlexShard copies Shard(i > 0) parameters with ``fsdp::_all_gather_copy_out_``
+    FlexShard's Shard buckets copy parameters with ``fsdp::_all_gather_copy_out_``
     and ``fsdp::_reduce_scatter_copy_in_`` from pytorch/pytorch#197204. These
     Python ports of their composite kernels, with the same schemas, let the
     tests run on PyTorch builds without it.

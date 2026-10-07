@@ -63,7 +63,6 @@ from .common import (
     expected_shard,
     make_test_sgd,
     make_transformer_model,
-    register_native_collective_copy_reference_ops,
     single_rank_cpu_mesh,
     single_rank_cuda_mesh,
     transformer_bucket_specs,
@@ -72,7 +71,6 @@ from .common import (
 
 
 device_type = torch.device(get_devtype())
-register_native_collective_copy_reference_ops()
 
 
 class _IncompletePlacement(Placement):
