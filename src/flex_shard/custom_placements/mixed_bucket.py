@@ -82,9 +82,19 @@ class _MixedUnshardState:
     requires_dtype_reinterpretation: bool
     pg: Any
     debug_fqn: str | None
-    # Every group lives whole on one owner, so the params view the gathered rows
-    # (see MixedBucketPlacement._prepare_owner_rows_unshard).
-    owner_rows: bool = False
+
+
+@dataclass(frozen=True)
+class _OwnerRowsUnshardState:
+    """Unshard state of a bucket whose groups each live whole on one owner,
+    whose params view the gathered rows (see
+    MixedBucketPlacement._prepare_owner_rows_unshard)."""
+
+    groups: list[_MixedUnshardGroupState]
+    world_size: int
+    row_numel: int
+    pg: Any
+    debug_fqn: str | None
 
 
 @dataclass(frozen=True)
@@ -541,39 +551,36 @@ class MixedBucketPlacement(Placement):
         )
 
     def run_prepared_unshard(self, prepared: PlacementPreparedUnshard) -> None:
+        if isinstance(prepared.placement_state, _OwnerRowsUnshardState):
+            self._run_owner_rows_unshard(prepared, prepared.placement_state)
+            return
         if not isinstance(prepared.placement_state, _MixedUnshardState):
             raise AssertionError(
                 "Expected _MixedUnshardState, "
                 f"got {type(prepared.placement_state).__name__}"
             )
-        state = prepared.placement_state
-        if not state.owner_rows:
-            gathered = prepared.buffers[1]
-        elif prepared.persistent_buffers is not None:
-            # A refill gathers straight into the persistent rows.
-            gathered = prepared.persistent_buffers[0]
-        else:
-            gathered = prepared.buffers[0].new_empty(state.world_size * state.row_numel)
-            prepared.buffers.insert(1, gathered)
-        with _record_comm_if_eager("FlexShard::mixed_all_gather", state.debug_fqn):
+        with _record_comm_if_eager(
+            "FlexShard::mixed_all_gather",
+            prepared.placement_state.debug_fqn,
+        ):
             dist.all_gather_into_tensor(
-                output_tensor=gathered,
+                output_tensor=prepared.buffers[1],
                 input_tensor=prepared.buffers[0],
-                group=state.pg,
+                group=prepared.placement_state.pg,
             )
 
     def finish_prepared_unshard(
         self,
         prepared: PlacementPreparedUnshard,
     ) -> PlacementUnshardResult:
+        if isinstance(prepared.placement_state, _OwnerRowsUnshardState):
+            return self._finish_owner_rows_unshard(prepared, prepared.placement_state)
         if not isinstance(prepared.placement_state, _MixedUnshardState):
             raise AssertionError(
                 "Expected _MixedUnshardState, "
                 f"got {type(prepared.placement_state).__name__}"
             )
         state = prepared.placement_state
-        if state.owner_rows:
-            return self._finish_owner_rows_unshard(prepared, state)
         # A refill returns no full params (see PlacementUnshardResult).
         refill = prepared.persistent_buffers is not None
         gathered_by_rank = prepared.buffers[1].view(
@@ -731,21 +738,37 @@ class MixedBucketPlacement(Placement):
         return PlacementPreparedUnshard(
             placement=self,
             buffers=[send],
-            placement_state=_MixedUnshardState(
+            placement_state=_OwnerRowsUnshardState(
                 groups=group_states,
                 world_size=world_size,
                 row_numel=row_numel,
-                requires_dtype_reinterpretation=False,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
-                owner_rows=True,
             ),
         )
+
+    def _run_owner_rows_unshard(
+        self,
+        prepared: PlacementPreparedUnshard,
+        state: _OwnerRowsUnshardState,
+    ) -> None:
+        if prepared.persistent_buffers is not None:
+            # A refill gathers straight into the persistent rows.
+            gathered = prepared.persistent_buffers[0]
+        else:
+            gathered = prepared.buffers[0].new_empty(state.world_size * state.row_numel)
+            prepared.buffers.insert(1, gathered)
+        with _record_comm_if_eager("FlexShard::mixed_all_gather", state.debug_fqn):
+            dist.all_gather_into_tensor(
+                output_tensor=gathered,
+                input_tensor=prepared.buffers[0],
+                group=state.pg,
+            )
 
     def _finish_owner_rows_unshard(
         self,
         prepared: PlacementPreparedUnshard,
-        state: _MixedUnshardState,
+        state: _OwnerRowsUnshardState,
     ) -> PlacementUnshardResult:
         if prepared.persistent_buffers is not None:
             # Run refilled the persistent rows.
