@@ -178,10 +178,8 @@ class FlexShardModule:
         forward hooks that gather buckets, e.g. Megatron-LM's EP overlap
         schedule. Buckets whose hooks never run then stay unsharded, with their
         grads, until the end of a backward or ``finalize_backward`` finishes
-        them, following the sync and reshard settings, or ``reshard()``. With
-        grad enabled, it also sets up their gradient buckets
-        (``BucketSpec.gradient_bucket``), as the pre-backward hooks it bypasses
-        would. Call it outside backward and after waiting on any
+        them, following the sync and reshard settings, or ``reshard()``. Call
+        it outside backward and after waiting on any
         ``finalize_backward`` handle. Eager only.
         """
         if _in_backward():
@@ -194,8 +192,6 @@ class FlexShardModule:
                 )
             for bucket in context.buckets:
                 bucket.unshard()
-                if torch.is_grad_enabled():
-                    bucket._alloc_gradient_bucket()
 
     def finish_deferred_backward(self, param: nn.Parameter) -> None:
         """Finish the backward of the bucket that holds ``param`` and defers its
