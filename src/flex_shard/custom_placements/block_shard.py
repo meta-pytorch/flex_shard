@@ -539,9 +539,9 @@ class BucketedBlockShard(Placement):
     straight into that buffer; during graph capture they view the gathered
     bucket directly. Collectives zero-pad ranks with smaller ranges to the
     largest one; with equal ranges (the default) nothing is padded, so the
-    bucket itself is the all-gather output and the reduce-scatter input. With
-    ``BucketSpec(gradient_bucket=True)`` the gradients are views of one bucket
-    in the same layout, which the reduce-scatter reads as is.
+    bucket itself is the all-gather output and the reduce-scatter input. When
+    the gradients are views of one bucket in the same layout (see
+    ``BucketSpec.pre_backward_hook``), the reduce-scatter reads it as is.
     """
 
     @dataclass(frozen=True)
@@ -1024,7 +1024,7 @@ class BucketedBlockShard(Placement):
         dtype: torch.dtype,
     ) -> torch.Tensor | None:
         """The gradient bucket ``tensors`` view at their layout offsets, if
-        they all view one (see ``BucketSpec.gradient_bucket``)."""
+        they all view one (see ``BucketSpec.pre_backward_hook``)."""
         bucket = tensors[0]._base
         if (
             bucket is None
@@ -1063,8 +1063,8 @@ class BucketedBlockShard(Placement):
                 tensors, infos, bucket_layout.global_numel, dtype
             )
             if grad_bucket is not None:
-                # The grads are views of a gradient bucket in this layout
-                # (BucketSpec(gradient_bucket=True)): reduce it as is.
+                # The grads are views of a gradient bucket in this layout:
+                # reduce it as is.
                 return PlacementPreparedReduceGrad(
                     placement=self,
                     buffers=[grad_bucket],

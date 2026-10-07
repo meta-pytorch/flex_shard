@@ -6,7 +6,6 @@
 
 import copy
 import dataclasses
-import warnings
 import weakref
 from collections import Counter
 from unittest import mock
@@ -37,6 +36,7 @@ from ..custom_placements.shard import per_param_placements, Shard
 from ..flex_shard import bucket_runtime
 from ..flex_shard.checkpoint import get_flex_shard_global_layouts
 from .common import (
+    alloc_grads_in_param_layout,
     check_flex_shard_parity,
     expected_shard,
     flex_shard_cuda,
@@ -645,9 +645,10 @@ class TestFlexShardTraining(FSDPTest):
     @skip_if_lt_x_gpu(2)
     def test_copy_free_matches_reference(self):
         # The all-gather sends the local storage as is, refills gather straight
-        # into the persistent buckets, and with gradient_bucket=True the
-        # reduce-scatter reads the grads' bucket as is; training matches an
-        # unsharded reference, with and without
+        # into the persistent buckets, and with grads allocated in the parameter
+        # layout (gradient_bucket, by a pre-backward hook) the reduce-scatter
+        # reads that bucket as is; training matches an unsharded reference, with
+        # and without
         # reshard-after-forward and no-sync. Whole-parameter BucketedOwned
         # buckets (Muon's) do so in their owners' rows of the gathered bucket.
         mesh = init_device_mesh(device_type.type, (self.world_size,))
@@ -696,7 +697,9 @@ class TestFlexShardTraining(FSDPTest):
                             placement_fn=placement_fn,
                             mesh=mesh,
                             reshard_after_forward=reshard_after_forward,
-                            gradient_bucket=gradient_bucket,
+                            pre_backward_hook=(
+                                alloc_grads_in_param_layout if gradient_bucket else None
+                            ),
                         )
                         for idx in (0, 2, 4)
                     ],
@@ -921,9 +924,7 @@ class TestFlexShardTraining(FSDPTest):
         # into two calls, so backward finalization is manual: the buckets keep
         # their grads until finalize_backward after the last microbatch. Two
         # steps, so the second unshard gathers the updated shards, which its
-        # outputs check. The first layer's bucket has a gradient bucket, which
-        # unshard() sets up in place of its bypassed pre-backward hook, so it
-        # reduces without copying.
+        # outputs check.
         mesh = init_device_mesh(device_type.type, (self.world_size,))
         torch.manual_seed(0)
         model = torch.nn.Sequential(
@@ -940,7 +941,6 @@ class TestFlexShardTraining(FSDPTest):
                     ),
                     mesh=mesh,
                     reshard_after_forward=False,
-                    gradient_bucket=True,
                 ),
                 BucketSpec(
                     ["2.*"],
@@ -954,30 +954,28 @@ class TestFlexShardTraining(FSDPTest):
         optimizer = make_test_sgd(model.parameters(), lr=0.1)
         reference_optimizer = make_test_sgd(reference.parameters(), lr=0.1)
         torch.manual_seed(1 + self.rank)
-        with warnings.catch_warnings():
-            warnings.filterwarnings("error", "FlexShard bucket .* gradient_bucket=True")
-            for _ in range(2):
-                optimizer.zero_grad(set_to_none=True)
-                reference_optimizer.zero_grad(set_to_none=True)
-                model.unshard()
-                for microbatch in range(2):
-                    model.set_requires_gradient_sync(microbatch == 1)
-                    x = torch.randn(4, 8, device=device_type)
-                    # The first layer's forward hooks never run.
-                    hidden = torch.relu(
-                        torch.nn.functional.linear(x, model[0].weight, model[0].bias)
-                    )
-                    detached = hidden.detach().requires_grad_()
-                    output = model[2](detached)
-                    reference_output = reference(x)
-                    self.assertEqual(output, reference_output)
-                    output.sum().backward()
-                    hidden.backward(detached.grad)
-                    reference_output.sum().backward()
-                model.finalize_backward()
-                _average_reference_grads(reference)
-                optimizer.step()
-                reference_optimizer.step()
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            reference_optimizer.zero_grad(set_to_none=True)
+            model.unshard()
+            for microbatch in range(2):
+                model.set_requires_gradient_sync(microbatch == 1)
+                x = torch.randn(4, 8, device=device_type)
+                # The first layer's forward hooks never run.
+                hidden = torch.relu(
+                    torch.nn.functional.linear(x, model[0].weight, model[0].bias)
+                )
+                detached = hidden.detach().requires_grad_()
+                output = model[2](detached)
+                reference_output = reference(x)
+                self.assertEqual(output, reference_output)
+                output.sum().backward()
+                hidden.backward(detached.grad)
+                reference_output.sum().backward()
+            model.finalize_backward()
+            _average_reference_grads(reference)
+            optimizer.step()
+            reference_optimizer.step()
 
     @skip_if_lt_x_gpu(2)
     def test_gradient_accumulation(self):
