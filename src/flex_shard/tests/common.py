@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import math
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -251,90 +250,3 @@ def transformer_bucket_specs(
             ),
         ]
     )
-
-
-def _all_gather_copy_out_reference(
-    out: list[torch.Tensor],
-    src: torch.Tensor,
-    split_sizes: list[int],
-    outer_sizes: list[int],
-    num_chunks: int,
-) -> None:
-    """The composite kernel of ``fsdp::_all_gather_copy_out_``."""
-    chunks = src.view(num_chunks, -1)
-    offset = 0
-    for output, split_size, outer_size in zip(
-        out, split_sizes, outer_sizes, strict=True
-    ):
-        inner_size = split_size // outer_size
-        output.view(outer_size, num_chunks, inner_size).copy_(
-            chunks.narrow(1, offset, split_size)
-            .view(num_chunks, outer_size, inner_size)
-            .transpose(0, 1)
-        )
-        offset += split_size
-
-
-def _reduce_scatter_copy_in_reference(
-    out: torch.Tensor,
-    tensors: list[torch.Tensor],
-    num_leading_dims: list[int],
-    num_chunks: int,
-) -> torch.Tensor:
-    """The composite kernel of ``fsdp::_reduce_scatter_copy_in_``."""
-    chunks = out.view(num_chunks, -1)
-    if all(dim == 0 for dim in num_leading_dims):
-        torch._chunk_cat(tensors, 0, num_chunks, out=chunks)
-        return out
-    offset = 0
-    for tensor, dim in zip(tensors, num_leading_dims, strict=True):
-        outer_size = math.prod(tensor.shape[:dim])
-        inner_size = -(-tensor.shape[dim] // num_chunks) * math.prod(
-            tensor.shape[dim + 1 :]
-        )
-        chunk = chunks.narrow(1, offset, outer_size * inner_size)
-        if dim == 0:
-            chunk.copy_(torch._chunk_cat([tensor], 0, num_chunks))
-        else:
-            chunk.view(num_chunks, outer_size, inner_size).copy_(
-                tensor.view(outer_size, num_chunks, inner_size).transpose(0, 1)
-            )
-        offset += outer_size * inner_size
-    return out
-
-
-_NATIVE_COLLECTIVE_COPY_LIBRARIES: list[torch.library.Library] = []
-
-
-def register_native_collective_copy_reference_ops() -> None:
-    """Register ports of FSDP's native collective copies if PyTorch lacks them.
-
-    FlexShard's Shard buckets copy parameters with ``fsdp::_all_gather_copy_out_``
-    and ``fsdp::_reduce_scatter_copy_in_`` from pytorch/pytorch#197204. These
-    Python ports of their composite kernels, with the same schemas, let the
-    tests run on PyTorch builds without it.
-
-    TODO: remove once FlexShard requires a PyTorch with pytorch/pytorch#197204.
-    """
-    if hasattr(torch.ops.fsdp, "_all_gather_copy_out_"):
-        return
-    library = torch.library.Library("fsdp", "FRAGMENT")
-    library.define(
-        "_all_gather_copy_out_(Tensor(a!)[] self, Tensor src, SymInt[] split_sizes, "
-        "SymInt[] outer_sizes, int num_chunks) -> ()"
-    )
-    library.define(
-        "_reduce_scatter_copy_in_(Tensor(a!) self, Tensor[] tensors, "
-        "int[] num_leading_dims, int num_chunks) -> Tensor(a!)"
-    )
-    library.impl(
-        "_all_gather_copy_out_",
-        _all_gather_copy_out_reference,
-        "CompositeExplicitAutograd",
-    )
-    library.impl(
-        "_reduce_scatter_copy_in_",
-        _reduce_scatter_copy_in_reference,
-        "CompositeExplicitAutograd",
-    )
-    _NATIVE_COLLECTIVE_COPY_LIBRARIES.append(library)
