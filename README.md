@@ -48,9 +48,17 @@ each parameter's mesh, and updates local shards with AdamW.
 | --- | --- |
 | Apply `fully_shard` to child modules, then the root | Call `flex_shard` once with explicit buckets |
 | Shard parameters along dimension 0 | Use `per_param_placements`, which assigns each parameter `Shard(0)` |
+| `shard_placement_fn` returning `Shard(i)` | A `placement_fn` returning `Shard(i)`; one bucket may mix dims |
 | `fully_shard(layer.experts, mesh=efsdp_mesh)` | Expert `BucketSpec(..., mesh=efsdp_mesh)` |
 | Construct AdamW after sharding | Construct AdamW after sharding |
 | AdamW manages DTensor parameters | AdamW manages ordinary local parameter shards |
+
+For training that is bitwise identical to FSDP2, give each `fully_shard` group
+one `BucketSpec` naming the same modules, with the same `Shard(i)` placements,
+and set `fsdp2_compatible=True`. The bucket then orders its parameters as
+`fully_shard` does and, like FSDP2, reduce-scatters only the parameters that got
+a gradient, so its all-gather and reduce-scatter buffers match FSDP2's byte for
+byte.
 
 ### Dense parameters on dp, expert parameters on efsdp
 

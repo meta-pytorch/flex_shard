@@ -474,6 +474,10 @@ class BucketRuntime:
     unsharded_params: list[nn.Parameter] | None = field(default=None, repr=False)
     persistent_buffers: list[torch.Tensor] = field(default_factory=list, repr=False)
     persistent_buffer_nbytes: list[int] = field(default_factory=list)
+    # With BucketSpec.fsdp2_compatible: bucket_params indices in FSDP2's
+    # reduce-scatter order, grouped by sharded grad dtype. Set at the first
+    # syncing backward, as FSDP2 caches it at lazy init.
+    fsdp2_reduce_scatter_order: list[int] | None = None
 
     @classmethod
     def from_bucket_storage(
@@ -932,7 +936,9 @@ class BucketRuntime:
 
         Every trainable param joins the reduce-scatter, with zeros if it got no
         grad (e.g. an expert that saw no tokens on this rank), so every rank
-        issues the same collective, once per bucket per backward.
+        issues the same collective, once per bucket per backward. With
+        ``BucketSpec.fsdp2_compatible``, only the params that got a grad join,
+        in FSDP2's order, as FSDP2's reduce-scatter does.
 
         Without gradient sync, the grads stay on the unsharded params for later
         backwards to accumulate into, and the params stay unsharded unless
@@ -952,12 +958,20 @@ class BucketRuntime:
         params: list[nn.Parameter] = []
         infos: list[ParamInfo] = []
         sharded_params: list[nn.Parameter] = []
-        for bucket_param, unsharded_param in zip(
-            self.bucket_params, self.unsharded_params or [], strict=False
-        ):
+        fsdp2_compatible = self.bucket_storage._fsdp2_compatible
+        param_pairs = list(
+            zip(self.bucket_params, self.unsharded_params or [], strict=False)
+        )
+        if fsdp2_compatible and param_pairs:
+            param_pairs = [
+                param_pairs[idx] for idx in self._fsdp2_reduce_scatter_order()
+            ]
+        for bucket_param, unsharded_param in param_pairs:
             # A param frozen since its grad was kept drops it, on every rank.
             grad, unsharded_param.grad = unsharded_param.grad, None
             if not unsharded_param.requires_grad:
+                continue
+            if grad is None and fsdp2_compatible:
                 continue
             grads.append(grad)
             params.append(unsharded_param)
@@ -990,6 +1004,20 @@ class BucketRuntime:
         # placement's copy-in, which casts as it copies, rather than one cast
         # kernel per param here.
         self.reduce_grads(grads, infos, sharded_params)
+
+    def _fsdp2_reduce_scatter_order(self) -> list[int]:
+        """FSDP2's reduce-scatter order: the params grouped by sharded grad
+        dtype, in first-seen dtype order, each group in parameter order."""
+        if self.fsdp2_reduce_scatter_order is None:
+            indices_by_dtype: dict[torch.dtype | None, list[int]] = {}
+            for idx, bucket_param in enumerate(self.bucket_params):
+                indices_by_dtype.setdefault(
+                    bucket_param.sharded_param.grad_dtype, []
+                ).append(idx)
+            self.fsdp2_reduce_scatter_order = [
+                idx for indices in indices_by_dtype.values() for idx in indices
+            ]
+        return self.fsdp2_reduce_scatter_order
 
     # ------------------------------------------------------------------
     # Forward hooks

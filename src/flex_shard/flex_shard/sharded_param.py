@@ -33,6 +33,11 @@ def get_global_shape(tensor: torch.Tensor) -> torch.Size | None:
     return getattr(tensor, _GLOBAL_SHAPE_ATTR, None)
 
 
+def get_mesh(tensor: torch.Tensor) -> DeviceMesh | None:
+    """Get the mesh of the bucket holding a tensor, or None if not annotated."""
+    return getattr(tensor, _MESH_ATTR, None)
+
+
 def is_flex_shard_param(tensor: torch.Tensor) -> bool:
     """Return whether a tensor represents a FlexShard-managed parameter."""
     return hasattr(tensor, _PLACEMENTS_ATTR)
@@ -54,6 +59,7 @@ def set_sharding_info(
 
 __all__ = [
     "get_global_shape",
+    "get_mesh",
     "get_placements",
     "is_flex_shard_param",
     "set_sharding_info",
