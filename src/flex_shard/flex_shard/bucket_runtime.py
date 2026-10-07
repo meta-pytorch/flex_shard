@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from types import ModuleType
@@ -785,7 +784,6 @@ class BucketRuntime:
         self.context.queue_post_backward_callback()
         self.unshard()
         self._set_unsharded_grad_dtypes(defer_upcast=True)
-        self._alloc_gradient_bucket()
         if self.bucket_storage._pre_backward_hook is not None:
             self.bucket_storage._pre_backward_hook(self._named_unsharded_params())
         self.context.prefetch(self.context.next_backward_bucket(self))
@@ -823,82 +821,6 @@ class BucketRuntime:
             if grad is not None and grad.dtype != dtype:
                 param.grad = grad.to(dtype)
             param.grad_dtype = dtype
-
-    def _alloc_gradient_bucket(self) -> None:
-        """For ``BucketSpec(gradient_bucket=True)``: make the unsharded grads
-        views of zeroed buffers that mirror the persistent buffers the params
-        view, in the reduce dtype, if none exist yet (later backwards without
-        sync accumulate into them). A placement whose gradient reduction layout
-        is its parameter layout reduces such a buffer without copying."""
-        if not self.bucket_storage._gradient_bucket or self.unsharded_params is None:
-            return
-        params = self.unsharded_params
-        if not any(param.requires_grad for param in params) or any(
-            param.grad is not None for param in params
-        ):
-            return
-        buffers = {_storage_ptr(buffer): buffer for buffer in self.persistent_buffers}
-        grad_buffers: dict[int | None, torch.Tensor] = {}
-        grads: list[torch.Tensor | None] = []
-        for param in params:
-            if not param.requires_grad:
-                grads.append(None)
-                continue
-            buffer = buffers.get(_storage_ptr(param))
-            if (
-                buffer is None
-                or buffer.dtype != param.dtype
-                or not param.is_contiguous()
-            ):
-                self._warn_gradient_bucket_fallback(
-                    "its params do not view its persistent buffers contiguously"
-                )
-                return
-            grad_buffer = grad_buffers.get(_storage_ptr(buffer))
-            if grad_buffer is None:
-                grad_buffer = torch.zeros(
-                    buffer.numel(),
-                    dtype=self.infos[0].grad_reduce_dtype,
-                    device=buffer.device,
-                )
-                grad_buffers[_storage_ptr(buffer)] = grad_buffer
-            offset = param.storage_offset() - buffer.storage_offset()
-            grads.append(grad_buffer[offset : offset + param.numel()].view(param.shape))
-        for param, grad in zip(params, grads, strict=True):
-            if grad is not None:
-                param.grad = grad
-
-    def _check_gradient_bucket(
-        self, grads: list[torch.Tensor | None], infos: list[ParamInfo]
-    ) -> None:
-        """Warn if a gradient bucket's grads will not be reduced as is:
-        not all views of one bucket, or not in this backward's reduce dtype."""
-        if not self.bucket_storage._gradient_bucket:
-            return
-        bucket = grads[0]._base if grads[0] is not None else None
-        if bucket is None or any(
-            grad is None or grad._base is not bucket for grad in grads
-        ):
-            reason = (
-                "its grads are not views of one gradient bucket (e.g. allocated "
-                "or replaced before its pre-backward hook)"
-            )
-        elif bucket.dtype != infos[0].grad_reduce_dtype:
-            reason = (
-                f"its grads are {bucket.dtype}, not the reduce dtype "
-                f"{infos[0].grad_reduce_dtype}"
-            )
-        else:
-            return
-        self._warn_gradient_bucket_fallback(reason)
-
-    def _warn_gradient_bucket_fallback(self, reason: str) -> None:
-        # The default warning filter shows each bucket's message once.
-        warnings.warn(
-            f"FlexShard bucket {self.debug_fqn} has gradient_bucket=True, but "
-            f"{reason}, so its reduce-scatter copies the grads in.",
-            stacklevel=2,
-        )
 
     def _named_unsharded_params(self) -> list[tuple[str, nn.Parameter]]:
         return [
@@ -985,7 +907,6 @@ class BucketRuntime:
         # Promote over the real grads before the zeros exist, so zeros never
         # pick the reduce dtype.
         infos = _promote_reduce_dtype_over_grads(grads, infos)
-        self._check_gradient_bucket(grads, infos)
         # Zeros fill missing grads after resharding, so they never coexist
         # with the unsharded params, in the dtype autograd would produce, as
         # FSDP2's unsharded_zero_grad_data does.
@@ -1034,12 +955,14 @@ class BucketRuntime:
             return
         if _in_backward():
             # Activation-checkpoint recompute: the pre-backward hook usually
-            # re-gathered already; otherwise this consumes its prefetch. The
-            # original forward ran without grad, so no pre-backward hook set
-            # up the gradient bucket.
+            # re-gathered already; otherwise this consumes its prefetch. A
+            # forward without grad (reentrant checkpointing) left no
+            # pre-backward hook to run the bucket's pre_backward_hook, so run
+            # it here, before the recomputed backward.
             self.call_has_trigger.append(False)
             self.unshard()
-            self._alloc_gradient_bucket()
+            if self.bucket_storage._pre_backward_hook is not None:
+                self.bucket_storage._pre_backward_hook(self._named_unsharded_params())
             return
         self.context.check_no_raised_backward()
         if self.context.pending_finalization is not None:
@@ -1154,11 +1077,6 @@ class BucketRuntime:
             raise NotImplementedError(
                 "FlexShard BucketSpec defer_post_backward is eager-only; "
                 "torch.compile reduce-scatters in the traced backward."
-            )
-        if self.bucket_storage._gradient_bucket:
-            raise NotImplementedError(
-                "FlexShard BucketSpec gradient_bucket is eager-only; the traced "
-                "backward owns its gradient buffers."
             )
         if len(self.bucket_storage._hook_module_fqns or ()) > 1:
             raise NotImplementedError(

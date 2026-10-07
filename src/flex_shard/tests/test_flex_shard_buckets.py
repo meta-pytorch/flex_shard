@@ -493,31 +493,26 @@ class TestBucketPlacementValidation(TestCase):
             ],
         )
 
-    def test_fsdp2_compatible_requires_shard_without_gradient_bucket(self):
+    def test_fsdp2_compatible_requires_shard(self):
         def block_placement(named_params, mesh):
             del mesh
             return {fqn: (BlockShard(blocks_per_rank=(1,)),) for fqn, _ in named_params}
 
-        for placement_fn, gradient_bucket, message in (
-            (block_placement, False, "requires Shard placements"),
-            (per_param_placements, True, "gradient_bucket"),
-        ):
-            with single_rank_cuda_mesh() as mesh:
-                model = nn.Linear(4, 4)
-                with self.assertRaisesRegex(ValueError, message):
-                    flex_shard(
-                        model,
-                        buckets=[
-                            BucketSpec(
-                                ["*"],
-                                placement_fn=placement_fn,
-                                mesh=mesh,
-                                gradient_bucket=gradient_bucket,
-                                fsdp2_compatible=True,
-                            )
-                        ],
-                    )
-                self.assertFalse(hasattr(model, "_sharded_bucket_storages"))
+        with single_rank_cuda_mesh() as mesh:
+            model = nn.Linear(4, 4)
+            with self.assertRaisesRegex(ValueError, "requires Shard placements"):
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            ["*"],
+                            placement_fn=block_placement,
+                            mesh=mesh,
+                            fsdp2_compatible=True,
+                        )
+                    ],
+                )
+            self.assertFalse(hasattr(model, "_sharded_bucket_storages"))
 
 
 class TestBucketReduceDtype(TestCase):

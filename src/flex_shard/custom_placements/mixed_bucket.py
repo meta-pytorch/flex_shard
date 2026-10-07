@@ -814,8 +814,8 @@ class MixedBucketPlacement(Placement):
         debug_fqn: str | None,
     ) -> PlacementPreparedReduceGrad | None:
         """Reduce-scatter the grads' gradient bucket as is, if they view one
-        that mirrors the owner rows the params view
-        (``BucketSpec.gradient_bucket``; see _prepare_owner_rows_unshard):
+        that mirrors the owner rows the params view (see
+        ``BucketSpec.pre_backward_hook`` and _prepare_owner_rows_unshard):
         each grad already sits in its owner's row. None otherwise."""
         world_size = mesh.size()
         bucket = groups[0].tensors[0]._base

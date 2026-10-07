@@ -195,12 +195,18 @@ class BucketSpec:
             defaults to True. Under ``torch.compile`` the traced graph owns
             buffer lifetimes instead.
         pre_backward_hook: Optional callable run with this bucket's
-            ``(fqn, unsharded param)`` pairs in its pre-backward hook, after
-            they are unsharded and before its backward runs; it may run more
-            than once per backward. For example, kernels that add weight grads
+            ``(fqn, unsharded param)`` pairs once they are unsharded and before
+            its backward runs: in its pre-backward hook, and when activation
+            checkpointing unshards it for the recomputed forward; it may run
+            more than once per backward. For example, kernels that add weight grads
             into a buffer in place and give autograd none (TransformerEngine's
             ``fuse_wgrad_accumulation`` reads ``param.main_grad``) need the
-            grads allocated and exposed there first. Eager only.
+            grads allocated and exposed there first. Grads allocated as views
+            of one zeroed buffer per storage the unsharded params view, at
+            their offsets, in the reduce dtype, let a placement whose gradient
+            reduction layout is its parameter layout (``BucketedBlockShard``
+            with equal rank ranges, whole-parameter ``BucketedOwned``)
+            reduce-scatter that buffer without copying the grads in. Eager only.
         post_reduce_hook: Optional callable run with the same pairs once a
             syncing backward has taken their grads for the reduce-scatter, e.g.
             to release references to those grads. Eager only.
@@ -212,18 +218,6 @@ class BucketSpec:
             ``delay_wgrad_compute``, whose ``backward_dw()`` runs later. A
             syncing backward that runs the module's backward but ends with the
             bucket unfinished raises. Eager only.
-        gradient_bucket: Whether this bucket's unsharded grads are views of
-            zeroed buffers that mirror the persistent buffers the unsharded
-            params view, in the reduce dtype, set in its pre-backward hook
-            (before ``pre_backward_hook``), or by ``FlexShardModule.unshard()``,
-            when they do not exist yet. A
-            placement whose gradient reduction layout is its parameter layout
-            (``BucketedBlockShard`` with equal rank ranges) then reduce-scatters
-            that buffer without copying the grads in. They take the bucket's
-            reduce dtype from the start of its backward, instead of the compute
-            dtype until the copy-in. Grads that end up elsewhere (e.g. allocated
-            before the pre-backward hook, or in more than one buffer) fall back
-            to the copy, with a warning. Eager only.
         fsdp2_compatible: Whether this bucket's collectives match those of the
             FSDP2 ``fully_shard`` group it replaces, byte for byte, so training
             is bitwise identical to FSDP2. The parameters take FSDP2's order: a
@@ -232,8 +226,8 @@ class BucketSpec:
             each module's own parameters. The reduce-scatter groups them by
             sharded grad dtype, as FSDP2 does, and includes only the parameters
             that got a grad, as FSDP2 does by default: every rank must then get
-            grads for the same parameters. Requires ``Shard`` placements and
-            ``gradient_bucket=False``. Eager only.
+            grads for the same parameters. Requires ``Shard`` placements. Eager
+            only.
     """
 
     patterns: list[str]
@@ -247,7 +241,6 @@ class BucketSpec:
     pre_backward_hook: BucketHook | None = None
     post_reduce_hook: BucketHook | None = None
     defer_post_backward: bool = False
-    gradient_bucket: bool = False
     fsdp2_compatible: bool = False
 
 
@@ -359,7 +352,6 @@ class ShardedBucketStorage:
         post_reduce_hook: BucketHook | None = None,
         gradient_divide_factor: float | None = None,
         defer_post_backward: bool = False,
-        gradient_bucket: bool = False,
         hook_module_fqns: list[str] | None = None,
         fsdp2_compatible: bool = False,
     ) -> None:
@@ -374,7 +366,6 @@ class ShardedBucketStorage:
         self._pre_backward_hook = pre_backward_hook
         self._post_reduce_hook = post_reduce_hook
         self._defer_post_backward = defer_post_backward
-        self._gradient_bucket = gradient_bucket
         self._fsdp2_compatible = fsdp2_compatible
         # The modules a bucket of module patterns hooks (BucketSpec.patterns).
         self._hook_module_fqns = hook_module_fqns
@@ -430,7 +421,6 @@ class ShardedBucketStorage:
             post_reduce_hook=bucket_spec.post_reduce_hook,
             gradient_divide_factor=bucket_spec.gradient_divide_factor,
             defer_post_backward=bucket_spec.defer_post_backward,
-            gradient_bucket=bucket_spec.gradient_bucket,
             hook_module_fqns=_hook_module_fqns(module, bucket_spec.patterns),
             fsdp2_compatible=bucket_spec.fsdp2_compatible,
         )
