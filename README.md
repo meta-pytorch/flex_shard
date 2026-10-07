@@ -19,10 +19,12 @@ the same model's bucket collectives in a full model trace, following
 | CUDA and NCCL | A CUDA-enabled PyTorch build with NCCL and a compatible NVIDIA driver |
 | Triton | `~=3.8.0` on Linux |
 
-`Shard` placements call FSDP's native collective copies,
-`fsdp::_all_gather_copy_out_` and `fsdp::_reduce_scatter_copy_in_`, from
-[pytorch/pytorch#197204](https://github.com/pytorch/pytorch/pull/197204). Until a
-PyTorch release includes them, they need a PyTorch built with that pull request.
+`Shard` placements call FSDP's native collective copies:
+`fsdp::_all_gather_copy_out_` from
+[pytorch/pytorch#197204](https://github.com/pytorch/pytorch/pull/197204), and
+`fsdp::chunk_cat_mixed_dtype` with `num_leading_dims` from
+[pytorch/pytorch#200179](https://github.com/pytorch/pytorch/pull/200179). Until a
+PyTorch release includes them, they need a PyTorch built with those pull requests.
 
 Install a CUDA-enabled PyTorch build satisfying this range, then install
 FlexShard from the repository:

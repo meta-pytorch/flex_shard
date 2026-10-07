@@ -48,10 +48,10 @@ class Shard(Placement):
     ``Shard(i)`` parameter with ``i > 0`` must split evenly; its chunks are
     reordered to dim 0 around the collectives, and only ``Shard(0)`` pads uneven
     chunks. A bucket copies its parameters directly between their layouts and
-    the collective buffers with FSDP's native collective copies, which take
-    each tensor's leading size, the product of the dims before its shard dim
-    (1 for ``Shard(0)``), as FSDP2's ``with_native_copy`` functions do. These
-    need a PyTorch with pytorch/pytorch#197204.
+    the collective buffers with FSDP's native collective copies, as FSDP2's
+    ``with_native_copy`` functions do: ``fsdp::_all_gather_copy_out_`` from
+    pytorch/pytorch#197204 and ``fsdp::chunk_cat_mixed_dtype`` with
+    ``num_leading_dims`` from pytorch/pytorch#200179.
     """
 
     @dataclass(frozen=True)
@@ -376,17 +376,15 @@ class Shard(Placement):
     ) -> tuple[torch.Tensor, Shard._ReduceGradLayout]:
         dtype = infos[0].grad_reduce_dtype
         device = tensors[0].device
-        # The native copy-in takes one grad dtype, like FSDP2's.
-        native_copy_in = len({tensor.dtype for tensor in tensors}) == 1
-        # Per grad: the dims before its shard dim, which the native copy-in
-        # chunks along directly, or 0 to chunk along dim 0.
+        # Per grad: the number of dims before its shard dim, which the copy-in
+        # keeps in each chunk, or 0 to chunk along dim 0.
         num_leading_dims = [0] * len(tensors)
         if world_size > 1:
             tensors = list(tensors)
             for idx, (tensor, info) in enumerate(zip(tensors, infos, strict=True)):
                 if (shard_dim := info.placement.dim) == 0:
                     continue
-                if native_copy_in and tensor.is_contiguous():
+                if tensor.is_contiguous():
                     num_leading_dims[idx] = shard_dim
                 else:
                     # As FSDP2 does, reorder the grad along dim 0 so that each
@@ -406,17 +404,16 @@ class Shard(Placement):
         input_numel = sum(s.numel() for s in padded_sizes)
         send_buf = torch.empty(input_numel, dtype=dtype, device=device)
         send_buf_2d = send_buf.view(world_size, -1)
-        if native_copy_in:
-            torch.ops.fsdp._reduce_scatter_copy_in_(
-                send_buf_2d, tensors, num_leading_dims, world_size
-            )
-        else:
-            # Grads may differ in dtype (per-parameter grad_dtype). The copy-in
-            # casts each to the reduce dtype as it copies, one fused kernel for
-            # CUDA bf16 + fp32 (fsdp::chunk_cat_mixed_dtype, pytorch/pytorch#194434).
-            torch.ops.fsdp.chunk_cat_mixed_dtype(
-                tensors, dim=0, num_chunks=world_size, out=send_buf_2d
-            )
+        # Grads may differ in dtype (per-parameter grad_dtype). The copy-in
+        # casts each to the reduce dtype as it copies, in fused kernels for CUDA
+        # bf16 or fp16 into fp32.
+        torch.ops.fsdp.chunk_cat_mixed_dtype(
+            tensors,
+            dim=0,
+            num_chunks=world_size,
+            out=send_buf_2d,
+            num_leading_dims=num_leading_dims,
+        )
         return send_buf, Shard._ReduceGradLayout(padded_sizes)
 
     def _unpack_reduce_scatter_grad(

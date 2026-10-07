@@ -594,6 +594,39 @@ class TestBucketReduceDtype(TestCase):
                         [info.grad_reduce_dtype for info in infos], [bf16, bf16]
                     )
 
+    def test_copy_in_casts_mixed_grad_dtypes_across_shard_dims(self):
+        bf16, world_size = torch.bfloat16, 4
+        # Shard(0) pads 5 rows to 8. The transposed Shard(1) grad is not
+        # contiguous, so the copy-in takes it reordered to dim 0.
+        grads_and_dims = {
+            "rows": (torch.randn(5, 3, dtype=bf16, device=device_type), 0),
+            "cols": (torch.randn(2, 8, 3, dtype=bf16, device=device_type), 1),
+            "transposed": (torch.randn(8, 2, 3, device=device_type).transpose(0, 1), 1),
+            "depth": (torch.randn(3, 2, 4, device=device_type), 2),
+        }
+        params = {
+            fqn: nn.Parameter(torch.empty(grad.shape))
+            for fqn, (grad, _) in grads_and_dims.items()
+        }
+        with single_rank_cpu_mesh() as mesh:
+            infos, _ = ShardedBucketStorage.create_param_infos(
+                list(params.items()),
+                mesh,
+                {fqn: (Shard(dim),) for fqn, (_, dim) in grads_and_dims.items()},
+            )
+        grads = [grad for grad, _ in grads_and_dims.values()]
+        send_buf, _ = Shard(0)._pack_reduce_scatter_grad(
+            grads, list(infos.values()), world_size
+        )
+
+        # FSDP2's copy-in: Shard(i) grads reordered to dim 0, then chunked in fp32
+        reordered = [
+            torch.cat(torch.chunk(grad, world_size, dim=dim)) if dim else grad
+            for grad, dim in grads_and_dims.values()
+        ]
+        expected = torch._chunk_cat([g.float() for g in reordered], 0, world_size)
+        self.assertEqual(send_buf.view(world_size, -1), expected, atol=0, rtol=0)
+
 
 # ---------------------------------------------------------------------------
 # Bucket storage layout tests (single-process, no NCCL)
