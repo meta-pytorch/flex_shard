@@ -4,10 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""``fsdp2_compatible`` buckets against FSDP2's ``fully_shard``, bit for bit."""
+"""FlexShard ``Shard`` buckets against FSDP2's ``fully_shard``, bit for bit."""
 
 import contextlib
 import copy
+import functools
 import itertools
 from collections import defaultdict
 from collections.abc import Callable, Iterator
@@ -34,11 +35,36 @@ from ..custom_placements.shard import Shard
 device_type = torch.device(get_devtype())
 
 _VOCAB = 11
-# Uneven over four ranks: every Shard(0) parameter below pads its last chunks.
+# Odd, so every Shard(0) parameter below pads its last chunks.
 _DIM = 13
-# Even over four ranks, as FSDP2 requires for Shard(1).
+# Divisible by the world size, as FSDP2 requires for Shard(1).
 _HIDDEN = 8
 _BATCH = 6
+# Param/reduce dtypes, gradient divide factors (None averages over the mesh;
+# torchtitan sets 1.0 and scales the loss), and (microbatches, no_sync).
+_DTYPE_CONFIGS = [
+    (None, None),
+    (torch.bfloat16, torch.float32),
+    (torch.bfloat16, torch.bfloat16),
+    (torch.bfloat16, None),
+]
+_DIVIDE_FACTORS = [None, 1.0]
+_ACCUMULATIONS = [(1, False), (2, False), (2, True)]
+
+
+def _configs() -> Iterator[tuple[tuple, str]]:
+    """Yield every combination of the above, with a description."""
+    for (param_dtype, reduce_dtype), divide_factor, (
+        microbatches,
+        no_sync,
+    ) in itertools.product(_DTYPE_CONFIGS, _DIVIDE_FACTORS, _ACCUMULATIONS):
+        config = (param_dtype, reduce_dtype, divide_factor, microbatches, no_sync)
+        context = (
+            f"param_dtype={param_dtype} reduce_dtype={reduce_dtype} "
+            f"divide_factor={divide_factor} microbatches={microbatches} "
+            f"no_sync={no_sync}"
+        )
+        yield config, context
 
 
 class _StackedLinear(nn.Module):
@@ -63,7 +89,7 @@ class _Block(nn.Module):
         self.stacked = _StackedLinear()
         self.proj = nn.Linear(_HIDDEN, _DIM)
         # Never gets a grad, so FSDP2 leaves it out of the reduce-scatter. Its
-        # three rows leave the last rank an empty shard.
+        # three rows leave the last of four ranks an empty shard.
         self.unused = nn.Linear(_DIM, 3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -129,6 +155,7 @@ def _apply_flex_shard(
     param_dtype: torch.dtype | None,
     reduce_dtype: torch.dtype | None,
     divide_factor: float | None,
+    fsdp2_compatible: bool = False,
 ) -> None:
     def placement_fn(named_params, mesh):
         del mesh
@@ -144,7 +171,7 @@ def _apply_flex_shard(
             ),
             gradient_divide_factor=divide_factor,
             reshard_after_forward=reshard_after_forward,
-            fsdp2_compatible=True,
+            fsdp2_compatible=fsdp2_compatible,
         )
 
     flex_shard(
@@ -235,7 +262,83 @@ def _train(
     return history
 
 
-class TestFlexShardFSDP2Parity(FSDPTest):
+class _FullyShardParity(FSDPTest):
+    def _assert_bitwise_equal(
+        self, expected: torch.Tensor | None, actual: torch.Tensor | None, context: str
+    ) -> None:
+        if expected is None or actual is None:
+            self.assertIs(expected, actual, msg=context)
+            return
+        self.assertEqual(expected.dtype, actual.dtype, msg=context)
+        self.assertEqual(expected.shape, actual.shape, msg=context)
+        self.assertTrue(torch.equal(expected, actual), msg=context)
+
+    def _assert_same_history(
+        self,
+        expected_history: list[dict[str, object]],
+        actual_history: list[dict[str, object]],
+        context: str,
+    ) -> None:
+        for step, (expected, actual) in enumerate(
+            zip(expected_history, actual_history, strict=True)
+        ):
+            for expected_loss, actual_loss in zip(
+                expected["losses"], actual["losses"], strict=True
+            ):
+                self._assert_bitwise_equal(
+                    expected_loss, actual_loss, f"{context} step {step} loss"
+                )
+            for kind in ("grads", "params"):
+                self.assertEqual(list(expected[kind]), list(actual[kind]))
+                for fqn in expected[kind]:
+                    self._assert_bitwise_equal(
+                        expected[kind][fqn],
+                        actual[kind][fqn],
+                        f"{context} step {step} {kind} {fqn}",
+                    )
+
+    def _run_backend(
+        self,
+        apply: Callable[..., None],
+        reference: _Decoder,
+        mesh,
+        config: tuple,
+    ) -> list[dict[str, object]]:
+        param_dtype, reduce_dtype, divide_factor, microbatches, no_sync = config
+        model = copy.deepcopy(reference).to(device_type)
+        apply(model, mesh, param_dtype, reduce_dtype, divide_factor)
+        return _train(
+            model,
+            rank=self.rank,
+            steps=3,
+            microbatches=microbatches,
+            no_sync=no_sync,
+        )
+
+
+class TestFlexShardMatchesFullyShard(_FullyShardParity):
+    @property
+    def world_size(self) -> int:
+        # A sum of two values does not depend on their order, so buckets match
+        # fully_shard bit for bit at two ranks whatever their parameter order.
+        return 2
+
+    @skip_if_lt_x_gpu(2)
+    def test_matches_fully_shard(self):
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        torch.manual_seed(0)
+        reference = _Decoder()
+        # Without fsdp2_compatible, buckets reduce zeros for params without a
+        # grad, where FSDP2 leaves them out; frozen, both skip them.
+        for layer in reference.layers:
+            layer.unused.requires_grad_(False)
+        for config, context in _configs():
+            fsdp2_history = self._run_backend(_apply_fsdp2, reference, mesh, config)
+            flex_history = self._run_backend(_apply_flex_shard, reference, mesh, config)
+            self._assert_same_history(fsdp2_history, flex_history, context)
+
+
+class TestFlexShardFSDP2Parity(_FullyShardParity):
     @property
     def world_size(self) -> int:
         # Sums of four values make the reduction order observable.
@@ -272,79 +375,21 @@ class TestFlexShardFSDP2Parity(FSDPTest):
                     msg=f"{context}: {numel}-element inputs differ",
                 )
 
-    def _assert_bitwise_equal(
-        self, expected: torch.Tensor | None, actual: torch.Tensor | None, context: str
-    ) -> None:
-        if expected is None or actual is None:
-            self.assertIs(expected, actual, msg=context)
-            return
-        self.assertEqual(expected.dtype, actual.dtype, msg=context)
-        self.assertEqual(expected.shape, actual.shape, msg=context)
-        self.assertTrue(torch.equal(expected, actual), msg=context)
-
-    def _run_backend(
-        self,
-        apply: Callable[..., None],
-        reference: _Decoder,
-        mesh,
-        config: tuple,
-        *,
-        microbatches: int,
-        no_sync: bool,
-    ):
-        param_dtype, reduce_dtype, divide_factor = config
-        model = copy.deepcopy(reference).to(device_type)
-        apply(model, mesh, param_dtype, reduce_dtype, divide_factor)
-        with _record_collective_inputs() as recorded:
-            history = _train(
-                model,
-                rank=self.rank,
-                steps=3,
-                microbatches=microbatches,
-                no_sync=no_sync,
-            )
-        return history, recorded
-
     @skip_if_lt_x_gpu(4)
     def test_matches_fully_shard(self):
         mesh = init_device_mesh(device_type.type, (self.world_size,))
         torch.manual_seed(0)
         reference = _Decoder()
-        dtype_configs = [
-            (None, None),
-            (torch.bfloat16, torch.float32),
-            (torch.bfloat16, torch.bfloat16),
-            (torch.bfloat16, None),
-        ]
-        # None averages over the mesh; torchtitan sets 1.0 and scales the loss.
-        divide_factors = [None, 1.0]
-        accumulations = [(1, False), (2, False), (2, True)]
-        for (param_dtype, reduce_dtype), divide_factor, (
-            microbatches,
-            no_sync,
-        ) in itertools.product(dtype_configs, divide_factors, accumulations):
-            config = (param_dtype, reduce_dtype, divide_factor)
-            context = (
-                f"param_dtype={param_dtype} reduce_dtype={reduce_dtype} "
-                f"divide_factor={divide_factor} microbatches={microbatches} "
-                f"no_sync={no_sync}"
-            )
-            fsdp2_history, fsdp2_recorded = self._run_backend(
-                _apply_fsdp2,
-                reference,
-                mesh,
-                config,
-                microbatches=microbatches,
-                no_sync=no_sync,
-            )
-            flex_history, flex_recorded = self._run_backend(
-                _apply_flex_shard,
-                reference,
-                mesh,
-                config,
-                microbatches=microbatches,
-                no_sync=no_sync,
-            )
+        apply_fsdp2_compatible = functools.partial(
+            _apply_flex_shard, fsdp2_compatible=True
+        )
+        for config, context in _configs():
+            with _record_collective_inputs() as fsdp2_recorded:
+                fsdp2_history = self._run_backend(_apply_fsdp2, reference, mesh, config)
+            with _record_collective_inputs() as flex_recorded:
+                flex_history = self._run_backend(
+                    apply_fsdp2_compatible, reference, mesh, config
+                )
             for collective in ("all_gather", "reduce_scatter"):
                 self.assertTrue(fsdp2_recorded[collective], msg=context)
                 self._assert_same_inputs(
@@ -352,23 +397,7 @@ class TestFlexShardFSDP2Parity(FSDPTest):
                     flex_recorded[collective],
                     f"{context} {collective}",
                 )
-            for step, (expected, actual) in enumerate(
-                zip(fsdp2_history, flex_history, strict=True)
-            ):
-                for expected_loss, actual_loss in zip(
-                    expected["losses"], actual["losses"], strict=True
-                ):
-                    self._assert_bitwise_equal(
-                        expected_loss, actual_loss, f"{context} step {step} loss"
-                    )
-                for kind in ("grads", "params"):
-                    self.assertEqual(list(expected[kind]), list(actual[kind]))
-                    for fqn in expected[kind]:
-                        self._assert_bitwise_equal(
-                            expected[kind][fqn],
-                            actual[kind][fqn],
-                            f"{context} step {step} {kind} {fqn}",
-                        )
+            self._assert_same_history(fsdp2_history, flex_history, context)
 
 
 if __name__ == "__main__":
