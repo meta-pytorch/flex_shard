@@ -57,6 +57,7 @@ each parameter's mesh, and updates local shards with AdamW.
 | Shard parameters along dimension 0 | Use `per_param_placements`, which assigns each parameter `Shard(0)` |
 | `shard_placement_fn` returning `Shard(i)` | A `placement_fn` returning `Shard(i)`; one bucket may mix dims |
 | `fully_shard(layer.experts, mesh=efsdp_mesh)` | Expert `BucketSpec(..., mesh=efsdp_mesh)` |
+| `set_modules_to_forward_prefetch` / `set_modules_to_backward_prefetch` | `set_buckets_to_forward_prefetch` / `set_buckets_to_backward_prefetch` on entries of `sharded_bucket_storages` |
 | Construct AdamW after sharding | Construct AdamW after sharding |
 | AdamW manages DTensor parameters | AdamW manages ordinary local parameter shards |
 
