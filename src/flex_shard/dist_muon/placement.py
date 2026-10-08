@@ -15,14 +15,12 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Shard as DTensorShard
 
 from ..custom_placements.block_shard import BucketedBlockShard
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..custom_placements.owned import BucketedOwnedSegmentSpec
 from ..custom_placements.shard import Shard
-from ..flex_shard import Placement, PlacementFn
+from ..flex_shard import get_global_layout, GlobalLayout, Placement, PlacementFn
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,12 +107,9 @@ def get_dim0_block_partitions(
     named_params: Sequence[tuple[str, nn.Parameter]],
     *,
     num_partitions: int,
-    partition_axis_name: str,
+    partition_index: int,
 ) -> tuple[tuple[int, int], ...]:
-    local_shapes = [
-        param.to_local().shape if isinstance(param, DTensor) else param.shape
-        for _, param in named_params
-    ]
+    local_shapes = [param.shape for _, param in named_params]
     if any(len(shape) != 3 for shape in local_shapes):
         raise ValueError("Dimension-0 block parameters must be 3D.")
 
@@ -135,67 +130,35 @@ def get_dim0_block_partitions(
             raise ValueError("Dimension-0 block parameters must contain a block.")
         return ((num_local_blocks, block_numel),)
 
-    first_param = named_params[0][1]
-    if not isinstance(first_param, DTensor):
-        raise ValueError("Partitioned block parameters must be DTensors.")
-    global_num_blocks = int(first_param.shape[0])
     _validate_partitioned_params(
         named_params,
-        global_num_blocks=global_num_blocks,
-        matrix_numel=matrix_numel,
         num_partitions=num_partitions,
-        partition_axis_name=partition_axis_name,
+        partition_index=partition_index,
     )
-    return tuple(
-        (
-            int(
-                DTensorShard.local_shard_size_and_offset(
-                    global_num_blocks,
-                    num_partitions,
-                    partition,
-                )[0]
-            ),
-            block_numel,
-        )
-        for partition in range(num_partitions)
-    )
+    return ((num_local_blocks, block_numel),) * num_partitions
 
 
 def _validate_partitioned_params(
     named_params: Sequence[tuple[str, nn.Parameter]],
     *,
-    global_num_blocks: int,
-    matrix_numel: int,
     num_partitions: int,
-    partition_axis_name: str,
+    partition_index: int,
 ) -> None:
+    # Rank groups are built from the partition axis, so this rank's experts must
+    # be partition ``partition_index``'s even dim-0 chunk.
     for fqn, param in named_params:
-        if not isinstance(param, DTensor):
-            raise ValueError(f"Partitioned block parameter {fqn!r} must be a DTensor.")
-        mesh_axis_names = param.device_mesh.mesh_dim_names
-        if mesh_axis_names is None or partition_axis_name not in mesh_axis_names:
+        local_dim0, *trailing = param.shape
+        expected = GlobalLayout(
+            global_shape=(local_dim0 * num_partitions, *trailing),
+            global_offsets=((partition_index * local_dim0, *(0,) * len(trailing)),),
+            local_offsets=((0,) * param.ndim,),
+            local_sizes=(tuple(param.shape),),
+        )
+        if get_global_layout(param) != expected:
             raise ValueError(
-                f"Partitioned block parameter {fqn!r} must use mesh axis "
-                f"{partition_axis_name!r}."
-            )
-        partition_axis = mesh_axis_names.index(partition_axis_name)
-        placement = param.placements[partition_axis]
-        if (
-            not isinstance(placement, DTensorShard)
-            or placement.dim != 0
-            or param.device_mesh.size(partition_axis) != num_partitions
-        ):
-            raise ValueError(
-                f"Partitioned block parameter {fqn!r} must use Shard(0) on "
-                f"mesh axis {partition_axis_name!r} of size {num_partitions}."
-            )
-        if (
-            int(param.shape[0]) != global_num_blocks
-            or math.prod(param.shape[1:]) != matrix_numel
-        ):
-            raise ValueError(
-                "Partitioned block parameters must have matching global block "
-                "counts and per-block numel."
+                f"Partitioned block parameter {fqn!r} must declare a global "
+                f"layout that evenly shards dim 0 across {num_partitions} "
+                f"partitions, with this rank holding partition {partition_index}."
             )
 
 
