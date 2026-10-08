@@ -61,6 +61,7 @@ each parameter's mesh, and updates local shards with AdamW.
 | `unshard()`, `reshard()` and `set_reshard_after_forward` on one `fully_shard` group | The same methods on its bucket's storage, from `sharded_bucket_storages` or `model.bucket_storage_of(param)` |
 | Construct AdamW after sharding | Construct AdamW after sharding |
 | AdamW manages DTensor parameters | AdamW manages ordinary local parameter shards |
+| DCP checkpoints DTensor state dicts | DCP checkpoints local shards that declare their layouts; see [Distributed checkpoints](#distributed-checkpoints) |
 
 For training that is bitwise identical to FSDP2, give each `fully_shard` group
 one `BucketSpec` naming the same modules, with the same `Shard(i)` placements,
@@ -332,9 +333,60 @@ of such a call only waits for its reduce-scatters. Combined with the per-bucket
 methods above, this reduce-scatters like FSDP2 under the chunked loss, bit for
 bit.
 
-A regular FlexShard `state_dict()` contains rank-local shards. It is not a
-gathered model checkpoint. Existing FSDP2 checkpoint code needs an explicit
-compatibility check or conversion, even when the parameter split agrees.
+## Distributed checkpoints
+
+A FlexShard `state_dict()` holds each rank's local shards, which share storage
+with the sharded parameters. To checkpoint them with PyTorch distributed
+checkpointing (DCP), declare where each shard sits in the full tensor, through
+the fields of DCP's `CheckpointableTensor` protocol:
+
+- `set_state_dict_global_layouts(model, state_dict)` declares them on a model
+  state dict's parameters.
+- `register_optimizer_checkpoint_hook(optimizer, model)` makes
+  `optimizer.state_dict()` declare them on the optimizer's states. Register it
+  once the parameters are sharded, as right after `flex_shard()`.
+
+```python
+import torch.distributed.checkpoint as dcp
+from flex_shard import register_optimizer_checkpoint_hook, set_state_dict_global_layouts
+
+register_optimizer_checkpoint_hook(optimizer, model)
+
+
+def checkpoint_state_dict():
+    model_state_dict = model.state_dict()
+    set_state_dict_global_layouts(model, model_state_dict)
+    return {"model": model_state_dict, "optim": optimizer.state_dict()}
+
+
+dcp.save(checkpoint_state_dict(), checkpoint_id=path)
+
+state_dict = checkpoint_state_dict()
+dcp.load(state_dict, checkpoint_id=path)
+model.load_state_dict(state_dict["model"])
+optimizer.load_state_dict(state_dict["optim"])
+```
+
+DCP saves each shard as a chunk of the full tensor and loads chunks by their
+global offsets. A checkpoint therefore loads at a different number of ranks,
+and FSDP2 checkpoints of the same model load into FlexShard and back, as
+[`test_flex_shard_checkpoint.py`](src/flex_shard/tests/test_flex_shard_checkpoint.py)
+checks with AdamW. As for any `dcp.load` into `optimizer.state_dict()`, the
+optimizer needs its states first, for example from a step with zero gradients.
+
+The optimizer hook supports Adam and AdamW, whose states other than `step` are
+elementwise and have their parameter's shape. `step` is saved as replicated.
+
+The declarations are Python attributes of the state-dict tensors, so DCP has to
+receive those tensor objects:
+
+- A copy, such as a `.to(dtype)` cast before saving, needs
+  `set_state_dict_global_layouts` again.
+- DCP's process-based `async_save` (`AsyncCheckpointerType.PROCESS`) sends the
+  state dict to its checkpoint process through `torch.multiprocessing`, whose
+  tensor pickling keeps only the data. That process would save each shard as
+  if it were the full tensor, without raising. The default thread-based
+  `async_save` keeps the declarations.
 
 ## Limitations
 
