@@ -28,6 +28,7 @@ from .utils import _get_single_placement, _set_param_on_module
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
+    from .bucket_runtime import BucketCommContext, BucketRuntime
     from .placement_contract import (
         BucketStorageLayout,
         GlobalLayout,
@@ -785,6 +786,67 @@ class ShardedBucketStorage:
         and sets every bucket.
         """
         self._reshard_after_backward = reshard_after_backward
+
+    @property
+    def reshard_after_backward(self) -> bool:
+        """Whether a backward without gradient sync reshards this bucket; see
+        ``set_reshard_after_backward``."""
+        return self._reshard_after_backward
+
+    @property
+    def reshard_after_forward(self) -> bool:
+        """Whether this bucket frees its unsharded parameters after forward;
+        see ``set_reshard_after_forward``."""
+        return self._reshard_after_forward
+
+    def set_reshard_after_forward(self, reshard_after_forward: bool) -> None:
+        """Set whether this bucket reshards after forward, like FSDP2's
+        ``set_reshard_after_forward`` on its group.
+
+        ``BucketSpec.reshard_after_forward`` sets the initial value; this one
+        applies from the next forward on, e.g. to keep the bucket gathered
+        across several calls of its module.
+        """
+        self._reshard_after_forward = reshard_after_forward
+
+    def unshard(self) -> None:
+        """Unshard this bucket now and keep it unsharded, like FSDP2's
+        ``FSDPModule.unshard()`` on its group, synchronously.
+
+        ``FlexShardModule.unshard`` documents the behavior and unshards every
+        bucket. Eager only.
+        """
+        context, bucket = self._runtime()
+        context.check_outside_backward("unshard")
+        bucket.unshard()
+
+    def reshard(self) -> None:
+        """Reshard this bucket now, like FSDP2's ``FSDPModule.reshard()`` on
+        its group, and release its prefetched unshard, if any.
+
+        Grads accumulated without sync stay. Unlike
+        ``FlexShardModule.reshard``, this keeps the bucket's backward state, so
+        a backward still to run re-gathers the bucket in its pre-backward hook.
+        Eager only.
+        """
+        context, bucket = self._runtime()
+        context.check_outside_backward("reshard")
+        context.release_pending_unshard(bucket)
+        if bucket.is_unsharded:
+            bucket.reshard()
+
+    def _runtime(self) -> tuple[BucketCommContext, BucketRuntime]:
+        """This bucket's communication context and runtime, which exist once
+        its storage is materialized."""
+        from .bucket_runtime import BucketCommContext
+
+        context = BucketCommContext.get(self._module, self.byte_storage.device)
+        if context is None:
+            raise RuntimeError(
+                "FlexShard: the bucket has no runtime until its storage is "
+                "materialized, e.g. by to_empty()."
+            )
+        return context, context.bucket_runtime(self)
 
     def set_buckets_to_forward_prefetch(
         self, buckets: list[ShardedBucketStorage]

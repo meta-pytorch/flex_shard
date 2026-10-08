@@ -274,14 +274,35 @@ class BucketCommContext:
         )
 
     def bucket_runtime(self, bucket_storage: ShardedBucketStorage) -> BucketRuntime:
-        """The runtime of ``bucket_storage``, an explicit prefetch target."""
+        """The runtime of ``bucket_storage``, e.g. an explicit prefetch target."""
         for bucket in self.buckets:
             if bucket.bucket_storage is bucket_storage:
                 return bucket
         raise ValueError(
-            "FlexShard: a prefetch target is not a bucket of this flex_shard "
+            "FlexShard: a bucket storage is not a bucket of this flex_shard "
             "module on this device."
         )
+
+    def check_outside_backward(self, method: str) -> None:
+        """Raise unless ``method`` (e.g. ``"unshard"``) may run now: outside
+        backward and after waiting on any ``finalize_backward`` handle."""
+        if _in_backward():
+            raise RuntimeError(f"FlexShard: {method}() cannot run in backward.")
+        self.check_no_raised_backward()
+        if self.pending_finalization is not None:
+            raise RuntimeError(
+                f"FlexShard: wait on the finalize_backward() handle before {method}()."
+            )
+
+    def release_pending_unshard(self, bucket: BucketRuntime) -> None:
+        """Release ``bucket``'s prefetched unshard, if any."""
+        kept = []
+        for pending in self.pending_unshards:
+            if pending.bucket is bucket:
+                self._release_prefetch(pending)
+            else:
+                kept.append(pending)
+        self.pending_unshards = kept
 
     def take_pending_unshard(
         self,
