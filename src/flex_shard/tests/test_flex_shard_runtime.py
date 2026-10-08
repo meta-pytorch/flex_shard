@@ -6,6 +6,7 @@
 
 import copy
 import dataclasses
+import gc
 import warnings
 from unittest.mock import Mock, patch
 
@@ -834,6 +835,42 @@ class TestFlexShardEagerRuntime(TestCase):
                         torch.testing.assert_close(param.grad, ref_param.grad)
                     optim.step()
                     ref_optim.step()
+
+    def test_chunked_head_releases_hidden_states(self):
+        # The post-backward trigger on the head's leaf chunk inputs must not
+        # keep them, or the hidden states their storage is part of, alive
+        # after the step. torchtitan turns automatic garbage collection off,
+        # so a reference cycle through the trigger would keep one hidden state
+        # per step until the next collection.
+        with single_rank_cuda_mesh() as mesh:
+            torch.manual_seed(0)
+            model = _ChunkedHeadNet(64, 16)
+            flex_shard(
+                model,
+                buckets=[
+                    _bucket(["layer"], mesh, reshard_after_forward=True),
+                    dataclasses.replace(
+                        _bucket(["norm", "head"], mesh, reshard_after_forward=False),
+                        fsdp2_compatible=True,
+                    ),
+                ],
+            )
+            head_storage = model.bucket_storage_of(model.head.weight)
+            optim = torch.optim.SGD(model.parameters(), lr=0.1)
+            x = torch.randn(1024, 64, device="cuda")
+            targets = torch.randint(16, (1024,), device="cuda")
+            allocated = []
+            gc.collect()
+            gc.disable()
+            try:
+                for _ in range(3):
+                    _chunked_loss_backward(model, x, targets, 4, head_storage)
+                    optim.step()
+                    optim.zero_grad()
+                    allocated.append(torch.cuda.memory_allocated())
+            finally:
+                gc.enable()
+            self.assertEqual(allocated[1], allocated[2])
 
     def test_released_refill_frees_storage(self):
         # A prefetch that refills a bucket's persistent storage, which begin

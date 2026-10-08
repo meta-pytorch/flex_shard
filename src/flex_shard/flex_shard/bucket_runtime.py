@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Any
@@ -1152,24 +1153,17 @@ class BucketRuntime:
         whether the trigger exists.
 
         A multi-grad hook on the inputs does what FSDP2's
-        ``RegisterPostBackwardFunction`` does without wrapping them. Leaf
-        inputs, e.g. detached chunks of hidden states, are replaced by views
-        first, so that the hooks live on this graph's tensors rather than
-        outlive it, as FSDP2 wraps them. Forwards without grad-requiring
-        inputs, or with leaf ones inside dataclasses, get no trigger.
+        ``RegisterPostBackwardFunction`` does without wrapping them. A hook on
+        a leaf input, e.g. a detached chunk of hidden states, would outlive
+        this graph, and one on a view of it would form a reference cycle that
+        keeps the leaf, and the storage it views, alive until the next garbage
+        collection. Inputs that include a leaf are therefore wrapped in an
+        identity autograd function whose backward runs the trigger, as FSDP2
+        wraps all inputs. Forwards without grad-requiring inputs, or with leaf
+        ones inside dataclasses, get no trigger.
         """
         if not torch.is_grad_enabled():
             return args, kwargs, False
-        views: dict[int, torch.Tensor] = {}
-
-        def view_leaf(tensor: torch.Tensor) -> torch.Tensor:
-            if not tensor.requires_grad or tensor.grad_fn is not None:
-                return tensor
-            if id(tensor) not in views:
-                views[id(tensor)] = tensor.view_as(tensor)
-            return views[id(tensor)]
-
-        args, kwargs = tree_map_only(torch.Tensor, view_leaf, (args, kwargs))
         inputs = list(
             {
                 id(tensor): tensor
@@ -1177,10 +1171,29 @@ class BucketRuntime:
                 if tensor.requires_grad
             }.values()
         )
-        if not inputs or any(tensor.grad_fn is None for tensor in inputs):
+        if not inputs:
             return args, kwargs, False
-        torch.autograd.graph.register_multi_grad_hook(
-            inputs, lambda grads: self._input_grads_ready(forward_pass)
+        if all(tensor.grad_fn is not None for tensor in inputs):
+            torch.autograd.graph.register_multi_grad_hook(
+                inputs, lambda grads: self._input_grads_ready(forward_pass)
+            )
+            return args, kwargs, True
+        # Only the inputs tree_map reaches can be replaced by the wrapped ones.
+        reachable = {
+            id(leaf)
+            for leaf in tree_leaves((args, kwargs))
+            if isinstance(leaf, torch.Tensor)
+        }
+        if any(id(tensor) not in reachable for tensor in inputs):
+            return args, kwargs, False
+        outputs = _InputGradsTrigger.apply(
+            functools.partial(self._input_grads_ready, forward_pass), *inputs
+        )
+        wrapped = {
+            id(tensor): output for tensor, output in zip(inputs, outputs, strict=True)
+        }
+        args, kwargs = tree_map_only(
+            torch.Tensor, lambda tensor: wrapped.get(id(tensor), tensor), (args, kwargs)
         )
         return args, kwargs, True
 
@@ -1301,6 +1314,25 @@ class BucketRuntime:
             )
         full_params = _BucketUnshard.apply(self, *self._local_shards(use_autograd=True))
         self._swap_in_params(list(full_params))
+
+
+class _InputGradsTrigger(torch.autograd.Function):
+    """Identity on a forward call's grad-requiring inputs whose backward runs
+    ``callback`` once their grads are computed, as FSDP2's
+    ``RegisterPostBackwardFunction`` runs its post-backward. Unlike hooks on
+    the inputs, it holds nothing that refers back to the graph."""
+
+    @staticmethod
+    def forward(
+        ctx: Any, callback: Callable[[], None], *inputs: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        ctx.callback = callback
+        return inputs
+
+    @staticmethod
+    def backward(ctx: Any, *grads: torch.Tensor) -> tuple[Any, ...]:
+        ctx.callback()
+        return (None, *grads)
 
 
 class _BucketUnshard(torch.autograd.Function):
