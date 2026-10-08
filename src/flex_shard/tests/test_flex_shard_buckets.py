@@ -40,6 +40,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 from .. import (
     BucketSpec,
     flex_shard,
+    get_mesh,
     GradientReduction,
     is_flex_shard_param,
     Placement,
@@ -338,7 +339,7 @@ class TestBucketPlacementValidation(TestCase):
         assignments = [["a.weight", "b.weight"]]
         placements = {
             "a.weight": (Shard(0),),
-            "b.weight": (Shard(1),),
+            "b.weight": (BlockShard(blocks_per_rank=(1,)),),
         }
         with single_rank_cpu_mesh() as mesh:
             buckets = [
@@ -369,7 +370,7 @@ class TestBucketPlacementValidation(TestCase):
         def mixed_placements(named_params, mesh):
             return {
                 "a": (Shard(0),),
-                "b": (Shard(1),),
+                "b": (BlockShard(blocks_per_rank=(1,)),),
             }
 
         with single_rank_cuda_mesh() as mesh:
@@ -388,32 +389,53 @@ class TestBucketPlacementValidation(TestCase):
                 )
             self.assertFalse(hasattr(model, "_sharded_bucket_storages"))
 
-    def test_flex_shard_rejects_shard1_before_materializing(self):
-        class OneParamModule(nn.Module):
+    def test_flex_shard_mixes_shard_dims_in_one_bucket(self):
+        class TwoParamModule(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
-                self.weight = nn.Parameter(torch.empty(2, 2))
+                self.a = nn.Parameter(torch.randn(3, 2))
+                self.b = nn.Parameter(torch.randn(2, 4))
 
-        def shard1_placement(named_params, mesh):
+        def mixed_dims(named_params, mesh):
             del mesh
-            return {fqn: (Shard(1),) for fqn, _ in named_params}
+            return {"a": (Shard(0),), "b": (Shard(1),)}
 
         with single_rank_cuda_mesh() as mesh:
-            model = OneParamModule()
-            with self.assertRaisesRegex(NotImplementedError, "only Shard\\(0\\)"):
-                flex_shard(
-                    model,
-                    buckets=[
-                        BucketSpec(
-                            ["*"],
-                            placement_fn=shard1_placement,
-                            mesh=mesh,
-                            reshard_after_forward=False,
-                        )
-                    ],
-                )
-            self.assertFalse(hasattr(model, "_sharded_bucket_storages"))
+            model = TwoParamModule()
+            expected = {
+                name: param.detach().cuda() for name, param in model.named_parameters()
+            }
+            flex_shard(
+                model,
+                buckets=[
+                    BucketSpec(
+                        ["*"],
+                        placement_fn=mixed_dims,
+                        mesh=mesh,
+                        reshard_after_forward=False,
+                    )
+                ],
+            )
+            self.assertEqual(len(model.sharded_bucket_storages), 1)
+            for name, param in model.named_parameters():
+                self.assertEqual(param, expected[name])
+                self.assertIs(get_mesh(param), mesh)
 
+    def test_rejects_uneven_shard_on_nonzero_dim(self):
+        """As in FSDP2, only Shard(0) pads; Shard(1) must split evenly."""
+
+        class TwoRankMesh:
+            def get_local_rank(self) -> int:
+                return 0
+
+            def size(self) -> int:
+                return 2
+
+        weight = nn.Parameter(torch.empty(2, 3))
+        with self.assertRaisesRegex(NotImplementedError, "split evenly"):
+            Shard(1).bucket_storage_layout(
+                [("weight", weight)], {"weight": (Shard(1),)}, TwoRankMesh()
+            )
 
 class TestBucketReduceDtype(TestCase):
     def test_promotes_trainable_grad_dtypes_only(self):
@@ -488,6 +510,39 @@ class TestBucketReduceDtype(TestCase):
                     self.assertEqual(
                         [info.grad_reduce_dtype for info in infos], [bf16, bf16]
                     )
+
+    def test_copy_in_casts_mixed_grad_dtypes_across_shard_dims(self):
+        bf16, world_size = torch.bfloat16, 4
+        # Shard(0) pads 5 rows to 8. The transposed Shard(1) grad is not
+        # contiguous, so the copy-in takes it reordered to dim 0.
+        grads_and_dims = {
+            "rows": (torch.randn(5, 3, dtype=bf16, device=device_type), 0),
+            "cols": (torch.randn(2, 8, 3, dtype=bf16, device=device_type), 1),
+            "transposed": (torch.randn(8, 2, 3, device=device_type).transpose(0, 1), 1),
+            "depth": (torch.randn(3, 2, 4, device=device_type), 2),
+        }
+        params = {
+            fqn: nn.Parameter(torch.empty(grad.shape))
+            for fqn, (grad, _) in grads_and_dims.items()
+        }
+        with single_rank_cpu_mesh() as mesh:
+            infos, _ = ShardedBucketStorage.create_param_infos(
+                list(params.items()),
+                mesh,
+                {fqn: (Shard(dim),) for fqn, (_, dim) in grads_and_dims.items()},
+            )
+        grads = [grad for grad, _ in grads_and_dims.values()]
+        send_buf, _ = Shard(0)._pack_reduce_scatter_grad(
+            grads, list(infos.values()), world_size
+        )
+
+        # FSDP2's copy-in: Shard(i) grads reordered to dim 0, then chunked in fp32
+        reordered = [
+            torch.cat(torch.chunk(grad, world_size, dim=dim)) if dim else grad
+            for grad, dim in grads_and_dims.values()
+        ]
+        expected = torch._chunk_cat([g.float() for g in reordered], 0, world_size)
+        self.assertEqual(send_buf.view(world_size, -1), expected, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------

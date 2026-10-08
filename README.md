@@ -19,6 +19,13 @@ the same model's bucket collectives in a full model trace, following
 | CUDA and NCCL | A CUDA-enabled PyTorch build with NCCL and a compatible NVIDIA driver |
 | Triton | `~=3.8.0` on Linux |
 
+`Shard` placements call FSDP's native collective copies:
+`fsdp::_all_gather_copy_out_` from
+[pytorch/pytorch#197204](https://github.com/pytorch/pytorch/pull/197204), and
+`fsdp::chunk_cat_mixed_dtype` with `num_leading_dims` from
+[pytorch/pytorch#200179](https://github.com/pytorch/pytorch/pull/200179). Until a
+PyTorch release includes them, they need a PyTorch built with those pull requests.
+
 Install a CUDA-enabled PyTorch build satisfying this range, then install
 FlexShard from the repository:
 
@@ -48,6 +55,7 @@ each parameter's mesh, and updates local shards with AdamW.
 | --- | --- |
 | Apply `fully_shard` to child modules, then the root | Call `flex_shard` once with explicit buckets |
 | Shard parameters along dimension 0 | Use `per_param_placements`, which assigns each parameter `Shard(0)` |
+| `shard_placement_fn` returning `Shard(i)` | A `placement_fn` returning `Shard(i)`; one bucket may mix dims |
 | `fully_shard(layer.experts, mesh=efsdp_mesh)` | Expert `BucketSpec(..., mesh=efsdp_mesh)` |
 | Construct AdamW after sharding | Construct AdamW after sharding |
 | AdamW manages DTensor parameters | AdamW manages ordinary local parameter shards |
