@@ -16,8 +16,6 @@ from typing import Literal
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Replicate, Shard as DTensorShard
-from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from ..custom_placements.block_shard import (
     BlockShard as StorageBlockShard,
@@ -25,6 +23,7 @@ from ..custom_placements.block_shard import (
 )
 from ..custom_placements.owned import BucketedOwned
 from ..flex_shard.bucket_storage import ParamInfo
+from ..flex_shard.placement_contract import get_global_layout
 from ..flex_shard.sharded_param import (
     get_global_shape,
     get_placements,
@@ -63,35 +62,26 @@ def capture_flex_shard_muon_canonical_shards(model: nn.Module) -> None:
 
 
 def _capture_canonical_shard(parameter: torch.Tensor) -> LocalMuonStateShard:
-    if not isinstance(parameter, DTensor):
+    layout = get_global_layout(parameter)
+    if layout is None:
         return LocalMuonStateShard(
             global_shape=parameter.shape,
             global_offset=(0,) * parameter.ndim,
             local_shape=parameter.shape,
         )
-
-    shard_placements = [
-        placement
-        for placement in parameter.placements
-        if isinstance(placement, DTensorShard)
-    ]
-    if len(shard_placements) > 1 or any(
-        not isinstance(placement, Replicate)
-        and not (isinstance(placement, DTensorShard) and placement.dim == 0)
-        for placement in parameter.placements
+    if (
+        len(layout.global_offsets) != 1
+        or layout.global_shape[1:] != tuple(parameter.shape[1:])
+        or layout.local_offsets[0] != (0,) * parameter.ndim
+        or layout.local_sizes[0] != tuple(parameter.shape)
     ):
         raise NotImplementedError(
-            "FlexShard Muon recipes only support outer DTensor Shard(0)"
+            "FlexShard Muon recipes only support an outer Shard(0) layout"
         )
-    local_shape, global_offset = compute_local_shape_and_global_offset(
-        parameter.shape,
-        parameter.device_mesh,
-        parameter.placements,
-    )
     return LocalMuonStateShard(
-        global_shape=parameter.shape,
-        global_offset=global_offset,
-        local_shape=torch.Size(local_shape),
+        global_shape=torch.Size(layout.global_shape),
+        global_offset=layout.global_offsets[0],
+        local_shape=parameter.shape,
     )
 
 
@@ -118,6 +108,9 @@ def _flex_shard_muon_compute_layout(
     fqn: str,
     parameter: torch.Tensor,
 ) -> LocalMuonComputeLayout:
+    info = bucket_param_infos.get(canonical_fqn(fqn))
+    if info is not None:
+        _validate_captured_outer_layout(fqn, canonical_shard, info)
     global_storage_shape = get_global_shape(parameter)
     placements = get_placements(parameter)
     mesh = parameter._mesh
@@ -155,6 +148,27 @@ def _flex_shard_muon_compute_layout(
         f"FlexShard placement {placement!r} for Muon parameter {fqn!r} "
         "is not used by the supported recipes."
     )
+
+
+def _validate_captured_outer_layout(
+    fqn: str,
+    canonical_shard: LocalMuonStateShard,
+    info: ParamInfo,
+) -> None:
+    # flex_shard() records the declared outer layout; a shard captured before it
+    # was declared recorded the outer local shard as the whole parameter.
+    outer = info.outer_layout
+    if outer is None:
+        expected = (tuple(info.global_shape), ((0,) * len(info.global_shape),))
+    else:
+        expected = (outer.global_shape, outer.global_offsets)
+    captured = (tuple(canonical_shard.global_shape), (canonical_shard.global_offset,))
+    if captured != expected:
+        raise ValueError(
+            f"FlexShard Muon parameter {fqn!r} was captured with global shape and "
+            f"offsets {captured}, but flex_shard() recorded {expected}; declare "
+            "outer layouts before capture_flex_shard_muon_canonical_shards()."
+        )
 
 
 def _owned_layout(

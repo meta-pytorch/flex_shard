@@ -47,6 +47,7 @@ PlacementFn = Callable[
 # Called with a bucket's ``(fqn, unsharded param)`` pairs.
 BucketHook = Callable[[list[tuple[str, nn.Parameter]]], None]
 
+
 @dataclass(frozen=True)
 class MixedPrecisionPolicy:
     """Mixed precision policy for FlexShard buckets.
