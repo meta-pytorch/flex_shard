@@ -6,15 +6,24 @@
 
 from __future__ import annotations
 
+import functools
 from contextlib import AbstractContextManager, nullcontext
-from typing import Any, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, TypeVar
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.tensor import DTensor
+from torch.utils._python_dispatch import (
+    _get_current_dispatch_mode_stack,
+    _pop_mode,
+    _push_mode,
+)
+from torch.utils.checkpoint import _CachedTorchDispatchMode, _CachingTorchDispatchMode
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from torch.distributed.device_mesh import DeviceMesh
 
     from .bucket_storage import BucketParamFQNsByIndex, ShardedBucketStorage
@@ -65,6 +74,46 @@ def _record_comm_if_eager(
 ) -> AbstractContextManager[Any]:
     """Return an eager profiler range for communication launch code."""
     return _record_function_if_eager(label, fqn)
+
+
+_SAC_MODES = (_CachingTorchDispatchMode, _CachedTorchDispatchMode)
+_R = TypeVar("_R")
+
+
+def _outside_selective_checkpoint(fn: Callable[..., _R]) -> Callable[..., _R]:
+    """Run eager ``fn`` hidden from selective activation checkpointing.
+
+    SAC requires a checkpointed region's recompute to run the ops its forward
+    ran, but whether a bucket hook there unshards, prefetches, or releases a
+    prefetch depends on runtime state that differs between the two. Unshards
+    run without grad and refill their buffers in place, so SAC has nothing to
+    save or replay. Other dispatch modes stay active; during compile, SAC tags
+    the traced graph instead, so nothing is hidden.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> _R:
+        if torch.compiler.is_compiling():
+            return fn(*args, **kwargs)
+        stack = _get_current_dispatch_mode_stack()
+        first_sac = next(
+            (i for i, mode in enumerate(stack) if isinstance(mode, _SAC_MODES)), None
+        )
+        if first_sac is None:
+            return fn(*args, **kwargs)
+        popped = [_pop_mode() for _ in range(len(stack) - first_sac)]
+        kept = [mode for mode in reversed(popped) if not isinstance(mode, _SAC_MODES)]
+        for mode in kept:
+            _push_mode(mode)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            for _ in kept:
+                _pop_mode()
+            for mode in reversed(popped):
+                _push_mode(mode)
+
+    return wrapper
 
 
 def _get_single_placement(placements: tuple[Placement, ...]) -> Placement:

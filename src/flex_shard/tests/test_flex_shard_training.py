@@ -27,12 +27,14 @@ from torch.utils.checkpoint import (
 
 from .. import BucketSpec, flex_shard, MixedPrecisionPolicy
 from ..custom_placements.block_shard import (
+    BlockShard,
     BucketedBlockShard,
     make_bucketed_block_placement_fn,
 )
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..custom_placements.owned import make_bucketed_owned_full_param_placement_fn
 from ..custom_placements.shard import per_param_placements, Shard
+from ..dist_muon.placement import make_mixed_placement_fn
 from ..flex_shard import bucket_runtime
 from ..flex_shard.checkpoint import get_flex_shard_global_layouts
 from .common import (
@@ -140,6 +142,19 @@ class _ReusedWeights(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.a(x) + self.b(x)
+
+
+class _GatedBlock(torch.nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.attn = torch.nn.Linear(dim, dim)
+        self.mlp = torch.nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = x + self.attn(x)
+        # The gate's backward unpacks saved activations, so a checkpointed
+        # block recomputes before either linear's pre-backward hook runs.
+        return h + torch.sigmoid(h) * self.mlp(h)
 
 
 class _FusedWgradLinearFn(torch.autograd.Function):
@@ -1481,6 +1496,130 @@ class TestFlexShardTraining(FSDPTest):
         optim.step()
         ref_optim.step()
         check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
+
+    @skip_if_lt_x_gpu(2)
+    def test_submodule_buckets_under_selective_activation_checkpointing(self):
+        # Buckets inside checkpointed blocks unshard again in the recompute,
+        # which runs before their pre-backward hooks, after forward prefetched
+        # them from the previous block, or after a microbatch left them
+        # unsharded; selective activation checkpointing must not see it.
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+        blocks_per_rank = (1,) * self.world_size
+        block_shard = BlockShard(blocks_per_rank=blocks_per_rank)
+
+        def dist_muon_mixed_placements(named_params, mesh):
+            # DistMuon's mixed buckets: block-sharded weights, owned biases.
+            owned = {
+                fqn: idx % mesh.size()
+                for idx, (fqn, _) in enumerate(named_params)
+                if fqn.endswith("bias")
+            }
+            blocks = {
+                fqn: blocks_per_rank
+                for fqn, _ in named_params
+                if fqn.endswith("weight")
+            }
+            return make_mixed_placement_fn(owned, blocks)(named_params, mesh)
+
+        placement_fns = {
+            "shard": per_param_placements,
+            "block_shard": lambda named_params, _mesh: {
+                fqn: (block_shard,) for fqn, _ in named_params
+            },
+            "bucketed_block": make_bucketed_block_placement_fn(
+                dims=(0,), blocks_per_rank=blocks_per_rank
+            ),
+            # Whole-parameter BucketedOwned buckets unshard through their
+            # owners' rows, without copies.
+            "owned": make_bucketed_owned_full_param_placement_fn(),
+            "dist_muon_mixed": dist_muon_mixed_placements,
+        }
+        begin_unshard = bucket_runtime.BucketRuntime.begin_unshard
+        gathers: list[bucket_runtime.BucketRuntime] = []
+
+        def count_gathers(bucket, *args, **kwargs):
+            gathers.append(bucket)
+            return begin_unshard(bucket, *args, **kwargs)
+
+        for (name, placement_fn), accumulate in (
+            (case, accumulate)
+            for case in placement_fns.items()
+            for accumulate in (False, True)
+        ):
+            with self.subTest(placement=name, accumulate=accumulate):
+                torch.manual_seed(0)
+                reference = torch.nn.Sequential(*(_GatedBlock(8) for _ in range(3)))
+                reference = reference.to(device_type)
+                # The same FlexShard model without and with checkpointing.
+                plain, model = copy.deepcopy(reference), copy.deepcopy(reference)
+                for module in (reference, model):
+                    for idx, block in enumerate(module):
+                        module[idx] = checkpoint_wrapper(
+                            block, context_fn=_prefer_recompute_context_fn
+                        )
+                buckets = [
+                    BucketSpec(
+                        [f"{idx}.*{part}"],
+                        placement_fn=placement_fn,
+                        mesh=mesh,
+                        reshard_after_forward=True,
+                    )
+                    for idx in range(len(model))
+                    for part in ("attn", "mlp")
+                ]
+                for module in (plain, model):
+                    flex_shard(module, buckets=buckets)
+                modules = (reference, plain, model)
+                optims = [make_test_sgd(m.parameters(), lr=0.1) for m in modules]
+                for _ in range(3):
+                    if accumulate:
+                        # The params stay unsharded after this microbatch, so
+                        # the next forward skips the all-gather and the
+                        # recompute re-gathers.
+                        for module in (plain, model):
+                            module.set_reshard_after_backward(False)
+                            module.set_requires_gradient_sync(False)
+                        x = torch.randn(4, 8, device=device_type)
+                        for module in modules:
+                            module(x).square().sum().backward()
+                        for module in (plain, model):
+                            module.set_reshard_after_backward(True)
+                            module.set_requires_gradient_sync(True)
+                    x = torch.randn(4, 8, device=device_type)
+                    ref_loss = reference(x).square().sum()
+                    plain_loss = plain(x).square().sum()
+                    gathers.clear()
+                    with mock.patch.object(
+                        bucket_runtime.BucketRuntime, "begin_unshard", count_gathers
+                    ):
+                        loss = model(x).square().sum()
+                        loss.backward()
+                    ref_loss.backward()
+                    plain_loss.backward()
+                    self.assertEqual(plain_loss, ref_loss)
+                    self.assertEqual(loss, ref_loss)
+                    if not accumulate:
+                        # One all-gather per bucket in forward and in backward:
+                        # the recompute finishes the next bucket's prefetch.
+                        self.assertEqual(len(gathers), 2 * len(buckets))
+                    for (plain_fqn, plain_param), (fqn, param) in zip(
+                        plain.named_parameters(), model.named_parameters(), strict=True
+                    ):
+                        self.assertEqual(
+                            fqn.replace("_checkpoint_wrapped_module.", ""), plain_fqn
+                        )
+                        self.assertEqual(param.grad, plain_param.grad)
+                    for optim in optims:
+                        optim.step()
+                        optim.zero_grad(set_to_none=True)
+                for plain_param, param in zip(
+                    plain.parameters(), model.parameters(), strict=True
+                ):
+                    self.assertEqual(param, plain_param)
 
     @skip_if_lt_x_gpu(2)
     def test_pre_backward_and_post_reduce_hooks(self):
