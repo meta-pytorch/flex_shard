@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
 dependencies = [
-    "torch>=2.14,<2.15",
+    "torch>=2.15",
     "torchao>=0.18",
     "typing-extensions>=4.10",
     "triton~=3.8.0; platform_system == 'Linux'",
@@ -23,6 +23,7 @@ test = [
     "hypothesis",
     "numpy",
     "pytest",
+    "spmd_types",
 ]
 
 [project.urls]
