@@ -641,19 +641,22 @@ class BucketRuntime:
     # Eager: persistent unsharded parameters
     # ------------------------------------------------------------------
 
-    def unshard(self, *, keep_other_prefetch: bool = False) -> None:
+    def unshard(self, *, finish_other_prefetch: bool = False) -> None:
         """Make the unsharded params hold data and swap them into the modules.
 
-        With ``keep_other_prefetch``, another bucket's prefetch stays pending
-        for that bucket instead of being released.
+        With ``finish_other_prefetch``, another bucket's prefetch is finished
+        into that bucket's storage, where its own unshard finds it, instead of
+        being released.
         """
         if not self.is_unsharded:
             pending = self.context.pending_unshard
             if (
-                keep_other_prefetch
+                finish_other_prefetch
                 and pending is not None
                 and pending.bucket is not self
             ):
+                self.context.pending_unshard = None
+                pending.bucket.finish_unshard(pending.result)
                 result = None
             else:
                 result = self.context.take_pending_unshard(self)
@@ -944,13 +947,13 @@ class BucketRuntime:
             # Activation-checkpoint recompute: the pre-backward hook usually
             # re-gathered already; otherwise this consumes its prefetch. The
             # recompute visits its buckets in forward order, but backward
-            # prefetched in reverse, so another bucket's prefetch is kept for
-            # that bucket, as FSDP2 keeps each group's prefetch. A forward
-            # without grad (reentrant checkpointing) left no pre-backward hook
-            # to run the bucket's pre_backward_hook, so run it here, before the
-            # recomputed backward.
+            # prefetched in reverse, so another bucket's prefetch is finished
+            # for that bucket rather than released and gathered again. A
+            # forward without grad (reentrant checkpointing) left no
+            # pre-backward hook to run the bucket's pre_backward_hook, so run
+            # it here, before the recomputed backward.
             self.call_has_trigger.append(False)
-            self.unshard(keep_other_prefetch=True)
+            self.unshard(finish_other_prefetch=True)
             if self.bucket_storage._pre_backward_hook is not None:
                 self.bucket_storage._pre_backward_hook(self._named_unsharded_params())
             return
