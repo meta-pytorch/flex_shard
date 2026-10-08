@@ -105,9 +105,7 @@ class _ParallelLinears(torch.nn.Module):
 class _AccumulatingWeight(torch.nn.Module):
     def __init__(self, *, device: torch.device, dtype: torch.dtype) -> None:
         super().__init__()
-        self.weight = torch.nn.Parameter(
-            torch.zeros(8, 8, device=device, dtype=dtype)
-        )
+        self.weight = torch.nn.Parameter(torch.zeros(8, 8, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Grads of 256 and then 1 accumulate to 257 in fp32 but 256 in bf16."""
@@ -127,9 +125,7 @@ class _AccumulatingWeights(torch.nn.Module):
 class _ReusedWeight(torch.nn.Module):
     def __init__(self, *, device: torch.device, dtype: torch.dtype) -> None:
         super().__init__()
-        self.weight = torch.nn.Parameter(
-            torch.zeros(8, 8, device=device, dtype=dtype)
-        )
+        self.weight = torch.nn.Parameter(torch.zeros(8, 8, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Per-use grads 256 and 1 sum to 257 in fp32 but round to 256 in bf16."""

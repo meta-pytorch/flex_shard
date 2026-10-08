@@ -120,9 +120,7 @@ def _axis_size_and_coordinate(axis: Any, mesh: DeviceMesh) -> tuple[int, int]:
         mesh_axis = spmd.normalize_axis(axis)
         if mesh_axis.size() == 1:
             return 1, 0
-        matches = [
-            n for n in names if spmd.MeshAxis.of(mesh.get_group(n)) == mesh_axis
-        ]
+        matches = [n for n in names if spmd.MeshAxis.of(mesh.get_group(n)) == mesh_axis]
         if not matches:
             raise ValueError(f"Mesh axis {axis!r} is not a dim of {mesh}.")
         name = matches[0]

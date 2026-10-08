@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -22,12 +23,14 @@ from ..dist_muon.comm_free_adapter import _build_parameter_binding, LocalDistMuo
 from ..dist_muon.storage_layout import (
     _block_shard_layout,
     _bucketed_block_shard_layout,
+    _capture_canonical_shard,
     capture_flex_shard_muon_canonical_shards,
     get_flex_shard_muon_compute_layouts,
     LocalMuonComputeLayout,
     LocalMuonStateShard,
 )
 from ..flex_shard.bucket_storage import BucketLayout, BucketParamLayout, ParamInfo
+from ..flex_shard.placement_contract import GlobalLayout, set_global_layout
 from ..flex_shard.sharded_param import set_sharding_info
 from .common import single_rank_cpu_mesh, single_rank_cuda_mesh
 
@@ -76,6 +79,95 @@ def _sgd_binding(mesh, parameters=None):
 
 
 class TestDistMuonStorageLayout(TestCase):
+    def test_capture_uses_declared_outer_layout(self):
+        experts = nn.Parameter(torch.empty(2, 4, 3))
+        set_global_layout(
+            experts,
+            GlobalLayout(
+                global_shape=(6, 4, 3),
+                global_offsets=((2, 0, 0),),
+                local_offsets=((0, 0, 0),),
+                local_sizes=((2, 4, 3),),
+            ),
+        )
+        self.assertEqual(
+            _capture_canonical_shard(experts),
+            LocalMuonStateShard(
+                global_shape=torch.Size((6, 4, 3)),
+                global_offset=(2, 0, 0),
+                local_shape=torch.Size((2, 4, 3)),
+            ),
+        )
+
+        # The layout must describe the whole local tensor as one box.
+        partial = nn.Parameter(torch.empty(2, 4, 3))
+        set_global_layout(
+            partial,
+            GlobalLayout(
+                global_shape=(6, 4, 3),
+                global_offsets=((2, 0, 0),),
+                local_offsets=((0, 0, 0),),
+                local_sizes=((1, 4, 3),),
+            ),
+        )
+        with self.assertRaisesRegex(NotImplementedError, "outer Shard\\(0\\)"):
+            _capture_canonical_shard(partial)
+
+    def test_compute_layout_rejects_capture_before_outer_layout(self):
+        # Rows 2..3 of a [4, 3] weight, owned whole by this rank's FlexShard.
+        outer = GlobalLayout(
+            global_shape=(4, 3),
+            global_offsets=((2, 0),),
+            local_offsets=((0, 0),),
+            local_sizes=((2, 3),),
+        )
+        placement = BucketedOwned(
+            {"weight": [BucketedOwnedSegmentSpec("weight", "weight", 0, 6, 0)]}
+        )
+        with single_rank_cpu_mesh() as mesh:
+            for declare_first in (True, False):
+                with self.subTest(declare_first=declare_first):
+                    model = nn.Linear(3, 2, bias=False)
+                    parameter = model.weight
+                    if declare_first:
+                        set_global_layout(parameter, outer)
+                    capture_flex_shard_muon_canonical_shards(model)
+                    if not declare_first:
+                        set_global_layout(parameter, outer)
+                    set_sharding_info(
+                        parameter,
+                        placements=(placement,),
+                        global_shape=parameter.shape,
+                        global_stride=parameter.stride(),
+                        mesh=mesh,
+                    )
+                    info = ParamInfo(
+                        fqn="weight",
+                        global_shape=parameter.shape,
+                        global_stride=parameter.stride(),
+                        dtype=parameter.dtype,
+                        requires_grad=True,
+                        placements=(placement,),
+                        outer_layout=outer,
+                    )
+                    model.sharded_bucket_storages = [
+                        SimpleNamespace(param_infos={"weight": info})
+                    ]
+                    if declare_first:
+                        (layout,) = get_flex_shard_muon_compute_layouts(
+                            model, [("weight", parameter)]
+                        )
+                        self.assertEqual(
+                            layout.state_checkpoint_shard.global_offset, (2, 0)
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError, "declare outer layouts before"
+                        ):
+                            get_flex_shard_muon_compute_layouts(
+                                model, [("weight", parameter)]
+                            )
+
     def test_checkpoint_wrapped_names_resolve_to_owned_layout(self):
         with single_rank_cpu_mesh() as mesh:
             model = nn.Module()
@@ -303,7 +395,9 @@ class TestDistMuonZeroGrad(TestCase):
                 self.assertIsNone(parameter_binding.real_param.grad)
                 self.assertIsNone(parameter_binding.proxy_param.grad)
 
-            sum(parameter.square().sum() for parameter in parameters.values()).backward()
+            sum(
+                parameter.square().sum() for parameter in parameters.values()
+            ).backward()
             sum(parameter.square().sum() for parameter in reference.values()).backward()
             if step_before_zero:
                 binding.step()
