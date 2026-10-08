@@ -362,7 +362,7 @@ def materialize_dist_muon_buckets(
             get_dim0_block_partitions(
                 plan.partitioned_parameters,
                 num_partitions=len(rank_groups),
-                partition_axis_name=partition_axis_name,
+                partition_index=current_partition,
             )
             if plan.partitioned_parameters
             else ()
