@@ -25,7 +25,9 @@ from ..dist_muon import (
     ParameterBucketPlan,
     WholeMatrixSpec,
 )
+from ..dist_muon.placement import get_dim0_block_partitions
 from ..flex_shard.bucket_storage import BucketSpec, MixedPrecisionPolicy
+from ..flex_shard.placement_contract import GlobalLayout, set_global_layout
 
 
 def _materialize_with_assignment_fn(
@@ -207,3 +209,36 @@ class MatrixAssignmentTest(TestCase):
             with self.subTest(assignment=assignment):
                 with self.assertRaisesRegex(ValueError, error_pattern):
                     _materialize_with_assignment_fn(invalid_assignment_fn)
+
+    def test_dim0_block_partitions_use_declared_global_layout(self) -> None:
+        blocks = nn.Parameter(torch.empty(2, 2, 3))
+        with self.assertRaisesRegex(ValueError, "global layout"):
+            get_dim0_block_partitions(
+                [("blocks", blocks)], num_partitions=2, partition_index=1
+            )
+
+        set_global_layout(
+            blocks,
+            GlobalLayout(
+                global_shape=(4, 2, 3),
+                global_offsets=((2, 0, 0),),
+                local_offsets=((0, 0, 0),),
+                local_sizes=((2, 2, 3),),
+            ),
+        )
+        self.assertEqual(
+            get_dim0_block_partitions(
+                [("blocks", blocks)], num_partitions=2, partition_index=1
+            ),
+            ((2, 6), (2, 6)),
+        )
+        with self.assertRaisesRegex(ValueError, "global layout"):
+            get_dim0_block_partitions(
+                [("blocks", blocks)], num_partitions=4, partition_index=1
+            )
+        # Experts sharded along another axis sit at offsets the partition
+        # axis's rank groups do not expect.
+        with self.assertRaisesRegex(ValueError, "holding partition 0"):
+            get_dim0_block_partitions(
+                [("blocks", blocks)], num_partitions=2, partition_index=0
+            )
