@@ -14,12 +14,12 @@ the same model's bucket collectives in a full model trace, following
 | Component | Requirement |
 | --- | --- |
 | Python | 3.10 or later |
-| PyTorch | `>=2.14,<2.15` |
+| PyTorch | 2.15 or later; use a nightly build until 2.15 is released |
 | Platform | Linux with NVIDIA GPUs |
 | CUDA and NCCL | A CUDA-enabled PyTorch build with NCCL and a compatible NVIDIA driver |
 | Triton | `~=3.8.0` on Linux |
 
-Install a CUDA-enabled PyTorch build satisfying this range, then install
+Install a CUDA-enabled PyTorch build satisfying this requirement, then install
 FlexShard from the repository:
 
 ```bash
