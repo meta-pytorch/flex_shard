@@ -437,6 +437,7 @@ class TestBucketPlacementValidation(TestCase):
                 [("weight", weight)], {"weight": (Shard(1),)}, TwoRankMesh()
             )
 
+
 class TestBucketReduceDtype(TestCase):
     def test_promotes_trainable_grad_dtypes_only(self):
         params = {
