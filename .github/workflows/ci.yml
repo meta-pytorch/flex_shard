@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # No branch filter: ghstack PRs above the bottom of a stack target the PR below.
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      pytorch_ref:
+        description: Also test a PyTorch branch, tag, or commit built from source (takes hours)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ruff==0.15.4
+      - run: ruff check .
+      - run: ruff format --check .
+
+  cpu:
+    name: CPU / Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # PyTorch nightly no longer publishes Python 3.10 wheels.
+        python: ["3.11", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install PyTorch nightly and test dependencies
+        # torchao comes from the same index so its extensions match PyTorch's ABI.
+        run: |
+          python -m pip install --pre torch torchao --index-url https://download.pytorch.org/whl/nightly/cpu
+          python -m pip install -e '.[test]'
+          python -m pip check
+          python -c "import torch; print(torch.__version__, torch.version.git_version)"
+      - name: Run tests
+        run: python -m pytest -q -rs
+      - name: Compile examples
+        run: python -m compileall -q examples
+
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build and inspect distributions
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check --strict dist/*
+          python .github/scripts/check_dist.py dist
+      - name: Install the wheel into a fresh environment
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-venv"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install --pre torch torchao --index-url https://download.pytorch.org/whl/nightly/cpu
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip check
+      - name: Import the installed wheel outside the checkout
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/wheel-venv/bin/python" -I - <<'PY'
+          from pathlib import Path
+          import sys
+          import flex_shard
+          import flex_shard.custom_placements.shard
+          import flex_shard.dist_muon.storage_layout
+
+          assert Path(flex_shard.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+          print(flex_shard.__file__)
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: distributions
+          path: dist/
+
+  cpu-pytorch-source:
+    name: CPU / PyTorch ${{ inputs.pytorch_ref }} from source
+    if: github.event_name == 'workflow_dispatch' && inputs.pytorch_ref != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space for the PyTorch build
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: pytorch/pytorch
+          ref: ${{ inputs.pytorch_ref }}
+          path: pytorch
+          submodules: recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build and install PyTorch
+        working-directory: pytorch
+        env:
+          USE_CUDA: "0"
+          BUILD_TEST: "0"
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install --no-build-isolation -v .
+      - name: Install test dependencies
+        run: |
+          python -m pip install -e '.[test]'
+          python -m pip check
+          python -c "import torch; print(torch.__version__, torch.version.git_version)"
+      - name: Run tests
+        run: python -m pytest -q -rs
+
+  gpu:
+    # Runs once a maintainer sets FLEX_SHARD_GPU_RUNNER. Fork PRs are excluded
+    # because they would run untrusted code on that runner.
+    if: >-
+      vars.FLEX_SHARD_GPU_RUNNER != '' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ${{ vars.FLEX_SHARD_GPU_RUNNER }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install PyTorch nightly and test dependencies
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          .venv/bin/python -m pip install --pre torch torchao --index-url https://download.pytorch.org/whl/nightly/cu130
+          .venv/bin/python -m pip install -e '.[test]'
+          .venv/bin/python -m pip check
+      - name: Require two GPUs and NCCL
+        run: |
+          python - <<'PY'
+          import torch
+          import torch.distributed as dist
+
+          count = torch.cuda.device_count()
+          assert count >= 2, f"FlexShard runtime tests need two GPUs, found {count}"
+          assert dist.is_nccl_available(), "FlexShard runtime tests need NCCL"
+          print(torch.__version__, torch.version.git_version, torch.cuda.get_device_name(0), count)
+          PY
+      - name: Run tests
+        run: python -m pytest -q -rs
+      - name: Run the AdamW example
+        run: |
+          if [ "$(python -c 'import torch; print(torch.cuda.device_count())')" -lt 4 ]; then
+            echo "::notice::Skipped examples/train_adamw.py, which needs four GPUs."
+            exit 0
+          fi
+          python -m torch.distributed.run --standalone --nproc-per-node=4 \
+            examples/train_adamw.py

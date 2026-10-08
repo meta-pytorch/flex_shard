@@ -46,6 +46,27 @@ four GPUs and skip on hosts with insufficient hardware. A CPU-only run is
 useful for applicable unit tests, but does not validate the training runtime.
 Maintainers can help arrange GPU validation before landing a contribution.
 
+GitHub Actions runs Ruff, the test suite on CPU with Python 3.11, 3.12, and
+3.14 against PyTorch nightly, and the wheel and sdist checks on every pull
+request. To also test a PyTorch branch, tag, or commit built from source, start
+the **CI** workflow manually with `pytorch_ref` set; the build takes hours. To
+run the lint and packaging checks locally:
+
+```bash
+python -m pip install build twine ruff==0.15.4
+ruff check .
+ruff format --check .
+python -m build
+python -m twine check --strict dist/*
+python .github/scripts/check_dist.py dist
+```
+
+The GPU job runs the suite and `examples/train_adamw.py` once a maintainer sets
+the repository variable `FLEX_SHARD_GPU_RUNNER` to the label of a Linux x86-64
+runner with at least two NVIDIA GPUs and a CUDA 13 compatible driver. Four GPUs
+are needed for the full suite and the example. The job runs on pushes to `main`
+and on pull requests from branches of this repository, but not from forks.
+
 Follow the surrounding Python style, use four spaces for indentation, and
 preserve copyright and license headers. Maintainers preserve GitHub formatting
 when importing changes and run the applicable internal build and test checks
