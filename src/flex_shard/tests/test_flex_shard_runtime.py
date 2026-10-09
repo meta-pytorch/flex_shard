@@ -6,11 +6,13 @@
 
 import copy
 import dataclasses
+import gc
 import warnings
 from unittest.mock import Mock, patch
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
@@ -126,6 +128,60 @@ class _SkipNet(nn.Module):
         if not self.skip:
             x = self.layers[1](x)
         return self.layers[2](x)
+
+
+class _ChunkedHeadNet(nn.Module):
+    """A layer, then a norm and an output projection; with ``skip_head``, the
+    forward returns the norm's output, as torchtitan's decoder does under its
+    chunked loss."""
+
+    def __init__(self, dim: int, vocab: int) -> None:
+        super().__init__()
+        self.layer = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, vocab, bias=False)
+        self.skip_head = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(self.layer(x))
+        return h if self.skip_head else self.head(h)
+
+
+def _chunked_loss_backward(
+    model: _ChunkedHeadNet,
+    x: torch.Tensor,
+    targets: torch.Tensor,
+    num_chunks: int,
+    head_storage=None,
+    after_chunk_backward=None,
+) -> None:
+    """torchtitan's ChunkedLossWrapper sequence: the head on each detached
+    chunk of the hidden states with a backward per chunk, then one backward
+    through the model. With ``head_storage``, the head's bucket stays
+    unsharded across the chunks and reduce-scatters at the last one."""
+    model.skip_head = True
+    hidden = model(x)
+    if head_storage is not None:
+        reshard_after_forward = head_storage.reshard_after_forward
+        reshard_after_backward = head_storage.reshard_after_backward
+        head_storage.set_reshard_after_forward(False)
+        head_storage.set_reshard_after_backward(False)
+        head_storage.set_requires_gradient_sync(False)
+        head_storage.unshard()
+    chunks = [chunk.detach().requires_grad_() for chunk in hidden.chunk(num_chunks)]
+    for idx, (chunk, target) in enumerate(
+        zip(chunks, targets.chunk(num_chunks), strict=True)
+    ):
+        if head_storage is not None and idx == num_chunks - 1:
+            head_storage.set_requires_gradient_sync(True)
+        F.cross_entropy(model.head(chunk), target, reduction="sum").backward()
+        if after_chunk_backward is not None:
+            after_chunk_backward(idx)
+    if head_storage is not None:
+        head_storage.set_reshard_after_forward(reshard_after_forward)
+        head_storage.set_reshard_after_backward(reshard_after_backward)
+        head_storage.reshard()
+    hidden.backward(torch.cat([chunk.grad for chunk in chunks]))
 
 
 class _TiedNet(nn.Module):
@@ -694,6 +750,127 @@ class TestFlexShardEagerRuntime(TestCase):
             output.register_hook(lambda grad: second.unshard())
             with self.assertRaisesRegex(RuntimeError, "cannot run in backward"):
                 output.sum().backward()
+
+    def test_chunked_head(self):
+        # torchtitan's chunked loss with the norm and the head in one bucket:
+        # the forward skips the head, so the root's post-forward completes the
+        # bucket, whose re-gather in the final backward serves the norm. Each
+        # call of the head on a detached (leaf) chunk triggers its own
+        # post-backward, keeping the head's grads until the last chunk's
+        # reduce-scatter. The chunk backwards, which re-gather nothing, leave
+        # the layer bucket to the final backward. Training matches an
+        # unsharded reference.
+        num_chunks = 3
+        for head_reshard_after_forward in (False, True):
+            with (
+                self.subTest(head_reshard_after_forward=head_reshard_after_forward),
+                single_rank_cuda_mesh() as mesh,
+            ):
+                torch.manual_seed(0)
+                model = _ChunkedHeadNet(8, 16)
+                reference = copy.deepcopy(model).cuda()
+                flex_shard(
+                    model,
+                    buckets=[
+                        _bucket(["layer"], mesh, reshard_after_forward=False),
+                        # As torchtitan's: params without a grad stay out of
+                        # the reduce-scatter.
+                        dataclasses.replace(
+                            _bucket(
+                                ["norm", "head"],
+                                mesh,
+                                reshard_after_forward=head_reshard_after_forward,
+                            ),
+                            fsdp2_compatible=True,
+                        ),
+                    ],
+                )
+                head_storage = model.bucket_storage_of(model.head.weight)
+                head_shard, norm_shard = model.head.weight, model.norm.weight
+                layer_bucket, head_bucket = _buckets(model)
+                optim = torch.optim.SGD(model.parameters(), lr=0.1)
+                ref_optim = torch.optim.SGD(reference.parameters(), lr=0.1)
+                for _ in range(2):
+                    optim.zero_grad()
+                    ref_optim.zero_grad()
+                    x = torch.randn(6, 8, device="cuda")
+                    targets = torch.randint(16, (6,), device="cuda")
+                    observed = []
+
+                    def after_chunk_backward(idx):
+                        observed.append(
+                            (
+                                layer_bucket.is_unsharded,
+                                head_bucket.is_unsharded,
+                                head_shard.grad is not None,
+                                norm_shard.grad is not None,
+                            )
+                        )
+
+                    _chunked_loss_backward(
+                        model,
+                        x,
+                        targets,
+                        num_chunks,
+                        head_storage,
+                        after_chunk_backward,
+                    )
+                    _chunked_loss_backward(reference, x, targets, num_chunks)
+                    # The layer stays gathered through the chunk backwards. The
+                    # head reduce-scatters its grads alone at the last chunk;
+                    # the norm's come with the final backward.
+                    self.assertEqual(
+                        observed,
+                        [(True, True, False, False)] * (num_chunks - 1)
+                        + [(True, False, True, False)],
+                    )
+                    self.assertFalse(layer_bucket.is_unsharded)
+                    self.assertFalse(head_bucket.is_unsharded)
+                    self.assertEqual(
+                        head_storage.reshard_after_forward, head_reshard_after_forward
+                    )
+                    for param, ref_param in zip(
+                        model.parameters(), reference.parameters(), strict=True
+                    ):
+                        torch.testing.assert_close(param.grad, ref_param.grad)
+                    optim.step()
+                    ref_optim.step()
+
+    def test_chunked_head_releases_hidden_states(self):
+        # The post-backward trigger on the head's leaf chunk inputs must not
+        # keep them, or the hidden states their storage is part of, alive
+        # after the step. torchtitan turns automatic garbage collection off,
+        # so a reference cycle through the trigger would keep one hidden state
+        # per step until the next collection.
+        with single_rank_cuda_mesh() as mesh:
+            torch.manual_seed(0)
+            model = _ChunkedHeadNet(64, 16)
+            flex_shard(
+                model,
+                buckets=[
+                    _bucket(["layer"], mesh, reshard_after_forward=True),
+                    dataclasses.replace(
+                        _bucket(["norm", "head"], mesh, reshard_after_forward=False),
+                        fsdp2_compatible=True,
+                    ),
+                ],
+            )
+            head_storage = model.bucket_storage_of(model.head.weight)
+            optim = torch.optim.SGD(model.parameters(), lr=0.1)
+            x = torch.randn(1024, 64, device="cuda")
+            targets = torch.randint(16, (1024,), device="cuda")
+            allocated = []
+            gc.collect()
+            gc.disable()
+            try:
+                for _ in range(3):
+                    _chunked_loss_backward(model, x, targets, 4, head_storage)
+                    optim.step()
+                    optim.zero_grad()
+                    allocated.append(torch.cuda.memory_allocated())
+            finally:
+                gc.enable()
+            self.assertEqual(allocated[1], allocated[2])
 
     def test_released_refill_frees_storage(self):
         # A prefetch that refills a bucket's persistent storage, which begin
