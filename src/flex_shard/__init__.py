@@ -22,6 +22,7 @@ from .flex_shard import (
     OffloadPolicy,
     Placement,
     PlacementFn,
+    register_optimizer_checkpoint_hook,
     set_global_layout,
     set_state_dict_global_layouts,
 )
@@ -45,6 +46,7 @@ __all__ = [
     "OffloadPolicy",
     "Placement",
     "PlacementFn",
+    "register_optimizer_checkpoint_hook",
     "set_global_layout",
     "set_state_dict_global_layouts",
 ]
