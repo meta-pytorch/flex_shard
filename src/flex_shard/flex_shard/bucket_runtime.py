@@ -424,15 +424,16 @@ class BucketCommContext:
             _post_backward_callback
         )
 
-    def finish_buckets(self) -> None:
+    def finish_buckets(self, *, last_first: bool = False) -> None:
         """Finish the buckets backwards left (see ``BucketRuntime.needs_finish``),
-        then reset the per-backward trigger counts.
+        then reset the per-backward trigger counts. ``last_first`` finishes them
+        from the last bucket to the first.
 
         A bucket that defers its post-backward must be finished before a
         syncing backward that ran its module's backward ends, since its late
         grads may not exist yet; outside backward (``finalize_backward``), they
         do."""
-        for bucket in self.buckets:
+        for bucket in reversed(self.buckets) if last_first else self.buckets:
             if bucket.needs_finish():
                 if (
                     bucket.bucket_storage._defer_post_backward
@@ -459,7 +460,10 @@ class BucketCommContext:
         if _in_backward():
             raise RuntimeError("FlexShard: finalize_backward() cannot run in backward.")
         self.check_no_raised_backward()
-        self.finish_buckets()
+        # Last bucket first, as FSDP2's finalize_backward goes in reverse module
+        # order, like backward: a block's routed experts reduce before its
+        # dense bucket, whose smaller buffers then reuse the memory they freed.
+        self.finish_buckets(last_first=True)
         self.take_pending_unshard(None)
 
     def check_no_raised_backward(self) -> None:

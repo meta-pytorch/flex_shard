@@ -861,6 +861,49 @@ class TestFlexShardTraining(FSDPTest):
                     )
 
     @skip_if_lt_x_gpu(2)
+    def test_finalize_backward_reduces_last_bucket_first(self):
+        # As FSDP2's finalize_backward, which a pipeline stage calls after its
+        # last backward, the reduce-scatters go in reverse bucket order, as
+        # backward runs. Then a block's dense bucket reuses the memory its
+        # routed experts, reduced first, freed.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        torch.manual_seed(0)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 8),
+            torch.nn.ReLU(),
+            torch.nn.Linear(8, 8),
+            torch.nn.ReLU(),
+            torch.nn.Linear(8, 6),
+        ).to(device_type)
+        flex_shard(
+            model,
+            buckets=[
+                BucketSpec(
+                    [pattern],
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    reshard_after_forward=False,
+                )
+                for pattern in ("0.*", "2.*", "4.*")
+            ],
+        )
+        model.set_manual_backward_finalization(True)
+        model.set_requires_gradient_sync(False)
+        model.set_reshard_after_backward(False)
+        model(torch.randn(4, 8, device=device_type)).sum().backward()
+        model.set_requires_gradient_sync(True)
+        reduced = []
+        begin_reduce_grad = bucket_runtime.begin_reduce_grad
+
+        def recording_begin(tensors, infos, *args, **kwargs):
+            reduced.append(infos[0].fqn.split(".")[0])
+            return begin_reduce_grad(tensors, infos, *args, **kwargs)
+
+        with mock.patch.object(bucket_runtime, "begin_reduce_grad", recording_begin):
+            model.finalize_backward()
+        self.assertEqual(reduced, ["4", "2", "0"])
+
+    @skip_if_lt_x_gpu(2)
     def test_defer_post_backward(self):
         # A weight grad computed after its layer's backward, as with
         # TransformerEngine's delay_wgrad_compute: the layer's bucket defers its
