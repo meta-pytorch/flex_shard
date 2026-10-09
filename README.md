@@ -319,7 +319,11 @@ Some schedules run a module's computation directly, bypassing the forward hooks
 that gather its bucket. One example is Megatron-LM's EP all-to-all overlap,
 which calls each layer's sub-modules. Like FSDP2, call `model.unshard()` first:
 it gathers every bucket and keeps it gathered until the end of a backward that
-re-gathers a bucket, or `finalize_backward()`, finishes it.
+re-gathers a bucket, or `finalize_backward()`, finishes it. With
+`async_op=True` it only starts the all-gathers and returns a handle, as FSDP2's
+does, so a multi-stage pipeline schedule can gather a stage while others
+compute: call the handle's `wait()` before using the parameters directly, or
+run the forward, which finishes its buckets' all-gathers.
 
 Like `fully_shard` on a list of modules, a bucket whose patterns name several
 modules handles forwards that skip some of them and calls of one of them on its
