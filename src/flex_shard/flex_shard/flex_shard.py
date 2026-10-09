@@ -377,7 +377,10 @@ def flex_shard(
     Parameters must be plain tensors. Parameters that are local shards of an
     outer (e.g. TP/EP) sharding declare their position in the full parameter
     with ``set_global_layout``; ``flex_shard.layout_adapters.dtensor_to_global_layout``
-    does this for DTensor parameters.
+    does this for DTensor parameters. A parameter whose grad each rank of a
+    group computes only in part declares the group with
+    ``set_partial_grad_group``, and its grad is summed over it before the
+    reduce-scatter.
 
     Returns:
         The module (mutated in-place). Use
