@@ -283,7 +283,11 @@ before each microbatch, as with FSDP2; there is no `no_sync()` context
 manager. Backwards without sync skip the reduce-scatter and keep full
 gradients on the unsharded parameters, accumulating in the bucket's
 `reduce_dtype` when it is wider, and the next syncing backward reduce-scatters
-them. `model.set_reshard_after_backward(False)` also keeps the parameters
+them. A bucket called more than once per forward, such as an output projection
+shared by multi-token prediction, reduce-scatters the kept gradients on their
+own when the syncing backward first reaches it, and the new ones in a second
+reduce-scatter, as FSDP2's post-backward per call does.
+`model.set_reshard_after_backward(False)` also keeps the parameters
 unsharded between those microbatches, so only the first one all-gathers when
 `reshard_after_forward=False`. Unlike FSDP2, a syncing backward always
 reshards, so the optimizer step never leaves stale unsharded parameters. Both
