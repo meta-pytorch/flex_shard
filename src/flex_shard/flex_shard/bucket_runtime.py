@@ -424,16 +424,23 @@ class BucketCommContext:
             _post_backward_callback
         )
 
-    def finish_buckets(self, *, last_first: bool = False) -> None:
+    def finish_buckets(self, *, reverse_module_order: bool = False) -> None:
         """Finish the buckets backwards left (see ``BucketRuntime.needs_finish``),
-        then reset the per-backward trigger counts. ``last_first`` finishes them
-        from the last bucket to the first.
+        then reset the per-backward trigger counts. ``reverse_module_order``
+        finishes them in reverse order of their modules in the root module, and
+        a module's buckets last first, as FSDP2's ``finalize_backward`` goes
+        through its states and their param groups.
 
         A bucket that defers its post-backward must be finished before a
         syncing backward that ran its module's backward ends, since its late
         grads may not exist yet; outside backward (``finalize_backward``), they
         do."""
-        for bucket in reversed(self.buckets) if last_first else self.buckets:
+        buckets = (
+            reversed(sorted(self.buckets, key=lambda bucket: bucket.module_position))
+            if reverse_module_order
+            else self.buckets
+        )
+        for bucket in buckets:
             if bucket.needs_finish():
                 if (
                     bucket.bucket_storage._defer_post_backward
@@ -460,10 +467,10 @@ class BucketCommContext:
         if _in_backward():
             raise RuntimeError("FlexShard: finalize_backward() cannot run in backward.")
         self.check_no_raised_backward()
-        # Last bucket first, as FSDP2's finalize_backward goes in reverse module
-        # order, like backward: a block's routed experts reduce before its
-        # dense bucket, whose smaller buffers then reuse the memory they freed.
-        self.finish_buckets(last_first=True)
+        # In reverse module order, as FSDP2's finalize_backward, like backward:
+        # a block's routed experts reduce before its dense bucket, whose smaller
+        # buffers then reuse the memory they freed.
+        self.finish_buckets(reverse_module_order=True)
         self.take_pending_unshard(None)
 
     def check_no_raised_backward(self) -> None:
@@ -592,6 +599,9 @@ class BucketRuntime:
     # ones whose forward the current pass still awaits, and its open forward
     # call, if any (see GroupForwardPass).
     group_modules: tuple[nn.Module, ...] = field(default=(), repr=False)
+    # Position of its first hooked module in the root module's modules(), as
+    # FSDP2 orders its states (see EagerCommContext.finish_buckets).
+    module_position: int = 0
     modules_to_run: set[nn.Module] = field(default_factory=set, repr=False)
     group_pass: GroupForwardPass | None = None
     # Whether a backward without gradient sync finished this bucket since its
@@ -1650,6 +1660,10 @@ def _install_bucket_unshard_hooks(
     state-dict hooks that reshard first, as FSDP2 does."""
     owner_buckets: dict[nn.Module, dict[int, BucketRuntime]] = {}
     group_buckets: list[BucketRuntime] = []
+    module_positions = {
+        module: position
+        for position, module in enumerate(bucket_storages[0]._module.modules())
+    }
     for bucket_storage in bucket_storages:
         if not bucket_storage._param_infos:
             raise AssertionError("Expected FlexShard bucket storage to own parameters.")
@@ -1666,6 +1680,7 @@ def _install_bucket_unshard_hooks(
             if bucket_storage._hook_module_fqns
             else [bucket_runtime.forward_hook_module()]
         )
+        bucket_runtime.module_position = min(module_positions[m] for m in modules)
         if len(modules) == 1:
             pre_hook = bucket_runtime.pre_forward_hook
             post_hook = bucket_runtime.post_forward_hook

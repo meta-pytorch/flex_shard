@@ -861,30 +861,32 @@ class TestFlexShardTraining(FSDPTest):
                     )
 
     @skip_if_lt_x_gpu(2)
-    def test_finalize_backward_reduces_last_bucket_first(self):
+    def test_finalize_backward_reduces_in_reverse_module_order(self):
         # As FSDP2's finalize_backward, which a pipeline stage calls after its
-        # last backward, the reduce-scatters go in reverse bucket order, as
-        # backward runs. Then a block's dense bucket reuses the memory its
-        # routed experts, reduced first, freed.
+        # last backward, the reduce-scatters go in reverse module order, as
+        # backward runs, whatever order the buckets were given in. Then a
+        # block's dense bucket reuses the memory its routed experts, reduced
+        # first, freed. As in torchtitan, the norm and output projection's
+        # bucket comes first.
         mesh = init_device_mesh(device_type.type, (self.world_size,))
         torch.manual_seed(0)
         model = torch.nn.Sequential(
             torch.nn.Linear(8, 8),
             torch.nn.ReLU(),
             torch.nn.Linear(8, 8),
-            torch.nn.ReLU(),
+            torch.nn.LayerNorm(8),
             torch.nn.Linear(8, 6),
         ).to(device_type)
         flex_shard(
             model,
             buckets=[
                 BucketSpec(
-                    [pattern],
+                    modules,
                     placement_fn=per_param_placements,
                     mesh=mesh,
                     reshard_after_forward=False,
                 )
-                for pattern in ("0.*", "2.*", "4.*")
+                for modules in (["3", "4"], ["0"], ["2"])
             ],
         )
         model.set_manual_backward_finalization(True)
@@ -901,7 +903,7 @@ class TestFlexShardTraining(FSDPTest):
 
         with mock.patch.object(bucket_runtime, "begin_reduce_grad", recording_begin):
             model.finalize_backward()
-        self.assertEqual(reduced, ["4", "2", "0"])
+        self.assertEqual(reduced, ["3", "2", "0"])
 
     @skip_if_lt_x_gpu(2)
     def test_defer_post_backward(self):
