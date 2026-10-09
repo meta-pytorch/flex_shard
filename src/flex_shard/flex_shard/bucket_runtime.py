@@ -14,6 +14,7 @@ from types import ModuleType
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import _get_device_handle
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
@@ -911,7 +912,10 @@ class BucketRuntime:
         AccumulateGrad adds them in place to a wider kept grad. That saves a
         cast kernel per param and the wider unsharded grads until the copy-in.
         Restoring upcasts a new grad that is not reduced, once, after the
-        bucket reshards, so the accumulation across backwards stays wider.
+        bucket reshards, so the accumulation across backwards stays wider. As
+        FSDP2 does for grads it reduces outside data parallelism, a param with
+        a partial-grad group keeps autograd's upcast, so its all-reduce runs in
+        the wider dtype too.
         """
         for bucket_param, param in zip(
             self.bucket_params, self.unsharded_params or [], strict=False
@@ -925,6 +929,7 @@ class BucketRuntime:
                 or not dtype.is_floating_point
                 or not compute_dtype.is_floating_point
                 or dtype.itemsize <= compute_dtype.itemsize
+                or info.partial_grad_group is not None
             ):
                 continue
             if defer_upcast:
@@ -1049,6 +1054,12 @@ class BucketRuntime:
             else grad
             for grad, param in zip(grads, params, strict=True)
         ]
+        # In the grad's dtype, which keeps autograd's upcast for these params,
+        # before the copy-in casts to the reduce dtype, as FSDP2 redistributes a
+        # Partial grad when it takes it.
+        for grad, info in zip(grads, infos, strict=True):
+            if info.partial_grad_group is not None:
+                dist.all_reduce(grad, group=info.partial_grad_group)
         # After the zeros, which take the forward dtype while the upcast is
         # deferred. The grads are already taken, so this only resets grad_dtype.
         self._set_unsharded_grad_dtypes(defer_upcast=False)
