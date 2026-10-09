@@ -187,19 +187,21 @@ class FlexShardModule:
         it outside backward and after waiting on any
         ``finalize_backward`` handle. Eager only.
 
-        With ``async_op=True``, it starts the all-gathers and returns a handle
-        without waiting, as FSDP2 does; call its ``wait()`` before using the
-        unsharded params directly. A forward finishes its buckets' all-gathers
-        without it.
+        As FSDP2's, the all-gathers run on the current stream, with their
+        buffers from its memory pool. With ``async_op=True``, the collectives
+        are asynchronous and it returns a handle without waiting, so the current
+        stream runs other work in between; call the handle's ``wait()`` before
+        using the unsharded params directly. A forward finishes its buckets'
+        all-gathers without it.
         """
         started = []
         for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
             context.check_outside_backward("unshard")
             for bucket in context.buckets:
                 if not async_op or bucket.is_unsharded:
-                    bucket.unshard()
+                    bucket.unshard(on_current_stream=True)
                 else:
-                    context.prefetch(bucket, explicit=True)
+                    context.prefetch(bucket, explicit=True, on_current_stream=True)
                     started.append((context, bucket))
         return ModuleUnshardHandle(started) if async_op else None
 
