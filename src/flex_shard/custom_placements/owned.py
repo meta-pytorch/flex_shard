@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from typing import Literal, TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from typing_extensions import override
 
@@ -338,8 +339,10 @@ class BucketedOwned(Placement):
         )
 
     @override
-    def run_prepared_unshard(self, prepared: PlacementPreparedUnshard) -> None:
-        self._mixed_member().run_prepared_unshard(prepared)
+    def run_prepared_unshard(
+        self, prepared: PlacementPreparedUnshard, *, async_op: bool = False
+    ) -> dist.Work | None:
+        return self._mixed_member().run_prepared_unshard(prepared, async_op=async_op)
 
     @override
     def finish_prepared_unshard(

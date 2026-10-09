@@ -22,6 +22,7 @@ from torch.utils._pytree import tree_leaves, tree_map_only
 from torch.utils.hooks import RemovableHandle
 
 from .bucket_comm import (
+    begin_explicit_bucket_unshard,
     begin_bucket_unshard,
     begin_reduce_grad,
     ReduceGradHandle,
@@ -294,9 +295,17 @@ class BucketCommContext:
                 return candidate
         return None
 
-    def prefetch(self, bucket: BucketRuntime | None, *, explicit: bool = False) -> None:
+    def prefetch(
+        self,
+        bucket: BucketRuntime | None,
+        *,
+        explicit: bool = False,
+        on_current_stream: bool = False,
+    ) -> None:
         """Start ``bucket``'s unshard ahead of its hook. Learned-order prefetches
-        run one at a time, explicit ones as many as the lists name."""
+        run one at a time, explicit ones as many as the lists name. With
+        ``on_current_stream``, for ``FlexShardModule.unshard(async_op=True)``,
+        the all-gather runs asynchronously on the current stream."""
         if (
             bucket is None
             or bucket.is_unsharded
@@ -308,7 +317,13 @@ class BucketCommContext:
         ):
             return
         self.pending_unshards.append(
-            PendingUnshard(bucket, bucket.begin_unshard(), explicit)
+            PendingUnshard(
+                bucket,
+                bucket.begin_unshard(
+                    on_current_stream=on_current_stream, async_op=on_current_stream
+                ),
+                explicit,
+            )
         )
 
     def bucket_runtime(self, bucket_storage: ShardedBucketStorage) -> BucketRuntime:
@@ -691,8 +706,14 @@ class BucketRuntime:
     def begin_unshard(
         self,
         local_shards: list[torch.Tensor] | None = None,
+        *,
+        on_current_stream: bool = False,
+        async_op: bool = False,
     ) -> UnshardHandle:
-        """Begin this bucket's unshard on the shared stream.
+        """Begin this bucket's unshard on the shared stream, or, with
+        ``on_current_stream``, for ``FlexShardModule.unshard()``, on the current
+        stream, asynchronously with ``async_op``, as FSDP2's
+        ``FSDPModule.unshard()`` does (``begin_explicit_bucket_unshard``).
 
         A refill re-allocates the persistent storage on the current stream (the
         one that frees it on reshard), and the placement writes the new values
@@ -709,6 +730,15 @@ class BucketRuntime:
             if not self.infos[0].placement.refills_persistent_buffers_in_finish:
                 self._alloc_persistent_storage()
             persistent_buffers = self.persistent_buffers
+        if on_current_stream:
+            return begin_explicit_bucket_unshard(
+                local_shards,
+                self.infos,
+                self.bucket_storage._mesh,
+                async_op=async_op,
+                debug_fqn=self.debug_fqn,
+                persistent_buffers=persistent_buffers,
+            )
         return begin_bucket_unshard(
             local_shards,
             self.infos,
@@ -757,12 +787,17 @@ class BucketRuntime:
     # Eager: persistent unsharded parameters
     # ------------------------------------------------------------------
 
-    def unshard(self) -> None:
-        """Make the unsharded params hold data and swap them into the modules."""
+    def unshard(self, *, on_current_stream: bool = False) -> None:
+        """Make the unsharded params hold data and swap them into the modules.
+
+        Without a pending unshard to finish, it all-gathers on the shared
+        stream, or, with ``on_current_stream``, for ``FlexShardModule.unshard()``,
+        synchronously on the current stream.
+        """
         if not self.is_unsharded:
             result = self.context.take_pending_unshard(self)
             if result is None:
-                result = self.begin_unshard()
+                result = self.begin_unshard(on_current_stream=on_current_stream)
             self.finish_unshard(result)
         self._swap_in_params(self.unsharded_params)
 

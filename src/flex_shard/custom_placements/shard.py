@@ -333,7 +333,9 @@ class Shard(Placement):
         )
 
     @override
-    def run_prepared_unshard(self, prepared: PlacementPreparedUnshard) -> None:
+    def run_prepared_unshard(
+        self, prepared: PlacementPreparedUnshard, *, async_op: bool = False
+    ) -> dist.Work | None:
         """Launch the prepared bucket all-gather."""
         if not isinstance(prepared.placement_state, Shard._UnshardState):
             raise AssertionError(
@@ -345,10 +347,11 @@ class Shard(Placement):
             "FlexShard::all_gather",
             prepared.placement_state.debug_fqn,
         ):
-            dist.all_gather_single(
+            return dist.all_gather_single(
                 prepared.buffers[1],
                 send_buf,
                 group=prepared.placement_state.pg,
+                async_op=async_op,
             )
 
     @override
