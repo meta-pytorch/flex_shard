@@ -920,7 +920,71 @@ class TestFlexShardTraining(FSDPTest):
         # into two calls, so backward finalization is manual: the buckets keep
         # their grads until finalize_backward after the last microbatch. Two
         # steps, so the second unshard gathers the updated shards, which its
-        # outputs check.
+        # outputs check. With async_op, the schedule waits on the unshard's
+        # handle before it uses the params.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        for async_op in (False, True):
+            with self.subTest(async_op=async_op):
+                torch.manual_seed(0)
+                model = torch.nn.Sequential(
+                    torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 6)
+                ).to(device_type)
+                reference = copy.deepcopy(model)
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            ["0.*"],
+                            placement_fn=make_bucketed_block_placement_fn(
+                                dims=(0,), blocks_per_rank=(1,) * self.world_size
+                            ),
+                            mesh=mesh,
+                            reshard_after_forward=False,
+                        ),
+                        BucketSpec(
+                            ["2.*"],
+                            placement_fn=per_param_placements,
+                            mesh=mesh,
+                            reshard_after_forward=False,
+                        ),
+                    ],
+                )
+                model.set_manual_backward_finalization(True)
+                optimizer = make_test_sgd(model.parameters(), lr=0.1)
+                reference_optimizer = make_test_sgd(reference.parameters(), lr=0.1)
+                torch.manual_seed(1 + self.rank)
+                for _ in range(2):
+                    optimizer.zero_grad(set_to_none=True)
+                    reference_optimizer.zero_grad(set_to_none=True)
+                    handle = model.unshard(async_op=async_op)
+                    if async_op:
+                        handle.wait()
+                    for microbatch in range(2):
+                        model.set_requires_gradient_sync(microbatch == 1)
+                        x = torch.randn(4, 8, device=device_type)
+                        # The first layer's forward hooks never run.
+                        hidden = torch.relu(
+                            torch.nn.functional.linear(
+                                x, model[0].weight, model[0].bias
+                            )
+                        )
+                        detached = hidden.detach().requires_grad_()
+                        output = model[2](detached)
+                        reference_output = reference(x)
+                        self.assertEqual(output, reference_output)
+                        output.sum().backward()
+                        hidden.backward(detached.grad)
+                        reference_output.sum().backward()
+                    model.finalize_backward()
+                    _average_reference_grads(reference)
+                    optimizer.step()
+                    reference_optimizer.step()
+
+    @skip_if_lt_x_gpu(2)
+    def test_unshard_async_op_finished_by_forward(self):
+        # A pipeline schedule unshards a stage ahead of its forward with
+        # async_op=True. The forward finishes each bucket's pending all-gather
+        # in its pre-forward hook, so the handle's wait() is left with nothing.
         mesh = init_device_mesh(device_type.type, (self.world_size,))
         torch.manual_seed(0)
         model = torch.nn.Sequential(
@@ -931,47 +995,23 @@ class TestFlexShardTraining(FSDPTest):
             model,
             buckets=[
                 BucketSpec(
-                    ["0.*"],
-                    placement_fn=make_bucketed_block_placement_fn(
-                        dims=(0,), blocks_per_rank=(1,) * self.world_size
-                    ),
-                    mesh=mesh,
-                    reshard_after_forward=False,
-                ),
-                BucketSpec(
-                    ["2.*"],
+                    [pattern],
                     placement_fn=per_param_placements,
                     mesh=mesh,
                     reshard_after_forward=False,
-                ),
+                )
+                for pattern in ("0.*", "2.*")
             ],
         )
-        model.set_manual_backward_finalization(True)
-        optimizer = make_test_sgd(model.parameters(), lr=0.1)
-        reference_optimizer = make_test_sgd(reference.parameters(), lr=0.1)
-        torch.manual_seed(1 + self.rank)
-        for _ in range(2):
-            optimizer.zero_grad(set_to_none=True)
-            reference_optimizer.zero_grad(set_to_none=True)
-            model.unshard()
-            for microbatch in range(2):
-                model.set_requires_gradient_sync(microbatch == 1)
-                x = torch.randn(4, 8, device=device_type)
-                # The first layer's forward hooks never run.
-                hidden = torch.relu(
-                    torch.nn.functional.linear(x, model[0].weight, model[0].bias)
-                )
-                detached = hidden.detach().requires_grad_()
-                output = model[2](detached)
-                reference_output = reference(x)
-                self.assertEqual(output, reference_output)
-                output.sum().backward()
-                hidden.backward(detached.grad)
-                reference_output.sum().backward()
-            model.finalize_backward()
-            _average_reference_grads(reference)
-            optimizer.step()
-            reference_optimizer.step()
+        (context,) = getattr(model, bucket_runtime._EAGER_COMM_CONTEXTS_ATTR).values()
+        handle = model.unshard(async_op=True)
+        self.assertEqual(len(context.pending_unshards), 2)
+        self.assertFalse(any(bucket.is_unsharded for bucket in context.buckets))
+        x = torch.randn(4, 8, device=device_type)
+        self.assertEqual(model(x), reference(x))
+        self.assertEqual(context.pending_unshards, [])
+        handle.wait()
+        self.assertTrue(all(bucket.is_unsharded for bucket in context.buckets))
 
     @skip_if_lt_x_gpu(2)
     def test_gradient_accumulation(self):
