@@ -19,6 +19,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import _get_device_handle
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 from torch.utils._pytree import tree_leaves, tree_map_only
+from torch.utils.hooks import RemovableHandle
 
 from .bucket_comm import (
     begin_bucket_unshard,
@@ -1240,15 +1241,23 @@ class BucketRuntime:
         computed. Return the args and kwargs to call the module with, and
         whether the trigger exists.
 
-        A multi-grad hook on the inputs does what FSDP2's
-        ``RegisterPostBackwardFunction`` does without wrapping them. A hook on
-        a leaf input, e.g. a detached chunk of hidden states, would outlive
-        this graph, and one on a view of it would form a reference cycle that
-        keeps the leaf, and the storage it views, alive until the next garbage
-        collection. Inputs that include a leaf are therefore wrapped in an
-        identity autograd function whose backward runs the trigger, as FSDP2
-        wraps all inputs. Forwards without grad-requiring inputs, or with leaf
-        ones inside dataclasses, get no trigger.
+        The inputs are wrapped in an identity autograd function whose backward
+        runs the trigger, as FSDP2's ``RegisterPostBackwardFunction`` wraps
+        them. A multi-grad hook instead holds every input's ``grad_fn`` and is
+        held by them, so it can keep the forward's graph alive after backward:
+        - a hook on a leaf input, e.g. a detached chunk of hidden states,
+          outlives the graph, and one on a view of it forms a reference cycle
+          until the next garbage collection;
+        - when one input is computed from another, e.g. an MoE's routing
+          scores from its hidden states, the cycle runs through the autograd
+          edge between them, which garbage collection can't see. The graph,
+          and the leaf it starts from, e.g. a pipeline stage's received
+          activation, then stay alive for good.
+
+        Inputs that ``tree_map`` can't replace, inside dataclasses, get a
+        multi-grad hook only if none is a leaf, and it's removed once it runs.
+        Forwards without grad-requiring inputs, or with leaf ones inside
+        dataclasses, get no trigger.
         """
         if not torch.is_grad_enabled():
             return args, kwargs, False
@@ -1261,13 +1270,6 @@ class BucketRuntime:
         )
         if not inputs:
             return args, kwargs, False
-        if all(tensor.grad_fn is not None for tensor in inputs):
-            # A hook creates no tensors for spmd_types' checker to type.
-            with dist._spmd_no_typecheck():
-                torch.autograd.graph.register_multi_grad_hook(
-                    inputs, lambda grads: self._input_grads_ready(forward_pass)
-                )
-            return args, kwargs, True
         # Only the inputs tree_map reaches can be replaced by the wrapped ones.
         reachable = {
             id(leaf)
@@ -1275,7 +1277,23 @@ class BucketRuntime:
             if isinstance(leaf, torch.Tensor)
         }
         if any(id(tensor) not in reachable for tensor in inputs):
-            return args, kwargs, False
+            if any(tensor.grad_fn is None for tensor in inputs):
+                return args, kwargs, False
+            handles: list[RemovableHandle] = []
+
+            def on_input_grads(grads: Any) -> None:
+                for handle in handles:
+                    handle.remove()
+                self._input_grads_ready(forward_pass)
+
+            # A hook creates no tensors for spmd_types' checker to type.
+            with dist._spmd_no_typecheck():
+                handles.append(
+                    torch.autograd.graph.register_multi_grad_hook(
+                        inputs, on_input_grads
+                    )
+                )
+            return args, kwargs, True
         outputs = _InputGradsTrigger.apply(
             functools.partial(self._input_grads_ready, forward_pass), *inputs
         )
