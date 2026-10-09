@@ -32,7 +32,7 @@ from ..flex_shard.utils import (
     _record_copy_out_if_eager,
     _record_function_if_eager,
 )
-from .utils import copy_tensor_to_dtype, reduce_scatter_grads
+from .utils import foreach_copy_, reduce_scatter_grads
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -53,6 +53,10 @@ class Shard(Placement):
     pytorch/pytorch#197204 and ``fsdp::chunk_cat_mixed_dtype`` with
     ``num_leading_dims`` from pytorch/pytorch#200179.
     """
+
+    # Finish copies the gathered values into a refill's persistent buffers;
+    # run gathers into a separate buffer.
+    refills_persistent_buffers_in_finish = True
 
     @dataclass(frozen=True)
     class _ReduceGradLayout:
@@ -299,17 +303,22 @@ class Shard(Placement):
 
         with _record_copy_in_if_eager():
             padded_layout = self._padded_unshard_layout(infos)
-            send_buf = self._get_padded_bucket_storage_view(
+            local_storage = self._get_padded_bucket_storage_view(
                 tensors,
                 infos,
                 padded_layout,
             )
-            send_buf = copy_tensor_to_dtype(send_buf, dtype)
-            gather_buf = torch.empty(
-                ws * send_buf.numel(),
-                dtype=dtype,
-                device=device,
-            )
+            numel = local_storage.numel()
+            gather_buf = torch.empty(ws * numel, dtype=dtype, device=device)
+            if local_storage.dtype == dtype:
+                send_buf = local_storage
+            else:
+                # Cast straight into this rank's chunk of the gather buffer and
+                # all-gather in place, as FSDP2's copy-in does, rather than
+                # into a send buffer that would live until finish.
+                send_buf = gather_buf.narrow(0, mesh.get_local_rank() * numel, numel)
+                if numel > 0:
+                    foreach_copy_([send_buf], [local_storage])
 
         return PlacementPreparedUnshard(
             placement=self,
