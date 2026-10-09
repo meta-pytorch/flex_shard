@@ -375,14 +375,15 @@ class BucketCommContext:
         self.post_backward_callback_queued = True
 
         def _post_backward_callback() -> None:
-            finish = self.finish_at_backward_end
-            if finish:
-                self.finish_buckets()
-            self.wait_and_clear_reduce_grad_states(debug_fqn=None)
-            if finish:
-                self.take_pending_unshard(None)
-            self.finish_at_backward_end = False
-            self.post_backward_callback_queued = False
+            with dist._spmd_no_typecheck():
+                finish = self.finish_at_backward_end
+                if finish:
+                    self.finish_buckets()
+                self.wait_and_clear_reduce_grad_states(debug_fqn=None)
+                if finish:
+                    self.take_pending_unshard(None)
+                self.finish_at_backward_end = False
+                self.post_backward_callback_queued = False
 
         torch.autograd.Variable._execution_engine.queue_callback(
             _post_backward_callback
@@ -880,12 +881,13 @@ class BucketRuntime:
         post-backward trigger (a hook on that same output) frees its params
         before this re-gather, as FSDP2's ordering does.
         """
-        self.context.queue_post_backward_callback(finish=True)
-        self.unshard()
-        self._set_unsharded_grad_dtypes(defer_upcast=True)
-        if self.bucket_storage._pre_backward_hook is not None:
-            self.bucket_storage._pre_backward_hook(self._named_unsharded_params())
-        self._prefetch(forward=False)
+        with dist._spmd_no_typecheck():
+            self.context.queue_post_backward_callback(finish=True)
+            self.unshard()
+            self._set_unsharded_grad_dtypes(defer_upcast=True)
+            if self.bucket_storage._pre_backward_hook is not None:
+                self.bucket_storage._pre_backward_hook(self._named_unsharded_params())
+            self._prefetch(forward=False)
 
     def _prefetch(self, *, forward: bool) -> None:
         """Prefetch this bucket's explicit list, if it has one, else the next
@@ -1003,6 +1005,10 @@ class BucketRuntime:
         ``reshard_after_backward`` is set. A syncing backward always reshards,
         since the optimizer step then changes the local shards.
         """
+        with dist._spmd_no_typecheck():
+            self._post_backward()
+
+    def _post_backward(self) -> None:
         if not self.bucket_storage._requires_gradient_sync:
             self.needs_sync = True
             if self.is_unsharded and self.bucket_storage._reshard_after_backward:
@@ -1095,16 +1101,20 @@ class BucketRuntime:
         if torch.compiler.is_compiling():
             self._pre_forward_compile()
             return None
-        if _in_backward():
-            self.call_has_trigger.append(False)
-            self._unshard_for_recompute()
-            return None
-        self._check_forward_allowed()
-        if self.forward_index is None:
-            self.forward_index = len(self.context.forward_order)
-            self.context.forward_order.append(self)
-        self.unshard()
-        self._prefetch(forward=True)
+        # As FSDP2's pre-forward, the unshard runs outside spmd_types' type
+        # checker, since FlexShard's buffers carry no SPMD types; the trigger
+        # wraps the typed inputs, so it stays checked.
+        with dist._spmd_no_typecheck():
+            if _in_backward():
+                self.call_has_trigger.append(False)
+                self._unshard_for_recompute()
+                return None
+            self._check_forward_allowed()
+            if self.forward_index is None:
+                self.forward_index = len(self.context.forward_order)
+                self.context.forward_order.append(self)
+            self.unshard()
+            self._prefetch(forward=True)
         args, kwargs, has_trigger = self._register_input_grad_hook(args, kwargs)
         self.call_has_trigger.append(has_trigger)
         return args, kwargs
@@ -1123,20 +1133,21 @@ class BucketRuntime:
         if torch.compiler.is_compiling():
             self._pre_forward_compile()
             return None
-        if _in_backward():
-            self._unshard_for_recompute()
-            return None
-        self._check_forward_allowed()
-        if not self.modules_to_run:
-            self.modules_to_run.update(self.group_modules)
-        opens_pass = self.group_pass is None
-        if opens_pass and self.forward_index is None:
-            self.forward_index = len(self.context.forward_order)
-            self.context.forward_order.append(self)
-        self.unshard()
-        if not opens_pass:
-            return None
-        self._prefetch(forward=True)
+        with dist._spmd_no_typecheck():
+            if _in_backward():
+                self._unshard_for_recompute()
+                return None
+            self._check_forward_allowed()
+            if not self.modules_to_run:
+                self.modules_to_run.update(self.group_modules)
+            opens_pass = self.group_pass is None
+            if opens_pass and self.forward_index is None:
+                self.forward_index = len(self.context.forward_order)
+                self.context.forward_order.append(self)
+            self.unshard()
+            if not opens_pass:
+                return None
+            self._prefetch(forward=True)
         forward_pass = GroupForwardPass()
         args, kwargs, forward_pass.has_trigger = self._register_input_grad_hook(
             args, kwargs, forward_pass
@@ -1196,9 +1207,11 @@ class BucketRuntime:
         if not inputs:
             return args, kwargs, False
         if all(tensor.grad_fn is not None for tensor in inputs):
-            torch.autograd.graph.register_multi_grad_hook(
-                inputs, lambda grads: self._input_grads_ready(forward_pass)
-            )
+            # A hook creates no tensors for spmd_types' checker to type.
+            with dist._spmd_no_typecheck():
+                torch.autograd.graph.register_multi_grad_hook(
+                    inputs, lambda grads: self._input_grads_ready(forward_pass)
+                )
             return args, kwargs, True
         # Only the inputs tree_map reaches can be replaced by the wrapped ones.
         reachable = {
@@ -1234,7 +1247,8 @@ class BucketRuntime:
             # Activation-checkpoint recompute inside backward: this bucket's
             # backward still needs the params; post-backward reshards.
             return
-        self._post_forward(output, has_trigger)
+        with dist._spmd_no_typecheck():
+            self._post_forward(output, has_trigger)
 
     def group_post_forward_hook(self, mod: nn.Module, args: Any, output: Any) -> None:
         """Post-forward hook of each module of a bucket that hooks several: the
@@ -1248,7 +1262,8 @@ class BucketRuntime:
             return
         self.modules_to_run.discard(mod)
         if not self.modules_to_run:
-            self.complete_group_pass(output)
+            with dist._spmd_no_typecheck():
+                self.complete_group_pass(output)
 
     def complete_group_pass(self, output: Any) -> None:
         """Run the group's post-forward on ``output`` for its open forward
@@ -1355,6 +1370,14 @@ class _InputGradsTrigger(torch.autograd.Function):
     def backward(ctx: Any, *grads: torch.Tensor) -> tuple[Any, ...]:
         ctx.callback()
         return (None, *grads)
+
+
+if dist._is_spmd_types_available():
+    import spmd_types
+
+    # It runs on typed inputs under spmd_types' checker, as FSDP2 registers its
+    # RegisterPostBackwardFunction.
+    spmd_types.register_local_autograd_function(_InputGradsTrigger)
 
 
 class _BucketUnshard(torch.autograd.Function):
@@ -1569,9 +1592,10 @@ def _complete_group_passes(
     completes such groups."""
     if torch.compiler.is_compiling() or _in_backward():
         return
-    for bucket in buckets:
-        if bucket.group_pass is not None:
-            bucket.complete_group_pass(output)
+    with dist._spmd_no_typecheck():
+        for bucket in buckets:
+            if bucket.group_pass is not None:
+                bucket.complete_group_pass(output)
 
 
 def _unwrap_checkpoint(module: nn.Module) -> nn.Module:
