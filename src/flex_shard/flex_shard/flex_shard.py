@@ -40,6 +40,7 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
+    from .bucket_runtime import BucketRuntime
     from .placement_contract import Placement
 
 
@@ -183,14 +184,8 @@ class FlexShardModule:
         it outside backward and after waiting on any
         ``finalize_backward`` handle. Eager only.
         """
-        if _in_backward():
-            raise RuntimeError("FlexShard: unshard() cannot run in backward.")
         for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
-            context.check_no_raised_backward()
-            if context.pending_finalization is not None:
-                raise RuntimeError(
-                    "FlexShard: wait on the finalize_backward() handle before unshard()."
-                )
+            context.check_outside_backward("unshard")
             for bucket in context.buckets:
                 bucket.unshard()
 
@@ -207,21 +202,30 @@ class FlexShardModule:
         bucket is unsharded, the unsharded param. Calls after the bucket is
         finished do nothing, so a hook per param may call it. Eager only.
         """
+        bucket = self._bucket_holding(param)
+        if not bucket.bucket_storage._defer_post_backward:
+            raise ValueError(
+                f"FlexShard: bucket {bucket.debug_fqn} does not defer its "
+                "post-backward (BucketSpec.defer_post_backward)."
+            )
+        if bucket.needs_finish():
+            bucket.post_backward()
+
+    def bucket_storage_of(self, param: nn.Parameter) -> ShardedBucketStorage:
+        """The bucket storage that holds ``param``, the local shard or, while
+        its bucket is unsharded, the unsharded param. It takes per-bucket
+        calls, e.g. ``unshard()``, like the ``fully_shard`` group of an FSDP2
+        module."""
+        return self._bucket_holding(param).bucket_storage
+
+    def _bucket_holding(self, param: nn.Parameter) -> BucketRuntime:
         for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
             for bucket in context.buckets:
-                if not any(
+                if any(
                     p is param
                     for p in (*bucket.sharded_params, *(bucket.unsharded_params or ()))
                 ):
-                    continue
-                if not bucket.bucket_storage._defer_post_backward:
-                    raise ValueError(
-                        f"FlexShard: bucket {bucket.debug_fqn} does not defer its "
-                        "post-backward (BucketSpec.defer_post_backward)."
-                    )
-                if bucket.needs_finish():
-                    bucket.post_backward()
-                return
+                    return bucket
         raise ValueError("FlexShard: param is not in this module's buckets.")
 
     def _bucket_storages(self, recurse: bool) -> list[ShardedBucketStorage]:
