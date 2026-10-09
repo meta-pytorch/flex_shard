@@ -1013,6 +1013,91 @@ class TestFlexShardTraining(FSDPTest):
         handle.wait()
         self.assertTrue(all(bucket.is_unsharded for bucket in context.buckets))
 
+    def _two_bucket_mlp(self, mesh) -> torch.nn.Module:
+        torch.manual_seed(0)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 6)
+        ).to(device_type)
+        flex_shard(
+            model,
+            buckets=[
+                BucketSpec(
+                    [pattern],
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    reshard_after_forward=False,
+                )
+                for pattern in ("0.*", "2.*")
+            ],
+        )
+        return model
+
+    @skip_if_lt_x_gpu(2)
+    def test_unshard_all_gathers_on_current_stream(self):
+        # As FSDP2's FSDPModule.unshard: the all-gathers run on the caller's
+        # stream, asynchronously with async_op=True, and the handle's wait()
+        # waits on their work.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        original = dist.all_gather_single
+        for async_op in (False, True):
+            with self.subTest(async_op=async_op):
+                model = self._two_bucket_mlp(mesh)
+                calls = []
+                waits = []
+
+                class RecordingWork:
+                    def __init__(self, work) -> None:
+                        self.work = work
+
+                    def wait(self, *wait_args, **wait_kwargs):
+                        waits.append(True)
+                        return self.work.wait(*wait_args, **wait_kwargs)
+
+                def record(*args, **kwargs):
+                    calls.append(
+                        (torch.cuda.current_stream(), kwargs.get("async_op", False))
+                    )
+                    work = original(*args, **kwargs)
+                    return None if work is None else RecordingWork(work)
+
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with (
+                    mock.patch.object(dist, "all_gather_single", record),
+                    torch.cuda.stream(stream),
+                ):
+                    handle = model.unshard(async_op=async_op)
+                    self.assertEqual(len(waits), 0)
+                    if async_op:
+                        handle.wait()
+                self.assertEqual(calls, [(stream, async_op)] * 2)
+                self.assertEqual(len(waits), 2 if async_op else 0)
+                torch.cuda.current_stream().wait_stream(stream)
+
+    @skip_if_lt_x_gpu(2)
+    def test_unshard_leaves_no_memory_on_flex_shard_stream(self):
+        # A pipeline schedule unshards each stage with async_op=True. As in
+        # FSDP2, the all-gather buffers belong to the current stream, so after
+        # the copy-out its pool reuses them, rather than FlexShard's unshard
+        # stream keeping them reserved.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        model = self._two_bucket_mlp(mesh)
+        (context,) = getattr(model, bucket_runtime._EAGER_COMM_CONTEXTS_ATTR).values()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        for _ in range(2):
+            model.unshard(async_op=True).wait()
+            model.reshard()
+        torch.cuda.synchronize()
+        unshard_stream = context.unshard_stream.cuda_stream
+        segments = [
+            segment
+            for segment in torch.cuda.memory._snapshot()["segments"]
+            if segment["device"] == torch.cuda.current_device()
+            and segment["stream"] == unshard_stream
+        ]
+        self.assertEqual(segments, [])
+
     @skip_if_lt_x_gpu(2)
     def test_gradient_accumulation(self):
         # Three microbatches, in three modes:
