@@ -333,6 +333,21 @@ of such a call only waits for its reduce-scatters. Combined with the per-bucket
 methods above, this reduce-scatters like FSDP2 under the chunked loss, bit for
 bit.
 
+## Outer shardings
+
+FlexShard shards each parameter over its bucket's 1D mesh. A parameter that is
+already a local shard of another sharding, such as tensor or expert
+parallelism, is passed in as that plain local tensor:
+
+- `set_global_layout(param, layout)`, before `flex_shard()`, declares where it
+  sits in the full parameter. `get_outer_layout` returns the layout from the
+  sharded parameter, and checkpoints compose it with FlexShard's own split.
+- `set_partial_grad_group(param, group)` declares a group whose ranks each
+  compute only part of the parameter's grad. One example is a norm weight
+  under sequence parallelism, where each rank sees its own tokens. FlexShard
+  sums the unsharded grad over that group before the reduce-scatter, as FSDP2
+  does with a `Partial` grad on a mesh dim it does not shard over.
+
 ## Distributed checkpoints
 
 A FlexShard `state_dict()` holds each rank's local shards, which share storage
