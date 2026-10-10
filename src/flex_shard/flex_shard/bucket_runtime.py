@@ -909,10 +909,13 @@ class BucketRuntime:
 
         As in FSDP2 (pytorch/pytorch#198668 and #199242), a param whose
         unsharded grad dtype is wider than its compute dtype keeps the grads
-        autograd produces while deferred (``grad_dtype=None``), in every
-        backward: the reduce-scatter copy-in widens them as it copies, and
-        AccumulateGrad adds them in place to a wider kept grad. That saves a
-        cast kernel per param and the wider unsharded grads until the copy-in.
+        autograd produces while deferred (``grad_dtype=None``), in a backward
+        that syncs or that adds to a kept grad: the reduce-scatter copy-in
+        widens them as it copies, and AccumulateGrad adds them in place to a
+        wider kept grad. That saves a cast kernel per param and the wider
+        unsharded grads until the copy-in. A backward without sync that starts
+        a grad keeps the upcast, so a param used more than once sums its uses
+        in the wider dtype, as FSDP2 does.
         Restoring upcasts a new grad that is not reduced, once, after the
         bucket reshards, so the accumulation across backwards stays wider. As
         FSDP2 does for grads it reduces outside data parallelism, a param with
@@ -935,7 +938,14 @@ class BucketRuntime:
             ):
                 continue
             if defer_upcast:
-                param.grad_dtype = None
+                # As FSDP2: a backward without sync that starts the grad keeps
+                # the upcast, so that a param used more than once accumulates
+                # its uses in the wider dtype.
+                if (
+                    param.grad is not None
+                    or self.bucket_storage._requires_gradient_sync
+                ):
+                    param.grad_dtype = None
                 continue
             grad = param.grad
             if grad is not None and grad.dtype != dtype:
