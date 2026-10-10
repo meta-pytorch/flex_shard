@@ -341,8 +341,9 @@ class TestFlexShardTraining(FSDPTest):
             reduce_dtype=torch.float32,
         )
         # 1 MiB FP32 grads stay in the caching allocator's small pool, so the
-        # 2 MiB packed buckets are the only large-pool blocks and the second
-        # pack reuses the first pack's freed block.
+        # 2 MiB packed buckets are the only large-pool blocks. With the default
+        # of one pending reduce-scatter, as in FSDP2, the second pack reuses the
+        # first pack's freed block.
         flex_shard(
             model,
             buckets=[
@@ -356,7 +357,6 @@ class TestFlexShardTraining(FSDPTest):
                 for index in range(2)
             ],
         )
-        model.set_max_pending_reduce_grads(1)
 
         # Grad-requiring inputs let each layer's input-grad trigger reduce
         # mid-backward, one bucket after the other.
