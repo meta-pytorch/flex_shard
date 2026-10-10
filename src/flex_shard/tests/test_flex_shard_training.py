@@ -40,6 +40,7 @@ from .common import (
     check_flex_shard_parity,
     expected_shard,
     flex_shard_cuda,
+    flex_shard_transformer_model,
     make_test_sgd,
     make_transformer_model,
     transformer_bucket_specs,
@@ -1118,6 +1119,138 @@ class TestFlexShardTraining(FSDPTest):
                 self.assertEqual(calls, [(stream, async_op)] * 2)
                 self.assertEqual(len(waits), 2 if async_op else 0)
                 torch.cuda.current_stream().wait_stream(stream)
+
+    @skip_if_lt_x_gpu(2)
+    def test_single_rank_bucket_skips_all_gather_and_reduce_scatter(self):
+        # As FSDP2 on a 1-rank group, e.g. torchtitan's routed experts when the
+        # expert-parallel degree equals the data-parallel one: the unshard
+        # casts the local shards straight into the unsharded params, with no
+        # all-gather or gather buffer, through a forward's hook and through
+        # unshard(async_op=True) alike, and the post-backward reduce keeps the
+        # packed grads as the sharded grads, with no reduce-scatter. Without
+        # collectives, the 1-rank group can use a fake backend.
+        mesh = init_device_mesh(
+            device_type.type, (self.world_size, 1), mesh_dim_names=("dp", "edp")
+        )["edp"]
+        torch.manual_seed(0)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 6)
+        ).to(device_type)
+        reference = copy.deepcopy(model).to(torch.bfloat16)
+        flex_shard(
+            model,
+            buckets=[
+                BucketSpec(
+                    [pattern],
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
+                    reshard_after_forward=False,
+                )
+                for pattern in ("0.*", "2.*")
+            ],
+        )
+        x = torch.randn(4, 8, device=device_type, dtype=torch.bfloat16)
+
+        def check_unsharded_params() -> None:
+            for module, reference_module in (
+                (model[0], reference[0]),
+                (model[2], reference[2]),
+            ):
+                self.assertEqual(module.weight.dtype, torch.bfloat16)
+                self.assertTrue(torch.equal(module.weight, reference_module.weight))
+                self.assertTrue(torch.equal(module.bias, reference_module.bias))
+
+        with (
+            mock.patch.object(
+                dist,
+                "all_gather_single",
+                side_effect=AssertionError("all-gather on a 1-rank mesh"),
+            ),
+            mock.patch.object(
+                dist,
+                "reduce_scatter_tensor",
+                side_effect=AssertionError("reduce-scatter on a 1-rank mesh"),
+            ),
+        ):
+            output = model(x)
+            check_unsharded_params()
+            reference_output = reference(x)
+            self.assertTrue(torch.equal(output, reference_output))
+            output.sum().backward()
+            reference_output.sum().backward()
+            for param, reference_param in zip(
+                model.parameters(), reference.parameters(), strict=True
+            ):
+                self.assertTrue(torch.equal(param.grad, reference_param.grad.float()))
+            model.reshard()
+            model.unshard(async_op=True).wait()
+            check_unsharded_params()
+            model.reshard()
+
+    @skip_if_lt_x_gpu(2)
+    def test_shard_all_gathers_in_place(self):
+        # With a narrower unsharded dtype, Shard casts the local shard straight
+        # into its chunk of the gather buffer and all-gathers in place, as
+        # FSDP2's copy-in does. A 1-rank mesh skips the all-gather (see
+        # test_single_rank_bucket_skips_all_gather_and_reduce_scatter).
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        torch.manual_seed(0)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 8)
+        ).to(device_type)
+        flex_shard(
+            model,
+            buckets=[
+                BucketSpec(
+                    [pattern],
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
+                    reshard_after_forward=True,
+                )
+                for pattern in ("0.*", "2.*")
+            ],
+        )
+        bucket = [
+            bucket
+            for context in model._flex_shard_eager_comm_contexts.values()
+            for bucket in context.buckets
+        ][-1]
+        handle = bucket.begin_unshard()
+        send_buf, gather_buf = handle.prepared.buffers
+        self.assertEqual(
+            send_buf.untyped_storage().data_ptr(),
+            gather_buf.untyped_storage().data_ptr(),
+        )
+        bucket.finish_unshard(handle)
+        bucket.reshard()
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_traces_per_bucket_collectives(self):
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        args, model = flex_shard_transformer_model(mesh)
+        graphs = []
+
+        def capture_backend(gm, example_inputs):
+            graphs.append(gm)
+            return gm.forward
+
+        compiled_model = torch.compile(model, backend=capture_backend, fullgraph=True)
+        compiled_model(transformer_inputs(args, device=device_type)).sum().backward()
+        self.assertEqual(1, len(graphs))
+        # Collectives live in the fwd_body_*/bwd_body_* subgraphs that
+        # autograd_function_apply dispatches to, not at the top level.
+        subgraph_targets = set()
+        for _, submodule in graphs[0].named_modules():
+            if isinstance(submodule, torch.fx.GraphModule):
+                subgraph_targets.update(
+                    str(node.target) for node in submodule.graph.nodes
+                )
+        # Functional collectives keep the comm reorderable by graph passes.
+        self.assertIn("_c10d_functional.all_gather_into_tensor", subgraph_targets)
+        self.assertIn("_c10d_functional.reduce_scatter_tensor", subgraph_targets)
+        self.assertIn("_c10d_functional.wait_tensor", subgraph_targets)
 
     @skip_if_lt_x_gpu(2)
     def test_unshard_leaves_no_memory_on_flex_shard_stream(self):
