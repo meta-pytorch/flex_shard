@@ -21,6 +21,7 @@ from .bucket_runtime import (
 )
 from .bucket_storage import (
     _assign_params_to_buckets,
+    _fsdp2_param_order,
     BucketParamFQNsByIndex,
     BucketSpec,
     GradientReduceOp,
@@ -498,6 +499,10 @@ def _materialize_bucket_storages(
 
         bucket_spec = buckets[bucket_idx]
         bucket_named_params = [(fqn, named_params_dict[fqn]) for fqn in bucket_fqns]
+        if bucket_spec.fsdp2_compatible:
+            bucket_named_params = _fsdp2_param_order(
+                module, bucket_spec.patterns, bucket_named_params
+            )
         bucket_placements = {fqn: inputs.param_placements[fqn] for fqn in bucket_fqns}
         bucket_storages.append(
             ShardedBucketStorage.from_bucket(
@@ -574,6 +579,25 @@ def _validate_param_dtype_overrides(
             mp_policy._resolve_param_dtype(fqn, param_dict[fqn])
 
 
+def _validate_fsdp2_compatible_buckets(
+    bucket_assignments: BucketParamFQNsByIndex,
+    param_placements: dict[str, tuple[Placement, ...]],
+    buckets: list[BucketSpec],
+) -> None:
+    from ..custom_placements.shard import Shard
+
+    for bucket, bucket_fqns in zip(buckets, bucket_assignments, strict=True):
+        if not bucket.fsdp2_compatible:
+            continue
+        for fqn in bucket_fqns:
+            (placement,) = param_placements[fqn]
+            if type(placement) is not Shard:
+                raise ValueError(
+                    f"BucketSpec {bucket.patterns} sets fsdp2_compatible, which "
+                    f"requires Shard placements, but {fqn!r} uses {placement!r}."
+                )
+
+
 def _prepare_flex_shard_inputs(
     module: nn.Module,
     buckets: list[BucketSpec],
@@ -644,6 +668,7 @@ def _prepare_flex_shard_inputs(
         buckets,
         named_params,
     )
+    _validate_fsdp2_compatible_buckets(bucket_assignments, param_placements, buckets)
 
     return PreparedFlexShardInputs(
         named_params=named_params,
