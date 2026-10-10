@@ -18,6 +18,7 @@ from .bucket_runtime import (
     _install_bucket_unshard_hooks,
     _MAX_PENDING_REDUCE_GRADS_ATTR,
     GradientReductionHandle,
+    ModuleUnshardHandle,
 )
 from .bucket_storage import (
     _assign_params_to_buckets,
@@ -172,23 +173,35 @@ class FlexShardModule:
         handle.wait()
         return None
 
-    def unshard(self) -> None:
-        """Unshard every bucket now and keep it unsharded, like FSDP2's
-        ``FSDPModule.unshard()``, synchronously.
+    def unshard(self, *, async_op: bool = False) -> ModuleUnshardHandle | None:
+        """Unshard every bucket and keep it unsharded, like FSDP2's
+        ``FSDPModule.unshard()``.
 
         For callers that run submodules' computation directly, bypassing the
         forward hooks that gather buckets, e.g. Megatron-LM's EP overlap
-        schedule. Buckets whose hooks never run then stay unsharded, with their
-        grads, until the end of a backward that re-gathers a bucket in its
-        pre-backward hook, or ``finalize_backward``, finishes them, following
-        the sync and reshard settings, or until ``reshard()``. Call
+        schedule, or that gather ahead of a forward, e.g. a multi-stage
+        pipeline schedule. Buckets whose hooks never run then stay unsharded,
+        with their grads, until the end of a backward that re-gathers a bucket
+        in its pre-backward hook, or ``finalize_backward``, finishes them,
+        following the sync and reshard settings, or until ``reshard()``. Call
         it outside backward and after waiting on any
         ``finalize_backward`` handle. Eager only.
+
+        With ``async_op=True``, it starts the all-gathers and returns a handle
+        without waiting, as FSDP2 does; call its ``wait()`` before using the
+        unsharded params directly. A forward finishes its buckets' all-gathers
+        without it.
         """
+        started = []
         for context in getattr(self, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
             context.check_outside_backward("unshard")
             for bucket in context.buckets:
-                bucket.unshard()
+                if not async_op or bucket.is_unsharded:
+                    bucket.unshard()
+                else:
+                    context.prefetch(bucket, explicit=True)
+                    started.append((context, bucket))
+        return ModuleUnshardHandle(started) if async_op else None
 
     def finish_deferred_backward(self, param: nn.Parameter) -> None:
         """Finish the backward of the bucket that holds ``param`` and defers its
