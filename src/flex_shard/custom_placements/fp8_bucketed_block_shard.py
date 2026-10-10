@@ -1101,7 +1101,9 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         )
 
     @override
-    def run_prepared_unshard(self, prepared: PlacementPreparedUnshard) -> None:
+    def run_prepared_unshard(
+        self, prepared: PlacementPreparedUnshard, *, async_op: bool = False
+    ) -> dist.Work | None:
         """All-gather packed fp8 data and fp32 scale bytes in one collective.
 
         Each rank's payload is padded to the same size, so the collective writes
@@ -1119,10 +1121,11 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             )
         local, gathered = prepared.buffers
         with _record_comm_if_eager("FlexShard::all_gather", state.debug_fqn):
-            dist.all_gather_into_tensor(
+            return dist.all_gather_into_tensor(
                 output_tensor=gathered,
                 input_tensor=local,
                 group=state.pg,
+                async_op=async_op,
             )
 
     @override
