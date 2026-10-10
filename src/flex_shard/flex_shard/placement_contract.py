@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Literal, TYPE_CHECKING
+from typing import Any, ClassVar, Literal, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -184,6 +184,14 @@ class Placement(ABC):
         """Return a hash consistent with placement equality."""
         raise NotImplementedError
 
+    #: Whether only ``finish_prepared_unshard`` writes a refill's persistent
+    #: buffers, as a copy-out on the current stream, never
+    #: ``run_prepared_unshard``. The bucket runtime then re-allocates their
+    #: storage right before finish rather than before run, as FSDP2 allocates
+    #: its unsharded parameters at copy-out, so a prefetched bucket holds only
+    #: its gather buffer until its hook takes it.
+    refills_persistent_buffers_in_finish: ClassVar[bool] = False
+
     def bucket_compatibility_key(self) -> object:
         """Return a key shared by placements that can use one bucket collective."""
         return self
@@ -352,7 +360,9 @@ class PlacementPreparedUnshard:
     waited on it. The placement writes the new values into them, in the same
     layout, where it chooses: run may gather straight into them on the unshard
     stream, or finish may copy into them on the current stream. Finish returns
-    them.
+    them. A placement whose finish alone writes them
+    (``Placement.refills_persistent_buffers_in_finish``) gets their storage
+    re-allocated right before finish instead.
     Eager unshards are persistent. During graph capture they are not, and the
     full params may view gathered buffers whose lifetime the traced graph owns.
     """

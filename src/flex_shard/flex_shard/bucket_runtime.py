@@ -665,20 +665,20 @@ class BucketRuntime:
     ) -> UnshardHandle:
         """Begin this bucket's unshard on the shared stream.
 
-        A refill re-allocates the persistent storage here, on the current
-        stream (the one that frees it on reshard) and before the unshard stream
-        waits on it, and the placement writes the new values into it, during
-        the unshard or when it is finished.
+        A refill re-allocates the persistent storage on the current stream (the
+        one that frees it on reshard), and the placement writes the new values
+        into it, during the unshard or when it is finished. If it writes them
+        only when finished (``Placement.refills_persistent_buffers_in_finish``),
+        ``finish_unshard`` allocates the storage right before, as FSDP2
+        allocates its unsharded parameters at copy-out; otherwise this does,
+        before the unshard stream waits on it.
         """
         if local_shards is None:
             local_shards = self._local_shards(use_autograd=False)
         persistent_buffers = None
         if self.unsharded_params is not None and not torch.compiler.is_compiling():
-            with torch.inference_mode(False):
-                for persistent_buffer, nbytes in zip(
-                    self.persistent_buffers, self.persistent_buffer_nbytes, strict=True
-                ):
-                    _alloc_storage(persistent_buffer, nbytes)
+            if not self.infos[0].placement.refills_persistent_buffers_in_finish:
+                self._alloc_persistent_storage()
             persistent_buffers = self.persistent_buffers
         return begin_bucket_unshard(
             local_shards,
@@ -755,6 +755,8 @@ class BucketRuntime:
                     unshard.full_params, unshard.persistent_buffers
                 )
             else:
+                if self.infos[0].placement.refills_persistent_buffers_in_finish:
+                    self._alloc_persistent_storage()
                 with torch.autograd._unsafe_preserve_version_counter(
                     tuple(self.persistent_buffers)
                 ):
@@ -834,6 +836,15 @@ class BucketRuntime:
         self._swap_in_params(self.sharded_params)
         self.free_persistent_storage()
         self.is_unsharded = False
+
+    def _alloc_persistent_storage(self) -> None:
+        """Re-allocate the storage behind the unsharded params for a refill,
+        on the current stream, outside inference mode."""
+        with torch.inference_mode(False):
+            for persistent_buffer, nbytes in zip(
+                self.persistent_buffers, self.persistent_buffer_nbytes, strict=True
+            ):
+                _alloc_storage(persistent_buffer, nbytes)
 
     def free_persistent_storage(self) -> None:
         """Free the storage behind the unsharded params.
