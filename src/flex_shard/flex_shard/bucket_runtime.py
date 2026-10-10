@@ -773,15 +773,25 @@ class BucketRuntime:
             return
         with torch.no_grad():
             self.context.drain_reduce_grad_states_if_needed(self.debug_fqn)
+            # A 1-rank mesh has nothing to communicate, so it reduces on the
+            # current stream, as FSDP2 does for a 1-rank group. On the reduce-grad
+            # stream, its cast sharded grads would come from that stream's
+            # allocator pool, which memory freed on the current stream cannot
+            # refill, and with one rank they are full size.
+            reduce_grad_stream = (
+                self.context.device_handle.current_stream(grads[0].device)
+                if self.bucket_storage._mesh.size() == 1
+                else self.context.reduce_grad_stream
+            )
             result = begin_reduce_grad(
                 grads,
                 infos,
                 self.bucket_storage._mesh,
                 self.bucket_storage.gradient_reduction,
-                self.context.reduce_grad_stream,
+                reduce_grad_stream,
                 debug_fqn=self.debug_fqn,
             )
-            with self.context.device_handle.stream(self.context.reduce_grad_stream):
+            with self.context.device_handle.stream(reduce_grad_stream):
                 with _record_function_if_eager(
                     "FlexShard::reduce_grad_accumulate",
                     self.debug_fqn,
@@ -792,7 +802,7 @@ class BucketRuntime:
                             sharded_params,
                             sharded_grads,
                         ),
-                        self.context.reduce_grad_stream,
+                        reduce_grad_stream,
                     )
             self.context.reduce_grad_states.append(PendingReduceGrad(result))
             self.context.queue_post_backward_callback(finish=False)
