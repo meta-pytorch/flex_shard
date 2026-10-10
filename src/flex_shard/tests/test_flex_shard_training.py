@@ -20,6 +20,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import FSDPTest, get_devtype
 from torch.testing._internal.common_utils import run_tests
+from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.checkpoint import (
     CheckpointPolicy,
     create_selective_checkpoint_contexts,
@@ -1127,8 +1128,9 @@ class TestFlexShardTraining(FSDPTest):
         # casts the local shards straight into the unsharded params, with no
         # all-gather or gather buffer, through a forward's hook and through
         # unshard(async_op=True) alike, and the post-backward reduce keeps the
-        # packed grads as the sharded grads, with no reduce-scatter. Without
-        # collectives, the 1-rank group can use a fake backend.
+        # packed grads as the sharded grads, with no reduce-scatter, on the
+        # current stream, so the cast sharded grads come from its allocator pool.
+        # Without collectives, the 1-rank group can use a fake backend.
         mesh = init_device_mesh(
             device_type.type, (self.world_size, 1), mesh_dim_names=("dp", "edp")
         )["edp"]
@@ -1151,6 +1153,13 @@ class TestFlexShardTraining(FSDPTest):
             ],
         )
         x = torch.randn(4, 8, device=device_type, dtype=torch.bfloat16)
+        device_module = torch.get_device_module(device_type)
+        backward_streams = set()
+
+        class RecordStreams(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                backward_streams.add(device_module.current_stream())
+                return func(*args, **(kwargs or {}))
 
         def check_unsharded_params() -> None:
             for module, reference_module in (
@@ -1177,7 +1186,10 @@ class TestFlexShardTraining(FSDPTest):
             check_unsharded_params()
             reference_output = reference(x)
             self.assertTrue(torch.equal(output, reference_output))
-            output.sum().backward()
+            with RecordStreams():
+                output.sum().backward()
+            for context in model._flex_shard_eager_comm_contexts.values():
+                self.assertNotIn(context.reduce_grad_stream, backward_streams)
             reference_output.sum().backward()
             for param, reference_param in zip(
                 model.parameters(), reference.parameters(), strict=True
