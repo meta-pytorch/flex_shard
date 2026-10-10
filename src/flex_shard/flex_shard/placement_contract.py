@@ -328,8 +328,16 @@ class Placement(ABC):
     def run_prepared_unshard(
         self,
         prepared: PlacementPreparedUnshard,
-    ) -> None:
-        """Launch this placement's prepared unshard collective."""
+        *,
+        async_op: bool = False,
+    ) -> dist.Work | None:
+        """Launch this placement's prepared unshard collective.
+
+        With ``async_op``, return the collective's work, as ``torch.distributed``
+        collectives do; the caller waits on it before
+        ``finish_prepared_unshard``. A placement whose run reads the gathered
+        data waits on it itself and returns ``None``.
+        """
         raise NotImplementedError
 
     def finish_prepared_unshard(

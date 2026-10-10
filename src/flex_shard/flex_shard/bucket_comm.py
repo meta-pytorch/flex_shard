@@ -11,6 +11,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 from torch.distributed.device_mesh import _get_device_handle
 
 from .placement_contract import PlacementPreparedUnshard, PlacementUnshardResult
@@ -180,6 +181,42 @@ def begin_reduce_grad(
     )
 
 
+def begin_explicit_bucket_unshard(
+    tensors: list[torch.Tensor],
+    infos: list[ParamInfo],
+    mesh: DeviceMesh,
+    *,
+    async_op: bool,
+    debug_fqn: str | None = None,
+    persistent_buffers: list[torch.Tensor] | None = None,
+) -> UnshardHandle:
+    """Begin a bucket unshard for ``FlexShardModule.unshard()`` on the current
+    stream, as FSDP2's ``FSDPModule.unshard()`` all-gathers on it
+    (``FSDPCommContext.get_all_gather_streams``).
+
+    The copy-in, the all-gather buffers and the copy-out all belong to the
+    current stream, so its memory pool gets the buffers back after the
+    copy-out. With ``async_op``, the collective is asynchronous, so the current
+    stream runs other work until the handle is waited on or finished.
+    Otherwise this returns after the collective is queued, as a synchronous
+    collective does. See ``begin_bucket_unshard`` for ``persistent_buffers``.
+    """
+    placement = _get_bucket_placement(infos, "unshard")
+    prepared = placement.prepare_unshard_bucket(tensors, infos, mesh, debug_fqn)
+    prepared.persistent = True
+    prepared.persistent_buffers = persistent_buffers
+    if persistent_buffers is None:
+        work = prepared.placement.run_prepared_unshard(prepared, async_op=async_op)
+    else:
+        with (
+            torch.inference_mode(False),
+            torch.no_grad(),
+            torch.autograd._unsafe_preserve_version_counter(tuple(persistent_buffers)),
+        ):
+            work = prepared.placement.run_prepared_unshard(prepared, async_op=async_op)
+    return ExplicitUnshardResult(prepared=prepared, work=work)
+
+
 @dataclass
 class SyncUnshardResult(UnshardHandle):
     """Already-finished unshard result used during graph capture."""
@@ -241,6 +278,40 @@ class AsyncUnshardResult(UnshardHandle):
             (self.unshard_stream, current_stream),
             self.device_handle,
         ).release_after_current_stream()
+
+
+@dataclass
+class ExplicitUnshardResult(UnshardHandle):
+    """An unshard begun on the current stream by ``FlexShardModule.unshard()``.
+
+    ``work`` is the asynchronous collective's work, as in FSDP2's
+    ``AllGatherResult``, or ``None`` if the collective was synchronous.
+    """
+
+    prepared: PlacementPreparedUnshard
+    work: dist.Work | None
+    _finished: bool = field(default=False, init=False)
+
+    def finish(self) -> PlacementUnshardResult:
+        if self._finished:
+            raise RuntimeError("An unshard may only be finished once.")
+        self._finished = True
+        self.wait()
+        result = self.prepared.placement.finish_prepared_unshard(self.prepared)
+        # The current stream queued the all-gather and the copy-out, so its
+        # pool can reuse the buffers once these references drop.
+        self.prepared.buffers.clear()
+        result.buffers.clear()
+        return result
+
+    def wait(self) -> None:
+        if self.work is not None:
+            self.work.wait()
+            self.work = None
+
+    def release_buffers(self) -> None:
+        self.wait()
+        self.prepared.buffers.clear()
 
 
 @dataclass
