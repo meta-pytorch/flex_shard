@@ -60,6 +60,13 @@ each parameter's mesh, and updates local shards with AdamW.
 | Construct AdamW after sharding | Construct AdamW after sharding |
 | AdamW manages DTensor parameters | AdamW manages ordinary local parameter shards |
 
+For training that is bitwise identical to FSDP2, give each `fully_shard` group
+one `BucketSpec` naming the same modules, with the same `Shard(i)` placements,
+and set `fsdp2_compatible=True`. The bucket then orders its parameters as
+`fully_shard` does and, like FSDP2, reduce-scatters only the parameters that got
+a gradient, so its all-gather and reduce-scatter buffers match FSDP2's byte for
+byte.
+
 ### Dense parameters on dp, expert parameters on efsdp
 
 The four ranks form an `efsdp × replica` grid:

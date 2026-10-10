@@ -437,6 +437,83 @@ class TestBucketPlacementValidation(TestCase):
                 [("weight", weight)], {"weight": (Shard(1),)}, TwoRankMesh()
             )
 
+    def test_fsdp2_compatible_orders_params_as_fully_shard(self):
+        """FSDP2 takes a module's own params after its children's."""
+
+        class Block(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.scale = nn.Parameter(torch.randn(4))
+                self.inner = nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.inner(x * self.scale)
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.block = Block()
+                self.norm = nn.LayerNorm(4)
+                self.head = nn.Linear(4, 2)
+
+            def forward(self, x):
+                return self.head(self.norm(self.block(x)))
+
+        def storage_fqns(fsdp2_compatible: bool) -> list[list[str]]:
+            with single_rank_cuda_mesh() as mesh:
+                model = Model()
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            patterns,
+                            placement_fn=per_param_placements,
+                            mesh=mesh,
+                            fsdp2_compatible=fsdp2_compatible,
+                        )
+                        # A module list out of registration order keeps its
+                        # order, as fully_shard([head, norm]) does.
+                        for patterns in (["block"], ["head", "norm"])
+                    ],
+                )
+                return [list(s.param_infos) for s in model.sharded_bucket_storages]
+
+        self.assertEqual(
+            storage_fqns(fsdp2_compatible=True),
+            [
+                ["block.inner.weight", "block.inner.bias", "block.scale"],
+                ["head.weight", "head.bias", "norm.weight", "norm.bias"],
+            ],
+        )
+        self.assertEqual(
+            storage_fqns(fsdp2_compatible=False),
+            [
+                ["block.scale", "block.inner.weight", "block.inner.bias"],
+                ["norm.weight", "norm.bias", "head.weight", "head.bias"],
+            ],
+        )
+
+    def test_fsdp2_compatible_requires_shard(self):
+        def block_placement(named_params, mesh):
+            del mesh
+            return {fqn: (BlockShard(blocks_per_rank=(1,)),) for fqn, _ in named_params}
+
+        with single_rank_cuda_mesh() as mesh:
+            model = nn.Linear(4, 4)
+            with self.assertRaisesRegex(ValueError, "requires Shard placements"):
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            ["*"],
+                            placement_fn=block_placement,
+                            mesh=mesh,
+                            fsdp2_compatible=True,
+                        )
+                    ],
+                )
+            self.assertFalse(hasattr(model, "_sharded_bucket_storages"))
+
 
 class TestBucketReduceDtype(TestCase):
     def test_promotes_trainable_grad_dtypes_only(self):
