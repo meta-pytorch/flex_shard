@@ -26,6 +26,7 @@ from ..flex_shard.placement_contract import (
     PlacementReduceGradResult,
     PlacementUnshardResult,
 )
+from ..flex_shard.utils import host_interleaved_rank_order
 from .block_shard import BlockShard
 
 if TYPE_CHECKING:
@@ -392,9 +393,13 @@ class BucketedOwned(Placement):
 def _assign_params_to_ranks(
     named_params: list[tuple[str, nn.Parameter]],
     world_size: int,
+    rank_order: Sequence[int] | None = None,
 ) -> dict[str, int]:
-    """Greedily assign each full parameter to the currently least-loaded rank."""
-    loads = [(0, rank) for rank in range(world_size)]
+    """Greedily assign each full parameter to the currently least-loaded rank,
+    taking equally loaded ranks by their position in ``rank_order`` (rank
+    order by default)."""
+    positions = range(world_size) if rank_order is None else rank_order
+    loads = [(0, positions[rank], rank) for rank in range(world_size)]
     heapq.heapify(loads)
     assignments: dict[str, int] = {}
     for fqn, param in sorted(
@@ -402,23 +407,27 @@ def _assign_params_to_ranks(
         key=lambda item: item[1].numel(),
         reverse=True,
     ):
-        load, rank = heapq.heappop(loads)
+        load, position, rank = heapq.heappop(loads)
         assignments[fqn] = rank
-        heapq.heappush(loads, (load + param.numel(), rank))
+        heapq.heappush(loads, (load + param.numel(), position, rank))
     return assignments
 
 
 def make_bucketed_owned_full_param_segments(
     named_params: list[tuple[str, nn.Parameter]],
     world_size: int,
+    *,
+    rank_order: Sequence[int] | None = None,
 ) -> dict[str, list[BucketedOwnedSegmentSpec]]:
     """Build one whole-parameter BucketedOwned segment per parameter.
 
-    Parameters are assigned to owners with greedy LPT by numel.
+    Parameters are assigned to owners with greedy LPT by numel. Equally loaded
+    ranks go by their position in ``rank_order`` (see
+    ``host_interleaved_rank_order``), rank order by default.
     """
     if world_size <= 0:
         raise ValueError(f"world_size must be positive, but got {world_size}.")
-    assignments = _assign_params_to_ranks(named_params, world_size)
+    assignments = _assign_params_to_ranks(named_params, world_size, rank_order)
     return {
         fqn: [
             BucketedOwnedSegmentSpec(
@@ -435,7 +444,9 @@ def make_bucketed_owned_full_param_segments(
 
 
 def make_bucketed_owned_full_param_placement_fn() -> PlacementFn:
-    """Return a whole-parameter BucketedOwned placement function."""
+    """Return a whole-parameter BucketedOwned placement function. Owners
+    are balanced over the mesh with its ranks taken host by host, so the
+    largest parameters land on different hosts."""
 
     def placement_fn(
         named_params: list[tuple[str, nn.Parameter]],
@@ -444,6 +455,7 @@ def make_bucketed_owned_full_param_placement_fn() -> PlacementFn:
         segments_by_fqn = make_bucketed_owned_full_param_segments(
             named_params,
             mesh.size(),
+            rank_order=host_interleaved_rank_order(mesh.mesh.flatten().tolist()),
         )
         placement = BucketedOwned(segments_by_fqn, view_kind="full_param")
         return {fqn: (placement,) for fqn, _ in named_params}

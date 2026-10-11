@@ -14,7 +14,10 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.testing._internal.common_utils import TestCase
 
 from ..custom_placements.block_shard import BucketedBlockShard
-from ..custom_placements.owned import BucketedOwned
+from ..custom_placements.owned import (
+    BucketedOwned,
+    make_bucketed_owned_full_param_segments,
+)
 from ..dist_muon import (
     assign_matrices,
     AssignmentGroup,
@@ -28,6 +31,7 @@ from ..dist_muon import (
 from ..dist_muon.placement import get_dim0_block_partitions
 from ..flex_shard.bucket_storage import BucketSpec, MixedPrecisionPolicy
 from ..flex_shard.placement_contract import GlobalLayout, set_global_layout
+from ..flex_shard.utils import host_interleaved_rank_order
 
 
 def _materialize_with_assignment_fn(
@@ -242,3 +246,43 @@ class MatrixAssignmentTest(TestCase):
             get_dim0_block_partitions(
                 [("blocks", blocks)], num_partitions=2, partition_index=0
             )
+
+
+class HostInterleavedOwnerTest(TestCase):
+    def test_host_interleaved_rank_order(self) -> None:
+        positions = host_interleaved_rank_order(range(8), 4)
+        self.assertEqual(
+            sorted(range(8), key=positions.__getitem__), [0, 4, 1, 5, 2, 6, 3, 7]
+        )
+        # One host, or one rank per host, keeps rank order.
+        self.assertEqual(host_interleaved_rank_order(range(8), 8), tuple(range(8)))
+        self.assertEqual(host_interleaved_rank_order(range(8), 1), tuple(range(8)))
+
+    def test_largest_matrices_spread_across_hosts(self) -> None:
+        # 8 ranks on 2 hosts of 4: the two largest matrices go to ranks 0 and 4,
+        # one per host, where rank order puts both on host 0.
+        group = AssignmentGroup(
+            matrices=tuple(
+                WholeMatrixSpec(f"m{index}", numel)
+                for index, numel in enumerate((100, 100, 10, 10, 10, 10))
+            ),
+            block_groups=(),
+        )
+        host_first = assign_matrices(
+            (group,), num_ranks=8, rank_order=host_interleaved_rank_order(range(8), 4)
+        )
+        rank_order = assign_matrices((group,), num_ranks=8)
+        self.assertEqual({host_first.rank_by_matrix[m] for m in ("m0", "m1")}, {0, 4})
+        self.assertEqual({rank_order.rank_by_matrix[m] for m in ("m0", "m1")}, {0, 1})
+
+    def test_bucketed_owned_segments_spread_largest_params_across_hosts(self) -> None:
+        named_params = [
+            (f"p{index}", nn.Parameter(torch.empty(numel)))
+            for index, numel in enumerate((100, 100, 10, 10))
+        ]
+        host_first = make_bucketed_owned_full_param_segments(
+            named_params, 8, rank_order=host_interleaved_rank_order(range(8), 4)
+        )
+        rank_order = make_bucketed_owned_full_param_segments(named_params, 8)
+        self.assertEqual({host_first[p][0].owner_rank for p in ("p0", "p1")}, {0, 4})
+        self.assertEqual({rank_order[p][0].owner_rank for p in ("p0", "p1")}, {0, 1})

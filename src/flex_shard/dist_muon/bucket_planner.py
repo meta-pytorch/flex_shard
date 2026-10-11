@@ -11,6 +11,7 @@ from __future__ import annotations
 import heapq
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import Protocol
 
 import torch.distributed as dist
@@ -18,6 +19,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from ..flex_shard import BucketSpec, MixedPrecisionPolicy
+from ..flex_shard.utils import host_interleaved_rank_order
 from .placement import (
     BlockShardPlan,
     get_dim0_block_partitions,
@@ -148,7 +150,9 @@ class _BalancedMatrixAssignment:
         groups: Sequence[AssignmentGroup],
         *,
         num_ranks: int,
+        rank_order: Sequence[int] | None = None,
     ) -> MatrixAssignment:
+        positions = range(num_ranks) if rank_order is None else rank_order
         rank_by_matrix: dict[str, int] = {}
         blocks_per_rank_by_group: dict[str, tuple[int, ...]] = {}
         rank_loads = [0] * num_ranks
@@ -187,9 +191,11 @@ class _BalancedMatrixAssignment:
                     key=lambda item: item[0],
                     reverse=True,
                 )
+                # Equally loaded ranks by position, so a group's largest
+                # matrices land on different hosts (host_interleaved_rank_order).
                 available_ranks = sorted(
                     range(num_ranks),
-                    key=lambda rank: (rank_loads[rank], rank),
+                    key=lambda rank: (rank_loads[rank], positions[rank]),
                 )
                 for (slot_load, matrix_names), rank in zip(
                     slots,
@@ -226,12 +232,22 @@ def assign_matrices(
     groups: Sequence[AssignmentGroup],
     *,
     num_ranks: int,
+    rank_order: Sequence[int] | None = None,
 ) -> MatrixAssignment:
-    """Assign recipe-defined groups in their explicit sequence order."""
+    """Assign recipe-defined groups in their explicit sequence order.
+
+    Whole matrices go to equally loaded ranks by their position in
+    ``rank_order`` (rank order by default). Block groups keep their eligible
+    ranks' order, since their blocks are computed in batches."""
     _validate_inputs(groups, num_ranks)
+    if rank_order is not None and sorted(rank_order) != list(range(num_ranks)):
+        raise ValueError(
+            f"rank_order must give each of {num_ranks} ranks a distinct position."
+        )
     return _BalancedMatrixAssignment().assign(
         groups,
         num_ranks=num_ranks,
+        rank_order=rank_order,
     )
 
 
@@ -314,12 +330,21 @@ def materialize_dist_muon_buckets(
     partition_rank_axis_name: str,
     partition_axis_name: str,
     mp_policy: MixedPrecisionPolicy,
-    assignment_fn: MatrixAssignmentFn = assign_matrices,
+    assignment_fn: MatrixAssignmentFn | None = None,
 ) -> list[BucketSpec]:
     """Assign complete matrices and materialize their storage buckets.
 
     ``assignment_fn`` runs on every rank and must return the same assignment.
+    By default it is ``assign_matrices`` with the assignment mesh's ranks taken
+    host by host (``host_interleaved_rank_order``).
     """
+    if assignment_fn is None:
+        assignment_fn = partial(
+            assign_matrices,
+            rank_order=host_interleaved_rank_order(
+                assignment_mesh.mesh.flatten().tolist()
+            ),
+        )
     if partition_mesh is None:
         partition_storage_mesh = assignment_mesh
         rank_groups = (tuple(range(assignment_mesh.size())),)

@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any, TYPE_CHECKING
 
@@ -337,3 +339,33 @@ def alloc_grads_in_param_layout(named_params: list[tuple[str, nn.Parameter]]) ->
             buffers[storage._cdata] = buffer
         offset = param.storage_offset()
         param.grad = buffer[offset : offset + param.numel()].view(param.shape)
+
+
+def host_interleaved_rank_order(
+    global_ranks: Sequence[int], ranks_per_host: int | None = None
+) -> tuple[int, ...]:
+    """Each mesh rank's position in the order that takes one rank from every
+    host before a second one from any: by local rank, then by host, with hosts
+    of ``ranks_per_host`` consecutive global ranks, as torchrun numbers them.
+    ``global_ranks`` are the mesh's ranks in mesh order. ``ranks_per_host``
+    defaults to torchrun's LOCAL_WORLD_SIZE; without it, every rank is its own
+    host, which keeps rank order.
+
+    Owner balancers take equally loaded ranks in this order, so the largest
+    whole matrices land on different hosts (and network cards) rather than on
+    one host's first ranks."""
+    if ranks_per_host is None:
+        ranks_per_host = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    if ranks_per_host <= 0:
+        raise ValueError(f"ranks_per_host must be positive, got {ranks_per_host}.")
+    ordered = sorted(
+        range(len(global_ranks)),
+        key=lambda index: (
+            global_ranks[index] % ranks_per_host,
+            global_ranks[index] // ranks_per_host,
+        ),
+    )
+    positions = [0] * len(global_ranks)
+    for position, index in enumerate(ordered):
+        positions[index] = position
+    return tuple(positions)
