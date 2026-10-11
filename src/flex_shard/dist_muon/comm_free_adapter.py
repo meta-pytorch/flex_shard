@@ -146,13 +146,7 @@ def build_local_dist_muon(
     ):
         raise ValueError("local DistMuon requires one CUDA device per process")
 
-    # Process-group creation is SPMD, including on ranks with no local Muon work.
-    world_mesh = init_device_mesh(
-        device.type,
-        (dist.get_world_size(), 1),
-        mesh_dim_names=("world", "local"),
-    )
-    local_mesh = world_mesh["local"]
+    local_mesh = _local_mesh(device.type)
     local_named_params = tuple(
         (fqn, param) for fqn, param in named_params if param.numel() > 0
     )
@@ -180,6 +174,31 @@ def build_local_dist_muon(
         {binding.fqn: binding.layout for binding in bindings},
     )
     return LocalDistMuonBinding(optimizer, bindings)
+
+
+# One-rank meshes by device type, shared by every binding in the process, e.g.
+# one per virtual pipeline stage.
+_LOCAL_MESHES: dict[str, DeviceMesh] = {}
+
+
+def _local_mesh(device_type: str) -> DeviceMesh:
+    """This rank's one-rank mesh for the proxies, created on first use.
+
+    Process-group creation is SPMD, including on ranks with no local Muon work.
+    The one-rank groups use gloo: the bound optimizer runs no collectives on
+    them, and an NCCL group per rank would cost about 390 MiB of device memory
+    each (measured on H100).
+    """
+    mesh = _LOCAL_MESHES.get(device_type)
+    if mesh is None:
+        world_mesh = init_device_mesh(
+            device_type,
+            (dist.get_world_size(), 1),
+            mesh_dim_names=("world", "local"),
+            backend_override={"local": "gloo"},
+        )
+        mesh = _LOCAL_MESHES[device_type] = world_mesh["local"]
+    return mesh
 
 
 def _build_parameter_binding(
