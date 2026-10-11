@@ -341,31 +341,93 @@ def alloc_grads_in_param_layout(named_params: list[tuple[str, nn.Parameter]]) ->
         param.grad = buffer[offset : offset + param.numel()].view(param.shape)
 
 
-def host_interleaved_rank_order(
+def mesh_rank_hosts(
     global_ranks: Sequence[int], ranks_per_host: int | None = None
 ) -> tuple[int, ...]:
-    """Each mesh rank's position in the order that takes one rank from every
-    host before a second one from any: by local rank, then by host, with hosts
-    of ``ranks_per_host`` consecutive global ranks, as torchrun numbers them.
+    """Each mesh rank's host, numbered 0, 1, ... in mesh order, with hosts of
+    ``ranks_per_host`` consecutive global ranks, as torchrun numbers them.
     ``global_ranks`` are the mesh's ranks in mesh order. ``ranks_per_host``
     defaults to torchrun's LOCAL_WORLD_SIZE; without it, every rank is its own
-    host, which keeps rank order.
-
-    Owner balancers take equally loaded ranks in this order, so the largest
-    whole matrices land on different hosts (and network cards) rather than on
-    one host's first ranks."""
+    host."""
     if ranks_per_host is None:
         ranks_per_host = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
     if ranks_per_host <= 0:
         raise ValueError(f"ranks_per_host must be positive, got {ranks_per_host}.")
-    ordered = sorted(
-        range(len(global_ranks)),
-        key=lambda index: (
-            global_ranks[index] % ranks_per_host,
-            global_ranks[index] // ranks_per_host,
-        ),
+    host_ids: dict[int, int] = {}
+    return tuple(
+        host_ids.setdefault(rank // ranks_per_host, len(host_ids))
+        for rank in global_ranks
     )
-    positions = [0] * len(global_ranks)
-    for position, index in enumerate(ordered):
-        positions[index] = position
-    return tuple(positions)
+
+
+def _even_first_positions(count: int) -> list[int]:
+    """Each of 0, ..., count - 1's position in the order 0, 2, 4, ..., 1, 3, ..."""
+    return [
+        index // 2 if index % 2 == 0 else (count + 1) // 2 + index // 2
+        for index in range(count)
+    ]
+
+
+def assign_to_hosts_then_ranks(
+    loads: Sequence[int],
+    hosts: Sequence[int],
+    *,
+    carried_loads: Sequence[int] | None = None,
+    one_per_rank: bool = False,
+) -> list[int]:
+    """An owner rank for each load, largest first: onto the host with the least
+    load placed by this call, then the least carried load, then onto that
+    host's rank with the least load placed by this call, then the least
+    carried load. Remaining ties take hosts, and ranks within a host, in the
+    order 0, 2, 4, ..., 1, 3, ...
+
+    ``hosts`` gives each rank's host (see ``mesh_rank_hosts``) and
+    ``carried_loads`` each rank's load from earlier calls. With
+    ``one_per_rank``, each rank takes at most one load.
+
+    So the largest loads go to hosts 0, 2, 4, ... and heavy and light hosts
+    alternate in rank order. When owner rows lie back to back in rank order
+    and are cut into equal chunks, a heavy host's overflow then lands in a
+    light neighbor's chunks rather than pushing every later host out of its
+    own. A later call with carried loads puts its largest loads on the other
+    hosts."""
+    num_ranks = len(hosts)
+    num_hosts = len(set(hosts))
+    if sorted(set(hosts)) != list(range(num_hosts)):
+        raise ValueError(f"hosts must be numbered 0, 1, ..., got {tuple(hosts)}.")
+    if one_per_rank and len(loads) > num_ranks:
+        raise ValueError(
+            f"{len(loads)} loads don't fit one per rank on {num_ranks} ranks."
+        )
+    carried = [0] * num_ranks if carried_loads is None else list(carried_loads)
+    members: list[list[int]] = [[] for _ in range(num_hosts)]
+    for rank, host in enumerate(hosts):
+        members[host].append(rank)
+    host_position = _even_first_positions(num_hosts)
+    rank_position = [0] * num_ranks
+    for ranks in members:
+        for rank, position in zip(ranks, _even_first_positions(len(ranks))):
+            rank_position[rank] = position
+    host_carried = [sum(carried[rank] for rank in ranks) for ranks in members]
+    host_load = [0] * num_hosts
+    rank_load = [0] * num_ranks
+    taken = [False] * num_ranks
+    owners = [0] * len(loads)
+    for index in sorted(range(len(loads)), key=lambda index: -loads[index]):
+        host = min(
+            (
+                host
+                for host in range(num_hosts)
+                if not one_per_rank or not all(taken[rank] for rank in members[host])
+            ),
+            key=lambda host: (host_load[host], host_carried[host], host_position[host]),
+        )
+        rank = min(
+            (rank for rank in members[host] if not (one_per_rank and taken[rank])),
+            key=lambda rank: (rank_load[rank], carried[rank], rank_position[rank]),
+        )
+        owners[index] = rank
+        taken[rank] = True
+        host_load[host] += loads[index]
+        rank_load[rank] += loads[index]
+    return owners
