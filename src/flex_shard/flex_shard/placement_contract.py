@@ -367,6 +367,16 @@ class Placement(ABC):
         implements ``reduction`` for one reduce-scatter."""
         raise NotImplementedError
 
+    def reduces_grads_in_param_layout(
+        self, infos: list[ParamInfo], world_size: int
+    ) -> bool:
+        """Whether this bucket's gradient reduction reads, without copying
+        them in, grads allocated as views of one zeroed buffer per storage the
+        unsharded params view, at their offsets (see
+        ``BucketSpec.pre_backward_hook``). The bucket runtime then allocates
+        them there itself for a bucket with no pre-backward hook."""
+        return False
+
 
 @dataclass
 class PlacementPreparedUnshard:

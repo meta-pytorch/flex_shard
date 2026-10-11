@@ -33,6 +33,7 @@ from .utils import (
     _get_bucket_storage_debug_fqn,
     _module_path_common_prefix,
     _record_function_if_eager,
+    alloc_grads_in_param_layout,
 )
 
 
@@ -619,6 +620,9 @@ class BucketRuntime:
     # reduce-scatter order, grouped by sharded grad dtype. Set at the first
     # syncing backward, as FSDP2 caches it at lazy init.
     fsdp2_reduce_scatter_order: list[int] | None = None
+    # Whether the placement's gradient reduction reads grads in the parameter
+    # layout as is (see _run_pre_backward_hook). Set at the first backward.
+    grads_in_param_layout: bool | None = None
 
     @classmethod
     def from_bucket_storage(
@@ -985,9 +989,28 @@ class BucketRuntime:
             ):
                 self._post_backward(reshard=False)
             self._set_unsharded_grad_dtypes(defer_upcast=True)
-            if self.bucket_storage._pre_backward_hook is not None:
-                self.bucket_storage._pre_backward_hook(self._named_unsharded_params())
+            self._run_pre_backward_hook()
             self._prefetch(forward=False)
+
+    def _run_pre_backward_hook(self) -> None:
+        """Run the bucket's pre_backward_hook. A bucket without one whose
+        placement reduces grads in the parameter layout as is (whole-parameter
+        BucketedOwned's owner rows) gets its grads allocated there, so the
+        reduce copies none in. Missing grads are zero-filled before the reduce
+        in such buckets anyway, so the values don't change."""
+        hook = self.bucket_storage._pre_backward_hook
+        if hook is None:
+            if self.grads_in_param_layout is None:
+                infos = [bucket_param.param_info for bucket_param in self.bucket_params]
+                self.grads_in_param_layout = infos[
+                    0
+                ].placement.reduces_grads_in_param_layout(
+                    infos, self.bucket_storage._mesh.size()
+                )
+            if self.grads_in_param_layout:
+                hook = alloc_grads_in_param_layout
+        if hook is not None:
+            hook(self._named_unsharded_params())
 
     def _prefetch(self, *, forward: bool) -> None:
         """Prefetch this bucket's explicit list, if it has one, else the next
@@ -1279,8 +1302,7 @@ class BucketRuntime:
         pre_backward_hook, so run it here, before the recomputed backward.
         """
         self.unshard()
-        if self.bucket_storage._pre_backward_hook is not None:
-            self.bucket_storage._pre_backward_hook(self._named_unsharded_params())
+        self._run_pre_backward_hook()
 
     def _check_forward_allowed(self) -> None:
         self.context.check_no_raised_backward()
