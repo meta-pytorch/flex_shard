@@ -170,12 +170,14 @@ def plan_owner_rows_transport(
 class SymmetricBuffer:
     """A buffer in symmetric memory and every host rank's buffer mapped here,
     by mesh rank. ``readers`` are asynchronous collectives that may still read
-    it."""
+    it; ``views`` caches each bucket layout's views into it (see
+    ``gather_owner_rows``), dropped with the buffer when it grows."""
 
     tensor: torch.Tensor
     handle: Any
     peers: dict[int, torch.Tensor]
     readers: list[dist.Work] = field(default_factory=list)
+    views: dict[tuple[Any, ...], Any] = field(default_factory=dict)
 
     def barrier(self) -> None:
         """Wait on this stream until every rank of the host reaches its
@@ -300,16 +302,15 @@ def _subtract(
     return out
 
 
-def _host_p2p(
+def _host_ops(
     plan: OwnerRowsTransportPlan,
     rank: int,
     buffer: torch.Tensor,
     pg: dist.ProcessGroup,
     *,
     reverse: bool,
-) -> None:
-    """The moves between hosts, buffer to buffer, in one NCCL group; the
-    current stream then waits for them."""
+) -> list[dist.P2POp]:
+    """This rank's sends and receives between hosts, buffer to buffer."""
     ops = []
     for move in plan.host_moves:
         src, dst = (move.dst, move.src) if reverse else (move.src, move.dst)
@@ -324,9 +325,95 @@ def _host_p2p(
                         group_peer=peer,
                     )
                 )
+    return ops
+
+
+def _run_host_ops(ops: list[dist.P2POp]) -> None:
+    """One NCCL group; the current stream then waits for it."""
     if ops:
         for work in dist.batch_isend_irecv(ops):
             work.wait()
+
+
+def _row_ranges(
+    plan: OwnerRowsTransportPlan, rank: int, row_start: int, row_numel: int
+) -> list[tuple[int, int, int]]:
+    """Each range of this rank's row as ``(start, numel, holder)``: the rank
+    whose buffer holds it in transit. That's the rank whose chunk holds it, a
+    relay, or this rank, for its own chunk's part and for slices it relays."""
+    row_end = row_start + row_numel
+    ranges = [
+        (move.start, move.numel, move.dst)
+        for move in plan.owner_moves
+        if move.src == rank
+    ]
+    ranges += [
+        (move.start, move.numel, rank)
+        for move in plan.host_moves
+        if move.src == rank and row_start <= move.start < row_end
+    ]
+    ranges += [
+        (start, numel, rank)
+        for start, numel in _subtract(
+            row_start, row_numel, [(start, numel) for start, numel, _ in ranges]
+        )
+    ]
+    return ranges
+
+
+@dataclass
+class _GatherViews:
+    """A bucket layout's gather on this rank, built once (see
+    gather_owner_rows): the owner's writes, the sends and receives between
+    hosts, the relays' writes, and the all-gather's input."""
+
+    sources_key: tuple[Any, ...]
+    writes: tuple[list[torch.Tensor], list[torch.Tensor]]
+    host_ops: list[dist.P2POp]
+    relays: tuple[list[torch.Tensor], list[torch.Tensor]]
+    relay_barrier: bool
+    chunk: torch.Tensor
+
+
+def _gather_views(
+    plan: OwnerRowsTransportPlan,
+    hosts: Sequence[int],
+    buffer: SymmetricBuffer,
+    pg: dist.ProcessGroup,
+    rank: int,
+    row_start: int,
+    row_numel: int,
+    sources: Sequence[tuple[torch.Tensor, int]],
+    sources_key: tuple[Any, ...],
+) -> _GatherViews:
+    writes: tuple[list[torch.Tensor], list[torch.Tensor]] = ([], [])
+    for start, numel, holder in _row_ranges(plan, rank, row_start, row_numel):
+        base = plan.buffer_offset(holder, start)
+        for tensor, tensor_start in sources:
+            lo = max(start, tensor_start)
+            hi = min(start + numel, tensor_start + tensor.numel())
+            if lo < hi:
+                writes[0].append(
+                    buffer.peers[holder][base + lo - start : base + hi - start]
+                )
+                writes[1].append(
+                    tensor.reshape(-1)[lo - tensor_start : hi - tensor_start]
+                )
+    relays: tuple[list[torch.Tensor], list[torch.Tensor]] = ([], [])
+    for move in plan.relay_moves:
+        if move.src == rank:
+            dst = plan.buffer_offset(move.dst, move.start)
+            src = plan.buffer_offset(rank, move.start)
+            relays[0].append(buffer.peers[move.dst][dst : dst + move.numel])
+            relays[1].append(buffer.tensor[src : src + move.numel])
+    return _GatherViews(
+        sources_key=sources_key,
+        writes=writes,
+        host_ops=_host_ops(plan, rank, buffer.tensor, pg, reverse=False),
+        relays=relays,
+        relay_barrier=any(hosts[move.dst] == hosts[rank] for move in plan.relay_moves),
+        chunk=buffer.tensor[: plan.chunk_numel],
+    )
 
 
 def gather_owner_rows(
@@ -352,63 +439,88 @@ def gather_owner_rows(
     goes into its own buffer. Then NCCL carries the relayed slices between
     hosts, relays write them into their holders' buffers, and NCCL's
     all-gather reads each rank's chunk. Positions no source covers are
-    padding and stay unwritten."""
+    padding and stay unwritten.
+
+    The views behind all this are built once per bucket layout and kept
+    with the buffer; they're rebuilt when the params' storage moves."""
     buffer = buffers.get("gather", gathered.dtype, plan.buffer_numel, gathered.device)
     buffer.wait_readers()
-    writes: tuple[list[torch.Tensor], list[torch.Tensor]] = ([], [])
-
-    def write(target: int, start: int, numel: int) -> None:
-        base = plan.buffer_offset(target, start)
-        for tensor, tensor_start in sources:
-            lo = max(start, tensor_start)
-            hi = min(start + numel, tensor_start + tensor.numel())
-            if lo < hi:
-                writes[0].append(
-                    buffer.peers[target][base + lo - start : base + hi - start]
-                )
-                writes[1].append(
-                    tensor.reshape(-1)[lo - tensor_start : hi - tensor_start]
-                )
-
-    row_end = row_start + row_numel
-    sent = []
-    for move in plan.owner_moves:
-        if move.src == rank:
-            write(move.dst, move.start, move.numel)
-            sent.append((move.start, move.numel))
-    for move in plan.host_moves:
-        if move.src == rank and row_start <= move.start < row_end:
-            # This rank relays its own slice: staged in its own buffer.
-            write(rank, move.start, move.numel)
-            sent.append((move.start, move.numel))
-    for start, numel in _subtract(row_start, row_numel, sent):
-        write(rank, start, numel)
+    sources_key = tuple(
+        (
+            tensor.untyped_storage().data_ptr(),
+            tensor.storage_offset(),
+            tensor.numel(),
+            tensor.dtype,
+            start,
+        )
+        for tensor, start in sources
+    )
+    key = ("gather", id(plan), rank)
+    views = buffer.views.get(key)
+    if views is None or views.sources_key != sources_key:
+        views = buffer.views[key] = _gather_views(
+            plan, hosts, buffer, pg, rank, row_start, row_numel, sources, sources_key
+        )
     # Neighbors are done with what their buffers held, then the writes.
     buffer.barrier()
-    if writes[0]:
-        foreach_copy_(writes[0], writes[1])
+    if views.writes[0]:
+        foreach_copy_(*views.writes)
     buffer.barrier()
-    _host_p2p(plan, rank, buffer.tensor, pg, reverse=False)
-    relays = [
-        (
-            buffer.peers[move.dst][plan.buffer_offset(move.dst, move.start) :][
-                : move.numel
-            ],
-            buffer.tensor[plan.buffer_offset(rank, move.start) :][: move.numel],
-        )
-        for move in plan.relay_moves
-        if move.src == rank
-    ]
-    if relays:
-        foreach_copy_([dst for dst, _ in relays], [src for _, src in relays])
-    if any(hosts[move.dst] == hosts[rank] for move in plan.relay_moves):
+    _run_host_ops(views.host_ops)
+    if views.relays[0]:
+        foreach_copy_(*views.relays)
+    if views.relay_barrier:
         buffer.barrier()
     work = dist.all_gather_into_tensor(
-        gathered, buffer.tensor[: plan.chunk_numel], group=pg, async_op=async_op
+        gathered, views.chunk, group=pg, async_op=async_op
     )
     if work is not None:
         buffer.readers.append(work)
     return work
+
+
+@dataclass
+class _ReduceViews:
+    """A bucket layout's reduce on this rank, built once (see
+    reduce_owner_rows): the relays' reads, the sends and receives between
+    hosts, and the owner's reads as ``(offset in its row, numel, source)``."""
+
+    relays: tuple[list[torch.Tensor], list[torch.Tensor]]
+    host_ops: list[dist.P2POp]
+    host_barrier: bool
+    reads: list[tuple[int, int, torch.Tensor]]
+    chunk: torch.Tensor
+
+
+def _reduce_views(
+    plan: OwnerRowsTransportPlan,
+    hosts: Sequence[int],
+    buffer: SymmetricBuffer,
+    pg: dist.ProcessGroup,
+    rank: int,
+    row_start: int,
+    row_numel: int,
+) -> _ReduceViews:
+    relays: tuple[list[torch.Tensor], list[torch.Tensor]] = ([], [])
+    for move in plan.relay_moves:
+        if move.src == rank:
+            dst = plan.buffer_offset(rank, move.start)
+            src = plan.buffer_offset(move.dst, move.start)
+            relays[0].append(buffer.tensor[dst : dst + move.numel])
+            relays[1].append(buffer.peers[move.dst][src : src + move.numel])
+    reads = []
+    for start, numel, holder in _row_ranges(plan, rank, row_start, row_numel):
+        offset = plan.buffer_offset(holder, start)
+        reads.append(
+            (start - row_start, numel, buffer.peers[holder][offset : offset + numel])
+        )
+    return _ReduceViews(
+        relays=relays,
+        host_ops=_host_ops(plan, rank, buffer.tensor, pg, reverse=True),
+        host_barrier=any(hosts[move.src] == hosts[rank] for move in plan.host_moves),
+        reads=reads,
+        chunk=buffer.tensor[: plan.chunk_numel],
+    )
 
 
 def reduce_owner_rows(
@@ -430,45 +542,26 @@ def reduce_owner_rows(
     read the slices bound for other hosts from their holders, NCCL carries
     them back, and each owner reads its row's slices from the buffers of the
     ranks holding them, casting to ``recv``'s dtype on the way. A last
-    barrier keeps anyone from overwriting a buffer still being read."""
+    barrier keeps anyone from overwriting a buffer still being read. As in
+    ``gather_owner_rows``, the views are built once per bucket layout."""
     buffer = buffers.get("reduce", send.dtype, plan.buffer_numel, send.device)
     buffer.wait_readers()
-    reduce_scatter_grads(buffer.tensor[: plan.chunk_numel], send, reduction, pg)
-    buffer.barrier()
-    relays = [
-        (
-            buffer.tensor[plan.buffer_offset(rank, move.start) :][: move.numel],
-            buffer.peers[move.dst][plan.buffer_offset(move.dst, move.start) :][
-                : move.numel
-            ],
+    key = ("reduce", id(plan), rank)
+    views = buffer.views.get(key)
+    if views is None:
+        views = buffer.views[key] = _reduce_views(
+            plan, hosts, buffer, pg, rank, row_start, recv.numel()
         )
-        for move in plan.relay_moves
-        if move.src == rank
-    ]
-    if relays:
-        foreach_copy_([dst for dst, _ in relays], [src for _, src in relays])
-    _host_p2p(plan, rank, buffer.tensor, pg, reverse=True)
-    if any(hosts[move.src] == hosts[rank] for move in plan.host_moves):
+    reduce_scatter_grads(views.chunk, send, reduction, pg)
+    buffer.barrier()
+    if views.relays[0]:
+        foreach_copy_(*views.relays)
+    _run_host_ops(views.host_ops)
+    if views.host_barrier:
         buffer.barrier()
-    row_end = row_start + recv.numel()
-    reads: tuple[list[torch.Tensor], list[torch.Tensor]] = ([], [])
-
-    def read(holder: int, start: int, numel: int) -> None:
-        offset = plan.buffer_offset(holder, start)
-        reads[0].append(recv[start - row_start :][:numel])
-        reads[1].append(buffer.peers[holder][offset : offset + numel])
-
-    received = []
-    for move in plan.owner_moves:
-        if move.src == rank:
-            read(move.dst, move.start, move.numel)
-            received.append((move.start, move.numel))
-    for move in plan.host_moves:
-        if move.src == rank and row_start <= move.start < row_end:
-            read(rank, move.start, move.numel)
-            received.append((move.start, move.numel))
-    for start, numel in _subtract(row_start, recv.numel(), received):
-        read(rank, start, numel)
-    if reads[0]:
-        foreach_copy_(reads[0], reads[1])
+    if views.reads:
+        foreach_copy_(
+            [recv[offset : offset + numel] for offset, numel, _ in views.reads],
+            [source for _, _, source in views.reads],
+        )
     buffer.barrier()
