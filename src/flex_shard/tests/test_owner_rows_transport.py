@@ -222,25 +222,41 @@ class TestOwnerRowsTransportBuffers(FSDPTest):
         self.assertNotEqual(reduce_buffer.tensor.data_ptr(), buffer.tensor.data_ptr())
 
     @skip_if_lt_x_gpu(4)
-    def test_gather_matches_grouped_gather(self) -> None:
+    def test_matches_grouped_path(self) -> None:
         # Whole-parameter owners of uneven sizes on 4 ranks, as 2 hosts of 2
         # (rank 0's row spills into host 1, through relays) and as 1 host of 4,
-        # in FP32 and with BF16 params, resharding after forward or not. Through
-        # equal chunks, the step-0 params equal the reference's cast to the
-        # param dtype bit for bit, the gathered storage is padded only to whole
-        # chunks, the gather runs NCCL's all-gather without grouped broadcasts,
-        # and 3 training steps give the same outputs, bit for bit, as the
-        # grouped broadcasts (FLEX_SHARD_OWNER_ROWS_TRANSPORT=grouped).
+        # in FP32 and with BF16 params reducing in BF16 (the DeepSeek V3
+        # recipes' setting), both reducing the grads in the param layout (#74),
+        # and with BF16 params reducing in FP32 (grads copied into the rows),
+        # resharding after forward or not.
+        # Through equal chunks against the grouped broadcasts and reduces
+        # (FLEX_SHARD_OWNER_ROWS_TRANSPORT=grouped):
+        # - step 0's params equal the reference's cast to the param dtype, bit
+        #   for bit, and so do the outputs;
+        # - step 0's reduced grads come back in FP32 and match, up to the
+        #   reduction's summation order, as do later steps' outputs;
+        # - two runs give the same outputs bit for bit;
+        # - NCCL's all-gather and reduce-scatter run, no grouped calls, and the
+        #   gathered storage is padded only to whole chunks.
         mesh = init_device_mesh("cuda", (self.world_size,))
-        for local_world_size, param_dtype, reshard_after_forward in itertools.product(
-            ("2", "4"), (torch.float32, torch.bfloat16), (False, True)
+        precisions = (
+            (torch.float32, None),
+            (torch.bfloat16, torch.bfloat16),
+            (torch.bfloat16, torch.float32),
+        )
+        for local_world_size, (
+            param_dtype,
+            reduce_dtype,
+        ), reshard_after_forward in itertools.product(
+            ("2", "4"), precisions, (False, True)
         ):
-            outputs = {}
-            for transport in ("chunks", "grouped"):
+            runs = {}
+            for transport in ("chunks", "chunks again", "grouped"):
                 with (
                     self.subTest(
                         local_world_size=local_world_size,
                         param_dtype=param_dtype,
+                        reduce_dtype=reduce_dtype,
                         reshard_after_forward=reshard_after_forward,
                         transport=transport,
                     ),
@@ -248,17 +264,41 @@ class TestOwnerRowsTransportBuffers(FSDPTest):
                         os.environ,
                         {
                             "LOCAL_WORLD_SIZE": local_world_size,
-                            "FLEX_SHARD_OWNER_ROWS_TRANSPORT": transport,
+                            "FLEX_SHARD_OWNER_ROWS_TRANSPORT": transport.split()[0],
                         },
                     ),
                 ):
-                    outputs[transport] = self._train(
-                        mesh, param_dtype, reshard_after_forward, transport
+                    runs[transport] = self._train(
+                        mesh,
+                        MixedPrecisionPolicy(
+                            param_dtype=param_dtype, reduce_dtype=reduce_dtype
+                        ),
+                        reshard_after_forward,
+                        transport.split()[0],
                     )
-            for chunks, grouped in zip(outputs["chunks"], outputs["grouped"], strict=True):
-                self.assertTrue(torch.equal(chunks, grouped))
+            chunks, again, grouped = (
+                runs["chunks"],
+                runs["chunks again"],
+                runs["grouped"],
+            )
+            for first, second in zip(chunks[0], again[0], strict=True):
+                self.assertTrue(torch.equal(first, second))
+            self.assertTrue(torch.equal(chunks[0][0], grouped[0][0]))
+            # BF16 sums in another order round differently.
+            tolerance = (
+                {"rtol": 2e-2, "atol": 1e-2}
+                if reduce_dtype == torch.bfloat16
+                else {"rtol": 1e-5, "atol": 1e-6}
+            )
+            for name, grad in chunks[1].items():
+                self.assertEqual(grad.dtype, torch.float32)
+                self.assertEqual(grad, grouped[1][name], **tolerance)
+            for first, second in zip(chunks[0], grouped[0], strict=True):
+                self.assertEqual(first.float(), second.float(), rtol=2e-2, atol=2e-2)
 
-    def _train(self, mesh, param_dtype, reshard_after_forward, transport) -> list[torch.Tensor]:
+    def _train(self, mesh, mp_policy, reshard_after_forward, transport):
+        """Train 3 steps; return the outputs and step 0's sharded grads."""
+        param_dtype = mp_policy.param_dtype
         torch.manual_seed(0)
         model = nn.Sequential(
             nn.Linear(64, 64), nn.Linear(64, 16), nn.Linear(16, 16), nn.Linear(16, 8)
@@ -274,7 +314,7 @@ class TestOwnerRowsTransportBuffers(FSDPTest):
                     ["*"],
                     placement_fn=make_bucketed_owned_full_param_placement_fn(),
                     mesh=mesh,
-                    mp_policy=MixedPrecisionPolicy(param_dtype=param_dtype),
+                    mp_policy=mp_policy,
                     reshard_after_forward=reshard_after_forward,
                 )
             ],
@@ -300,7 +340,13 @@ class TestOwnerRowsTransportBuffers(FSDPTest):
             for name, module in model.named_children()
         ]
         calls: Counter[str] = Counter()
-        originals = {name: getattr(dist, name) for name in ("all_gather", "all_gather_into_tensor")}
+        names = (
+            "all_gather",
+            "all_gather_into_tensor",
+            "reduce_scatter",
+            "reduce_scatter_tensor",
+        )
+        originals = {name: getattr(dist, name) for name in names}
 
         def counting(name):
             def call(*args, **kwargs):
@@ -310,9 +356,9 @@ class TestOwnerRowsTransportBuffers(FSDPTest):
             return call
 
         optimizer = make_test_sgd(model.parameters(), lr=0.1)
-        outputs = []
+        outputs, grads = [], {}
         torch.manual_seed(1 + self.rank)
-        with mock.patch.multiple(dist, **{name: counting(name) for name in originals}):
+        with mock.patch.multiple(dist, **{name: counting(name) for name in names}):
             for step in range(3):
                 output = model(torch.randn(4, 64, device="cuda", dtype=param_dtype))
                 if step == 0:
@@ -320,25 +366,37 @@ class TestOwnerRowsTransportBuffers(FSDPTest):
                         handle.remove()
                 outputs.append(output.detach().clone())
                 output.float().square().sum().backward()
+                if step == 0:
+                    grads = {
+                        name: param.grad.detach().clone()
+                        for name, param in model.named_parameters()
+                        if param.grad is not None and param.grad.numel()
+                    }
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
         self.assertEqual(mismatches, [])
         if transport == "grouped":
             self.assertGreater(calls["all_gather"], 0, calls)
-            return outputs
-        self.assertEqual(calls["all_gather"], 0, calls)
+            self.assertGreater(calls["reduce_scatter"], 0, calls)
+            return outputs, grads
+        self.assertEqual(calls["all_gather"] + calls["reduce_scatter"], 0, calls)
         self.assertGreater(calls["all_gather_into_tensor"], 0, calls)
+        self.assertGreater(calls["reduce_scatter_tensor"], 0, calls)
         # Rows of their owners' lengths: the gathered storage is padded only
         # up to whole chunks.
-        row = torch.tensor([model.sharded_bucket_storages[0].total_bytes // 4], device="cuda")
+        row = torch.tensor(
+            [model.sharded_bucket_storages[0].total_bytes // 4], device="cuda"
+        )
         rows = [torch.zeros_like(row) for _ in range(self.world_size)]
         dist.all_gather(rows, row)
-        plan = owner_rows_transport_plan(mesh, [int(r) for r in rows], torch.device("cuda"))
+        plan = owner_rows_transport_plan(
+            mesh, [int(r) for r in rows], torch.device("cuda")
+        )
         self.assertIsNotNone(plan)
         self.assertEqual(storages, {plan[0].gathered_numel * param_dtype.itemsize})
         if os.environ["LOCAL_WORLD_SIZE"] == "2":
             self.assertTrue(plan[0].host_moves)
-        return outputs
+        return outputs, grads
 
 
 if __name__ == "__main__":

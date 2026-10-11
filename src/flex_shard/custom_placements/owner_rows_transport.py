@@ -36,7 +36,7 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import DeviceMesh
 
 from ..flex_shard.utils import mesh_rank_hosts
-from .utils import foreach_copy_
+from .utils import foreach_copy_, reduce_scatter_grads
 
 # Chunk sizes, rail splits and relayed slices round up to this many elements,
 # 256 bytes in BF16.
@@ -409,3 +409,66 @@ def gather_owner_rows(
     if work is not None:
         buffer.readers.append(work)
     return work
+
+
+def reduce_owner_rows(
+    plan: OwnerRowsTransportPlan,
+    hosts: Sequence[int],
+    buffers: OwnerRowsTransportBuffers,
+    *,
+    rank: int,
+    row_start: int,
+    send: torch.Tensor,
+    recv: torch.Tensor,
+    reduction: Any,
+    pg: dist.ProcessGroup,
+) -> None:
+    """Reduce-scatter the gradient bucket ``send`` (``plan.gathered_numel``
+    long, rows back to back) and bring this rank's row back into ``recv``.
+
+    NCCL's reduce-scatter writes each rank's chunk into its buffer. Relays
+    read the slices bound for other hosts from their holders, NCCL carries
+    them back, and each owner reads its row's slices from the buffers of the
+    ranks holding them, casting to ``recv``'s dtype on the way. A last
+    barrier keeps anyone from overwriting a buffer still being read."""
+    buffer = buffers.get("reduce", send.dtype, plan.buffer_numel, send.device)
+    buffer.wait_readers()
+    reduce_scatter_grads(buffer.tensor[: plan.chunk_numel], send, reduction, pg)
+    buffer.barrier()
+    relays = [
+        (
+            buffer.tensor[plan.buffer_offset(rank, move.start) :][: move.numel],
+            buffer.peers[move.dst][plan.buffer_offset(move.dst, move.start) :][
+                : move.numel
+            ],
+        )
+        for move in plan.relay_moves
+        if move.src == rank
+    ]
+    if relays:
+        foreach_copy_([dst for dst, _ in relays], [src for _, src in relays])
+    _host_p2p(plan, rank, buffer.tensor, pg, reverse=True)
+    if any(hosts[move.src] == hosts[rank] for move in plan.host_moves):
+        buffer.barrier()
+    row_end = row_start + recv.numel()
+    reads: tuple[list[torch.Tensor], list[torch.Tensor]] = ([], [])
+
+    def read(holder: int, start: int, numel: int) -> None:
+        offset = plan.buffer_offset(holder, start)
+        reads[0].append(recv[start - row_start :][:numel])
+        reads[1].append(buffer.peers[holder][offset : offset + numel])
+
+    received = []
+    for move in plan.owner_moves:
+        if move.src == rank:
+            read(move.dst, move.start, move.numel)
+            received.append((move.start, move.numel))
+    for move in plan.host_moves:
+        if move.src == rank and row_start <= move.start < row_end:
+            read(rank, move.start, move.numel)
+            received.append((move.start, move.numel))
+    for start, numel in _subtract(row_start, recv.numel(), received):
+        read(rank, start, numel)
+    if reads[0]:
+        foreach_copy_(reads[0], reads[1])
+    buffer.barrier()
