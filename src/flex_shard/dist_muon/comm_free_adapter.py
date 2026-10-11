@@ -49,6 +49,17 @@ class LocalDistMuonBinding:
         )
 
     def step(self) -> None:
+        self.copy_grads_to_proxies()
+        self.optimizer.step()
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        self.optimizer.zero_grad(set_to_none=set_to_none)
+        self.zero_real_grads(set_to_none)
+
+    def copy_grads_to_proxies(self) -> None:
+        """Give each proxy parameter its real parameter's gradient, as
+        ``step()`` does before the optimizer's step. For an optimizer whose own
+        ``step()`` must do it, e.g. one that a training loop drives directly."""
         missing = [
             binding.fqn
             for binding in self._parameter_bindings
@@ -72,10 +83,10 @@ class LocalDistMuonBinding:
             )
         for binding in self._parameter_bindings:
             binding.proxy_param.grad = _proxy_gradient(binding)
-        self.optimizer.step()
 
-    def zero_grad(self, set_to_none: bool = True) -> None:
-        self.optimizer.zero_grad(set_to_none=set_to_none)
+    def zero_real_grads(self, set_to_none: bool = True) -> None:
+        """Zero the real parameters' gradients, as ``zero_grad()`` does after
+        the optimizer's."""
         for binding in self._parameter_bindings:
             param = binding.real_param
             if param.grad is None:
