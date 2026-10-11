@@ -216,7 +216,11 @@ class BucketSpec:
             their offsets, in the reduce dtype, let a placement whose gradient
             reduction layout is its parameter layout (``BucketedBlockShard``
             with equal rank ranges, whole-parameter ``BucketedOwned``)
-            reduce-scatter that buffer without copying the grads in. Eager only.
+            reduce-scatter that buffer without copying the grads in
+            (``alloc_grads_in_param_layout``). A whole-parameter
+            ``BucketedOwned`` bucket with no hook gets its grads allocated so
+            when its params are in the dtype their grads accumulate and reduce
+            in (``Placement.reduces_grads_in_param_layout``). Eager only.
         post_reduce_hook: Optional callable run with the same pairs once a
             syncing backward has taken their grads for the reduce-scatter, e.g.
             to release references to those grads. Eager only.
