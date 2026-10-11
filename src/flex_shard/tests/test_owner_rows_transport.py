@@ -194,6 +194,68 @@ class TestOwnerRowsTransportPlan(TestCase):
             self._check(rows, mesh_rank_hosts(range(16), 4))
 
 
+class TestOwnerRowsTransportChoice(TestCase):
+    def test_auto_falls_back_when_most_of_a_bucket_crosses_hosts(self) -> None:
+        # 64 ranks on 8 hosts. A pair of MoE layers puts 83% of its owner rows
+        # across hosts in the shuffle, more than the 0.7 default, so it keeps the
+        # grouped calls; 4 MoE layers (17%) and a dense layer (57%) take chunks.
+        # "chunks" and "grouped" force one path.
+        mesh = mock.MagicMock(ndim=1, mesh=torch.arange(64))
+        hosts = mesh_rank_hosts(range(64), 8)
+        dense = (7168 * 16384, 1536 * 7168, 18432 * 7168, 18432 * 7168, 7168 * 18432)
+        cases = {
+            "moe pair": _MOE_LAYER * 2,
+            "moe stage": _MOE_LAYER * 4,
+            "dense layer": dense,
+        }
+        expected = {"moe pair": False, "moe stage": True, "dense layer": True}
+        for name, numels in cases.items():
+            group = AssignmentGroup(
+                matrices=tuple(
+                    WholeMatrixSpec(f"m{i}", n) for i, n in enumerate(numels)
+                ),
+                block_groups=(),
+            )
+            owners = assign_matrices((group,), num_ranks=64, hosts=hosts).rank_by_matrix
+            rows = [0] * 64
+            for matrix in group.matrices:
+                rows[owners[matrix.name]] += matrix.numel
+            for transport, takes_chunks in (
+                ("auto", expected[name]),
+                ("chunks", True),
+                ("grouped", False),
+            ):
+                with (
+                    self.subTest(bucket=name, transport=transport),
+                    mock.patch.dict(
+                        os.environ,
+                        {
+                            "LOCAL_WORLD_SIZE": "8",
+                            "FLEX_SHARD_OWNER_ROWS_TRANSPORT": transport,
+                        },
+                    ),
+                ):
+                    plan = owner_rows_transport_plan(mesh, rows, torch.device("cuda"))
+                    self.assertEqual(plan is not None, takes_chunks)
+        with mock.patch.dict(
+            os.environ,
+            {"LOCAL_WORLD_SIZE": "8", "FLEX_SHARD_OWNER_ROWS_MAX_CROSSING": "0.9"},
+        ):
+            group = AssignmentGroup(
+                matrices=tuple(
+                    WholeMatrixSpec(f"m{i}", n) for i, n in enumerate(cases["moe pair"])
+                ),
+                block_groups=(),
+            )
+            owners = assign_matrices((group,), num_ranks=64, hosts=hosts).rank_by_matrix
+            rows = [0] * 64
+            for matrix in group.matrices:
+                rows[owners[matrix.name]] += matrix.numel
+            self.assertIsNotNone(
+                owner_rows_transport_plan(mesh, rows, torch.device("cuda"))
+            )
+
+
 class TestOwnerRowsTransportBuffers(FSDPTest):
     @property
     def world_size(self) -> int:

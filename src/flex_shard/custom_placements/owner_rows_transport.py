@@ -259,6 +259,11 @@ def owner_rows_transport_buffers(
 
 
 _TRANSPORT_ENV = "FLEX_SHARD_OWNER_ROWS_TRANSPORT"
+_MAX_CROSSING_ENV = "FLEX_SHARD_OWNER_ROWS_MAX_CROSSING"
+# Measured at 64 ranks on 8 H100 hosts: chunks beat the grouped broadcasts and
+# reduces with 17%, 19% and 57% of a bucket crossing hosts in the shuffle, and
+# lost with 83% (DeepSeek V3 buckets; PLAN_FLEXSHARD_TWO_LEVEL_OWNER_TRANSPORT.md).
+_DEFAULT_MAX_CROSSING = 0.7
 
 
 def owner_rows_transport_plan(
@@ -270,11 +275,18 @@ def owner_rows_transport_plan(
     - with equal rows, which already take one native collective;
     - off CUDA, or on a mesh with no host holding two of its ranks, where
       symmetric memory has nothing to share;
-    - with ``FLEX_SHARD_OWNER_ROWS_TRANSPORT=grouped``.
+    - by default, when more than ``FLEX_SHARD_OWNER_ROWS_MAX_CROSSING`` (0.7)
+      of the bucket would cross hosts in the shuffle. That happens when whole
+      matrices are much larger than a host's share of the bucket: they spill
+      into other hosts' chunks and push those hosts' rows out too.
+    ``FLEX_SHARD_OWNER_ROWS_TRANSPORT`` is ``auto`` by default; ``chunks``
+    takes the chunks wherever they can run, ``grouped`` never.
     """
-    choice = os.environ.get(_TRANSPORT_ENV, "chunks")
-    if choice not in ("chunks", "grouped"):
-        raise ValueError(f"{_TRANSPORT_ENV} must be chunks or grouped, got {choice!r}.")
+    choice = os.environ.get(_TRANSPORT_ENV, "auto")
+    if choice not in ("auto", "chunks", "grouped"):
+        raise ValueError(
+            f"{_TRANSPORT_ENV} must be auto, chunks or grouped, got {choice!r}."
+        )
     if (
         choice == "grouped"
         or torch.compiler.is_compiling()
@@ -286,7 +298,13 @@ def owner_rows_transport_plan(
     hosts = mesh_rank_hosts(mesh.mesh.flatten().tolist())
     if max(Counter(hosts).values()) < 2:
         return None
-    return plan_owner_rows_transport(tuple(row_numels), hosts), hosts
+    plan = plan_owner_rows_transport(tuple(row_numels), hosts)
+    max_crossing = float(os.environ.get(_MAX_CROSSING_ENV, _DEFAULT_MAX_CROSSING))
+    if choice == "auto" and sum(move.numel for move in plan.host_moves) > (
+        max_crossing * sum(row_numels)
+    ):
+        return None
+    return plan, hosts
 
 
 def _subtract(
