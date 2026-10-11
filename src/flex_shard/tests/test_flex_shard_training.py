@@ -762,6 +762,99 @@ class TestFlexShardTraining(FSDPTest):
                 )
 
     @skip_if_lt_x_gpu(2)
+    def test_owner_rows_hold_no_padding(self):
+        # Whole-parameter owners keep rows of their own lengths: each rank
+        # stores its row alone, the gathered bucket holds the rows back to
+        # back, and uneven rows take one broadcast and one reduce per owner
+        # (the list all_gather and reduce_scatter), while equal rows keep the
+        # single collectives. Training matches an unsharded reference.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        names = (
+            "all_gather",
+            "all_gather_into_tensor",
+            "reduce_scatter",
+            "reduce_scatter_tensor",
+        )
+        for out_features, gradient_bucket in ((8, False), (8, True), (16, False)):
+            # Linear(16, 16) then Linear(16, out_features) on 2 ranks: largest
+            # first to the least-loaded rank gives rows of 256 and 152 elements
+            # for 8 output features, and 272 each for 16.
+            rows = (256, 152) if out_features == 8 else (272, 272)
+            with self.subTest(
+                out_features=out_features, gradient_bucket=gradient_bucket
+            ):
+                torch.manual_seed(0)
+                model = torch.nn.Sequential(
+                    torch.nn.Linear(16, 16),
+                    torch.nn.Linear(16, out_features),
+                ).to(device_type)
+                reference = copy.deepcopy(model)
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            ["0.*", "1.*"],
+                            placement_fn=make_bucketed_owned_full_param_placement_fn(),
+                            mesh=mesh,
+                            reshard_after_forward=False,
+                            pre_backward_hook=(
+                                alloc_grads_in_param_layout if gradient_bucket else None
+                            ),
+                        )
+                    ],
+                )
+                element_size = 4
+                self.assertEqual(
+                    model.sharded_bucket_storages[0].total_bytes,
+                    rows[self.rank] * element_size,
+                )
+                optimizer = make_test_sgd(model.parameters(), lr=0.1)
+                reference_optimizer = make_test_sgd(reference.parameters(), lr=0.1)
+                calls: Counter[str] = Counter()
+
+                def counting(name, original):
+                    def call(*args, **kwargs):
+                        calls[name] += 1
+                        return original(*args, **kwargs)
+
+                    return call
+
+                patches = [
+                    mock.patch.object(dist, name, counting(name, getattr(dist, name)))
+                    for name in names
+                ]
+                torch.manual_seed(1 + self.rank)
+                for patch in patches:
+                    patch.start()
+                try:
+                    for _ in range(3):
+                        optimizer.zero_grad(set_to_none=True)
+                        reference_optimizer.zero_grad(set_to_none=True)
+                        x = torch.randn(4, 16, device=device_type)
+                        output = model(x)
+                        # Unsharded until backward: the params view the
+                        # gathered rows.
+                        self.assertEqual(
+                            model[0].weight.untyped_storage().nbytes(),
+                            sum(rows) * element_size,
+                        )
+                        reference_output = reference(x)
+                        self.assertEqual(output, reference_output)
+                        output.square().sum().backward()
+                        reference_output.square().sum().backward()
+                        _average_reference_grads(reference)
+                        optimizer.step()
+                        reference_optimizer.step()
+                finally:
+                    for patch in patches:
+                        patch.stop()
+                uneven = rows[0] != rows[1]
+                self.assertEqual(calls["all_gather"] > 0, uneven, calls)
+                self.assertEqual(calls["reduce_scatter"] > 0, uneven, calls)
+                self.assertEqual(calls["all_gather_into_tensor"] > 0, not uneven, calls)
+                self.assertEqual(calls["reduce_scatter_tensor"] > 0, not uneven, calls)
+
+    @skip_if_lt_x_gpu(2)
     def test_gradient_divide_factor(self):
         # The reduced gradient is the sum over the mesh divided by the factor,
         # e.g. the dense data-parallel size for an expert bucket on an expert
