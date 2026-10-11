@@ -32,6 +32,13 @@ from ..flex_shard.utils import (
 from .block_shard import _grad_reduce_dtype, _unsharded_dtype, BlockShard
 from .fp8_bucketed_block_shard import _align_up, _VEC_ALIGN_BYTES, Fp8BucketedBlockShard
 from .owned import BucketedOwned
+from .owner_rows_transport import (
+    gather_owner_rows,
+    owner_rows_transport_buffers,
+    owner_rows_transport_plan,
+    OwnerRowsTransportBuffers,
+    OwnerRowsTransportPlan,
+)
 from .shard import Shard
 from .utils import foreach_copy_, reduce_scatter_grads, reduce_scatter_grads_uneven
 
@@ -86,17 +93,33 @@ class _MixedUnshardState:
 
 
 @dataclass(frozen=True)
+class _OwnerRowsGather:
+    """A gather through equal chunks (see owner_rows_transport): the plan, the
+    mesh ranks' hosts, the transport buffers, this mesh rank, and its params
+    with their starts in the gathered buffer."""
+
+    plan: OwnerRowsTransportPlan
+    hosts: tuple[int, ...]
+    buffers: OwnerRowsTransportBuffers
+    rank: int
+    sources: list[tuple[torch.Tensor, int]]
+
+
+@dataclass(frozen=True)
 class _OwnerRowsUnshardState:
     """Unshard state of a bucket whose groups each live whole on one owner,
     whose params view the gathered rows (see
     MixedBucketPlacement._prepare_owner_rows_unshard). ``row_numels`` are the
-    rows' lengths, back to back in the gathered buffer."""
+    rows' lengths, back to back in the gathered buffer. With ``transport``,
+    the rows go through equal chunks and the buffer is padded to whole chunks;
+    without, they're gathered at their own lengths."""
 
     groups: list[_MixedUnshardGroupState]
     world_size: int
     row_numels: tuple[int, ...]
     pg: Any
     debug_fqn: str | None
+    transport: _OwnerRowsGather | None = None
 
 
 @dataclass(frozen=True)
@@ -716,7 +739,23 @@ class MixedBucketPlacement(Placement):
             if owner_rank == rank
             for index, tensor in enumerate(group.tensors)
         ]
-        send = _owner_row_view(owned, row_numels[rank], dtype)
+        device = groups[0].tensors[0].device
+        transport = owner_rows_transport_plan(mesh, row_numels, device)
+        gather = None
+        if transport is not None:
+            # The owner writes straight from its params' storage, casting on
+            # the way, so there is no send row.
+            row_start = _row_starts(row_numels)[rank]
+            gather = _OwnerRowsGather(
+                plan=transport[0],
+                hosts=transport[1],
+                buffers=owner_rows_transport_buffers(mesh, transport[1]),
+                rank=rank,
+                sources=[(tensor, row_start + start) for tensor, start in owned],
+            )
+            send = torch.empty(0, dtype=dtype, device=device)
+        else:
+            send = _owner_row_view(owned, row_numels[rank], dtype)
         if send is None:
             # The params are not in such storage (e.g. they are in another
             # dtype, or this rank owns none): copy them in.
@@ -755,6 +794,7 @@ class MixedBucketPlacement(Placement):
                 row_numels=row_numels,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
+                transport=gather,
             ),
         )
 
@@ -769,8 +809,27 @@ class MixedBucketPlacement(Placement):
             # A refill gathers straight into the persistent rows.
             gathered = prepared.persistent_buffers[0]
         else:
-            gathered = prepared.buffers[0].new_empty(sum(state.row_numels))
+            gathered = prepared.buffers[0].new_empty(
+                sum(state.row_numels)
+                if state.transport is None
+                else state.transport.plan.gathered_numel
+            )
             prepared.buffers.insert(1, gathered)
+        if state.transport is not None:
+            gather = state.transport
+            with _record_comm_if_eager("FlexShard::owner_rows_gather", state.debug_fqn):
+                return gather_owner_rows(
+                    gather.plan,
+                    gather.hosts,
+                    gather.buffers,
+                    rank=gather.rank,
+                    row_start=_row_starts(state.row_numels)[gather.rank],
+                    row_numel=state.row_numels[gather.rank],
+                    sources=gather.sources,
+                    gathered=gathered,
+                    pg=state.pg,
+                    async_op=async_op,
+                )
         with _record_comm_if_eager("FlexShard::mixed_all_gather", state.debug_fqn):
             if len(set(state.row_numels)) == 1:
                 return dist.all_gather_into_tensor(
