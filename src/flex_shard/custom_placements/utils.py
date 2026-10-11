@@ -172,6 +172,24 @@ def reduce_scatter_grads(
         output.div_(post_factor)
 
 
+def reduce_scatter_grads_uneven(
+    output: torch.Tensor,
+    inputs: list[torch.Tensor],
+    reduction: GradientReduction,
+    group: Any,
+) -> None:
+    """``reduce_scatter_grads`` for uneven chunks: ``inputs[r]`` is reduced into
+    rank r's ``output``, as one NCCL reduce per rank in one group."""
+    reduce_op, pre_factor, post_factor = _gradient_reduce_scatter_op(
+        reduction, group.size(), output.dtype
+    )
+    if pre_factor is not None:
+        inputs = [chunk / pre_factor for chunk in inputs]
+    dist.reduce_scatter(output, inputs, op=reduce_op, group=group)
+    if post_factor is not None:
+        output.div_(post_factor)
+
+
 def pack_segments_into_flat_buffer_triton_if_supported(
     inputs: list[torch.Tensor],
     tensor_indices: Sequence[int],
