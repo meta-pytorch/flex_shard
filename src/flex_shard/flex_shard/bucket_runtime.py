@@ -443,7 +443,13 @@ class BucketCommContext:
     def reset(self) -> None:
         """Reshard every bucket and clear per-backward state, for
         ``FlexShardModule.reshard()``. Unsharded params keep their grads, which
-        may be accumulated without sync."""
+        may be accumulated without sync.
+
+        A backward left unfinished, e.g. under manual backward finalization,
+        may also have left grad upcasts deferred. Restore them, as FSDP2's
+        post-backward does after every call, so the next backward that starts
+        a grad without sync keeps the upcast.
+        """
         self.check_no_raised_backward()
         self.take_pending_unshard(None)
         self.wait_and_clear_reduce_grad_states(debug_fqn=None)
@@ -452,6 +458,7 @@ class BucketCommContext:
             if bucket.is_unsharded:
                 bucket.reshard()
             bucket.reset_backward_state()
+            bucket._set_unsharded_grad_dtypes(defer_upcast=False)
 
     def wait_and_clear_reduce_grad_states(
         self,
