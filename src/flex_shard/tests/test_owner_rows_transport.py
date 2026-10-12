@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 import itertools
 import os
 from collections import Counter, defaultdict
@@ -357,6 +358,72 @@ class TestOwnerRowsTransportBuffers(FSDPTest):
                 self.assertEqual(grad, grouped[1][name], **tolerance)
             for first, second in zip(chunks[0], grouped[0], strict=True):
                 self.assertEqual(first.float(), second.float(), rtol=2e-2, atol=2e-2)
+
+    @skip_if_lt_x_gpu(4)
+    def test_grouped_path_with_empty_first_rows(self) -> None:
+        # Owners carried across buckets put the second bucket's one row on rank
+        # 3, so its first two rows are empty, as in most buckets at gate 5's
+        # 256 GPUs. It trains as an unsharded reference, resharding after
+        # forward or not.
+        mesh = init_device_mesh("cuda", (self.world_size,))
+        for reshard_after_forward in (True, False):
+            with (
+                self.subTest(reshard_after_forward=reshard_after_forward),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "LOCAL_WORLD_SIZE": "4",
+                        "FLEX_SHARD_OWNER_ROWS_TRANSPORT": "grouped",
+                    },
+                ),
+            ):
+                torch.manual_seed(0)
+                model = nn.Sequential(
+                    nn.Linear(16, 16, bias=False),
+                    nn.Linear(16, 16, bias=False),
+                    nn.Linear(16, 8, bias=False),
+                    nn.Linear(8, 8, bias=False),
+                ).cuda()
+                reference = copy.deepcopy(model)
+                placement_fn = make_bucketed_owned_full_param_placement_fn(
+                    carry_loads=True
+                )
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            patterns,
+                            placement_fn=placement_fn,
+                            mesh=mesh,
+                            reshard_after_forward=reshard_after_forward,
+                        )
+                        for patterns in (["0.*", "1.*", "2.*"], ["3.*"])
+                    ],
+                )
+                owners = [
+                    sorted(
+                        segment.owner_rank
+                        for fqn, info in storage.param_infos.items()
+                        for segment in info.placement.segments_by_fqn[fqn]
+                    )
+                    for storage in model.sharded_bucket_storages
+                ]
+                self.assertEqual(owners, [[0, 1, 2], [3]])
+                optimizer = make_test_sgd(model.parameters(), lr=0.1)
+                reference_optimizer = make_test_sgd(reference.parameters(), lr=0.1)
+                torch.manual_seed(1 + self.rank)
+                for _ in range(3):
+                    x = torch.randn(4, 16, device="cuda")
+                    output, reference_output = model(x), reference(x)
+                    self.assertEqual(output, reference_output)
+                    output.square().sum().backward()
+                    reference_output.square().sum().backward()
+                    for param in reference.parameters():
+                        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+                    optimizer.step()
+                    reference_optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    reference_optimizer.zero_grad(set_to_none=True)
 
     def _train(self, mesh, mp_policy, reshard_after_forward, transport):
         """Train 3 steps; return the outputs and step 0's sharded grads."""
