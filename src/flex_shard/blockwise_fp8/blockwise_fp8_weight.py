@@ -14,6 +14,7 @@ import torch
 from torch.utils._python_dispatch import return_and_correct_aliasing
 
 from ..custom_placements.fp8_bucketed_block_shard import (
+    _matrix_shape,
     _pad_2d_to_block_shape,
     _scale_shape,
     _validate_2d_non_empty,
@@ -54,7 +55,11 @@ def blockwise_dequant_weight(
 
 
 class BlockwiseFp8Weight(torch.Tensor):
-    """Blockwise FP8 weight returned by the FlexShard all-gather."""
+    """Blockwise FP8 weight returned by the FlexShard all-gather.
+
+    Stacked weights keep the parameter shape, e.g. ``[num_linears, out, in]``.
+    Their scales cover the flattened ``[num_linears * out, in]`` matrix.
+    """
 
     __slots__ = ["_data", "_recip_scale", "_block_size", "_orig_dtype"]
 
@@ -87,11 +92,13 @@ class BlockwiseFp8Weight(torch.Tensor):
         requires_grad: bool = False,
     ) -> None:
         _ = requires_grad
-        if data.ndim != 2:
-            raise ValueError(f"BlockwiseFp8Weight expects 2D data, got {data.shape}")
+        if data.ndim < 2:
+            raise ValueError(
+                f"BlockwiseFp8Weight expects 2D or stacked 2D data, got {data.shape}"
+            )
         if block_size <= 0:
             raise ValueError(f"block_size must be positive, got {block_size}")
-        expected_scale = _scale_shape(data.shape, block_size)
+        expected_scale = _scale_shape(_matrix_shape(data.shape), block_size)
         if tuple(recip_scale.shape) != expected_scale:
             raise ValueError(
                 f"scale shape must be {expected_scale} for data {tuple(data.shape)} "
@@ -125,11 +132,11 @@ class BlockwiseFp8Weight(torch.Tensor):
 
     def dequantize(self, dtype: torch.dtype | None = None) -> torch.Tensor:
         result = blockwise_dequant_weight(
-            self._data,
+            self._data.flatten(0, -2),
             self._recip_scale,
             self._block_size,
         )
-        return result.to(dtype or self._orig_dtype)
+        return result.reshape(self._data.shape).to(dtype or self._orig_dtype)
 
     def __tensor_flatten__(self) -> tuple[list[str], dict[str, Any]]:
         return ["_data", "_recip_scale"], {
