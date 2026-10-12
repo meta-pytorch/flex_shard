@@ -88,6 +88,26 @@ def set_global_layout(tensor: torch.Tensor, layout: GlobalLayout) -> None:
     tensor.local_sizes = layout.local_sizes
 
 
+_PARTIAL_GRAD_GROUP_ATTR = "_flex_shard_partial_grad_group"
+
+
+def set_partial_grad_group(tensor: torch.Tensor, group: dist.ProcessGroup) -> None:
+    """Declare that each rank of ``group`` computes only part of ``tensor``'s grad.
+
+    Call before ``flex_shard()``, for example on a norm weight under tensor
+    parallelism with sequence parallelism, where each rank's grad covers its
+    own tokens. FlexShard then sums the parameter's unsharded grad over
+    ``group`` before the reduce-scatter, as FSDP2 redistributes a ``Partial``
+    grad on a mesh dim it does not shard over.
+    """
+    setattr(tensor, _PARTIAL_GRAD_GROUP_ATTR, group)
+
+
+def get_partial_grad_group(tensor: torch.Tensor) -> dist.ProcessGroup | None:
+    """Return the group ``tensor`` declared its grad partial over, if any."""
+    return getattr(tensor, _PARTIAL_GRAD_GROUP_ATTR, None)
+
+
 def compose_global_layouts(outer: GlobalLayout, inner: GlobalLayout) -> GlobalLayout:
     """Map ``inner`` chunks into ``outer``'s global coordinates.
 
@@ -421,6 +441,7 @@ __all__ = [
     "BucketStorageLayout",
     "compose_global_layouts",
     "get_global_layout",
+    "get_partial_grad_group",
     "GlobalLayout",
     "GradientReduceOp",
     "GradientReduction",
@@ -431,4 +452,5 @@ __all__ = [
     "PlacementReduceGradResult",
     "PlacementUnshardResult",
     "set_global_layout",
+    "set_partial_grad_group",
 ]
