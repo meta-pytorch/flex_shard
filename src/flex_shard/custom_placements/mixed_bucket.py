@@ -32,6 +32,14 @@ from ..flex_shard.utils import (
 from .block_shard import _grad_reduce_dtype, _unsharded_dtype, BlockShard
 from .fp8_bucketed_block_shard import _align_up, _VEC_ALIGN_BYTES, Fp8BucketedBlockShard
 from .owned import BucketedOwned
+from .owner_rows_transport import (
+    gather_owner_rows,
+    reduce_owner_rows,
+    owner_rows_transport_buffers,
+    owner_rows_transport_plan,
+    OwnerRowsTransportBuffers,
+    OwnerRowsTransportPlan,
+)
 from .shard import Shard
 from .utils import foreach_copy_, reduce_scatter_grads, reduce_scatter_grads_uneven
 
@@ -86,17 +94,47 @@ class _MixedUnshardState:
 
 
 @dataclass(frozen=True)
+class _OwnerRowsGather:
+    """A gather through equal chunks (see owner_rows_transport): the plan, the
+    mesh ranks' hosts, the transport buffers, this mesh rank, and its params
+    with their starts in the gathered buffer."""
+
+    plan: OwnerRowsTransportPlan
+    hosts: tuple[int, ...]
+    buffers: OwnerRowsTransportBuffers
+    rank: int
+    sources: list[tuple[torch.Tensor, int]]
+
+
+@dataclass(frozen=True)
 class _OwnerRowsUnshardState:
     """Unshard state of a bucket whose groups each live whole on one owner,
     whose params view the gathered rows (see
     MixedBucketPlacement._prepare_owner_rows_unshard). ``row_numels`` are the
-    rows' lengths, back to back in the gathered buffer."""
+    rows' lengths, back to back in the gathered buffer. With ``transport``,
+    the rows go through equal chunks and the buffer is padded to whole chunks;
+    without, they're gathered at their own lengths."""
 
     groups: list[_MixedUnshardGroupState]
     world_size: int
     row_numels: tuple[int, ...]
     pg: Any
     debug_fqn: str | None
+    transport: _OwnerRowsGather | None = None
+
+
+@dataclass(frozen=True)
+class _OwnerRowsReduce:
+    """A reduce through equal chunks (see owner_rows_transport): the plan, the
+    mesh ranks' hosts, the transport buffers, this mesh rank, and the dtype
+    its row comes back in: its sharded grads' dtype, so the cast to it happens
+    on the way."""
+
+    plan: OwnerRowsTransportPlan
+    hosts: tuple[int, ...]
+    buffers: OwnerRowsTransportBuffers
+    rank: int
+    recv_dtype: torch.dtype
 
 
 @dataclass(frozen=True)
@@ -115,8 +153,10 @@ class _MixedReduceGradState:
     pg: Any
     debug_fqn: str | None
     # Owner rows only: each rank's row length, back to back in the send buffer
-    # (see _owner_rows_reduce_state); row_numel is then this rank's.
+    # (see _owner_rows_reduce_state); row_numel is then this rank's. With
+    # transport, the send buffer is padded to whole chunks.
     row_numels: tuple[int, ...] | None = None
+    transport: _OwnerRowsReduce | None = None
 
 
 class _MixedBucketMember:
@@ -716,7 +756,23 @@ class MixedBucketPlacement(Placement):
             if owner_rank == rank
             for index, tensor in enumerate(group.tensors)
         ]
-        send = _owner_row_view(owned, row_numels[rank], dtype)
+        device = groups[0].tensors[0].device
+        transport = owner_rows_transport_plan(mesh, row_numels, device)
+        gather = None
+        if transport is not None:
+            # The owner writes straight from its params' storage, casting on
+            # the way, so there is no send row.
+            row_start = _row_starts(row_numels)[rank]
+            gather = _OwnerRowsGather(
+                plan=transport[0],
+                hosts=transport[1],
+                buffers=owner_rows_transport_buffers(mesh, transport[1]),
+                rank=rank,
+                sources=[(tensor, row_start + start) for tensor, start in owned],
+            )
+            send = torch.empty(0, dtype=dtype, device=device)
+        else:
+            send = _owner_row_view(owned, row_numels[rank], dtype)
         if send is None:
             # The params are not in such storage (e.g. they are in another
             # dtype, or this rank owns none): copy them in.
@@ -755,6 +811,7 @@ class MixedBucketPlacement(Placement):
                 row_numels=row_numels,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
+                transport=gather,
             ),
         )
 
@@ -769,8 +826,27 @@ class MixedBucketPlacement(Placement):
             # A refill gathers straight into the persistent rows.
             gathered = prepared.persistent_buffers[0]
         else:
-            gathered = prepared.buffers[0].new_empty(sum(state.row_numels))
+            gathered = prepared.buffers[0].new_empty(
+                sum(state.row_numels)
+                if state.transport is None
+                else state.transport.plan.gathered_numel
+            )
             prepared.buffers.insert(1, gathered)
+        if state.transport is not None:
+            gather = state.transport
+            with _record_comm_if_eager("FlexShard::owner_rows_gather", state.debug_fqn):
+                return gather_owner_rows(
+                    gather.plan,
+                    gather.hosts,
+                    gather.buffers,
+                    rank=gather.rank,
+                    row_start=_row_starts(state.row_numels)[gather.rank],
+                    row_numel=state.row_numels[gather.rank],
+                    sources=gather.sources,
+                    gathered=gathered,
+                    pg=state.pg,
+                    async_op=async_op,
+                )
         with _record_comm_if_eager("FlexShard::mixed_all_gather", state.debug_fqn):
             if len(set(state.row_numels)) == 1:
                 return dist.all_gather_into_tensor(
@@ -852,9 +928,13 @@ class MixedBucketPlacement(Placement):
         if bucket is None or plan is None:
             return None
         layouts, offsets, owner_ranks, row_numels = plan
+        transport = _owner_rows_reduce_transport(
+            groups, owner_ranks, mesh, row_numels, bucket.device
+        )
+        numel = sum(row_numels) if transport is None else transport.plan.gathered_numel
         if (
             bucket.dtype != _grad_reduce_dtype(groups[0].infos[0])
-            or bucket.shape != (sum(row_numels),)
+            or bucket.shape != (numel,)
             or not bucket.is_contiguous()
         ):
             return None
@@ -877,7 +957,7 @@ class MixedBucketPlacement(Placement):
             placement=self,
             buffers=[bucket],
             placement_state=_owner_rows_reduce_state(
-                groups, layouts, offsets, row_numels, mesh, debug_fqn
+                groups, layouts, offsets, row_numels, mesh, debug_fqn, transport
             ),
         )
 
@@ -903,15 +983,22 @@ class MixedBucketPlacement(Placement):
         ):
             return None
         row_starts = _row_starts(row_numels)
+        device = groups[0].tensors[0].device
+        transport = _owner_rows_reduce_transport(
+            groups, owner_ranks, mesh, row_numels, device
+        )
         with _record_function_if_eager(
             "FlexShard::mixed_reduce_scatter_copy_in",
             debug_fqn,
         ):
             # The grads fill their rows but for the padding torch.compile adds
-            # (see _gathered_row_numels).
+            # (see _gathered_row_numels), and the transport's tail padding up
+            # to whole chunks, which no row holds.
             alloc = torch.zeros if torch.compiler.is_compiling() else torch.empty
             send = alloc(
-                sum(row_numels), dtype=dtype, device=groups[0].tensors[0].device
+                sum(row_numels) if transport is None else transport.plan.gathered_numel,
+                dtype=dtype,
+                device=device,
             )
             dsts: list[torch.Tensor] = []
             srcs: list[torch.Tensor] = []
@@ -938,7 +1025,7 @@ class MixedBucketPlacement(Placement):
             placement=self,
             buffers=[send],
             placement_state=_owner_rows_reduce_state(
-                groups, layouts, offsets, row_numels, mesh, debug_fqn
+                groups, layouts, offsets, row_numels, mesh, debug_fqn, transport
             ),
         )
 
@@ -1122,7 +1209,7 @@ class MixedBucketPlacement(Placement):
         send = prepared.buffers[0]
         recv = torch.empty(
             state.row_numel,
-            dtype=send.dtype,
+            dtype=send.dtype if state.transport is None else state.transport.recv_dtype,
             device=send.device,
         )
         uneven_rows = state.row_numels is not None and len(set(state.row_numels)) > 1
@@ -1130,7 +1217,20 @@ class MixedBucketPlacement(Placement):
             "FlexShard::mixed_reduce_scatter",
             state.debug_fqn,
         ):
-            if uneven_rows:
+            if state.transport is not None:
+                reduce = state.transport
+                reduce_owner_rows(
+                    reduce.plan,
+                    reduce.hosts,
+                    reduce.buffers,
+                    rank=reduce.rank,
+                    row_start=_row_starts(state.row_numels)[reduce.rank],
+                    send=send,
+                    recv=recv,
+                    reduction=reduction,
+                    pg=state.pg,
+                )
+            elif uneven_rows:
                 # One reduce per owner in one NCCL group, each straight from
                 # its row.
                 reduce_scatter_grads_uneven(
@@ -1531,6 +1631,7 @@ def _owner_rows_reduce_state(
     row_numels: tuple[int, ...],
     mesh: DeviceMesh,
     debug_fqn: str | None,
+    transport: _OwnerRowsReduce | None = None,
 ) -> _MixedReduceGradState:
     return _MixedReduceGradState(
         groups=[
@@ -1556,6 +1657,42 @@ def _owner_rows_reduce_state(
         pg=mesh.get_group(),
         debug_fqn=debug_fqn,
         row_numels=row_numels,
+        transport=transport,
+    )
+
+
+def _owner_rows_reduce_transport(
+    groups: list[_PlacementGroup],
+    owner_ranks: list[int],
+    mesh: DeviceMesh,
+    row_numels: tuple[int, ...],
+    device: torch.device,
+) -> _OwnerRowsReduce | None:
+    """The reduce through equal chunks for owner rows, if the transport takes
+    them (see owner_rows_transport_plan). This rank's row comes back in its
+    sharded grads' dtype (the params' dtype, or their explicit grad_dtype),
+    so the cast happens on the way; in the reduce dtype if they disagree."""
+    transport = owner_rows_transport_plan(mesh, row_numels, device)
+    if transport is None:
+        return None
+    rank = mesh.get_local_rank()
+    dtypes = {
+        info.grad_dtype_override if info.has_explicit_grad_dtype else info.dtype
+        for group, owner_rank in zip(groups, owner_ranks, strict=True)
+        if owner_rank == rank
+        for info in group.infos
+    }
+    recv_dtype = (
+        next(iter(dtypes))
+        if len(dtypes) == 1 and None not in dtypes
+        else _grad_reduce_dtype(groups[0].infos[0])
+    )
+    return _OwnerRowsReduce(
+        plan=transport[0],
+        hosts=transport[1],
+        buffers=owner_rows_transport_buffers(mesh, transport[1]),
+        rank=rank,
+        recv_dtype=recv_dtype,
     )
 
 
