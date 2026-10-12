@@ -880,10 +880,24 @@ class BucketRuntime:
         a tensor's hooks before its node's pre-hooks, so a consumer bucket's
         post-backward trigger (a hook on that same output) frees its params
         before this re-gather, as FSDP2's ordering does.
+
+        In a syncing backward of a bucket called more than once in the forward,
+        the first of these hooks reduce-scatters the grads kept from backwards
+        without sync on their own. FSDP2 runs a post-backward per call, and the
+        first one fires before autograd sums the calls' grads into the kept
+        ones, so it reduce-scatters the kept grads alone and this backward's
+        in a second reduce-scatter.
         """
         with dist._spmd_no_typecheck():
             self.context.queue_post_backward_callback(finish=True)
             self.unshard()
+            if (
+                self.backward_calls > 1
+                and self.needs_sync
+                and self.bucket_storage._requires_gradient_sync
+                and not self.bucket_storage._defer_post_backward
+            ):
+                self._post_backward(reshard=False)
             self._set_unsharded_grad_dtypes(defer_upcast=True)
             if self.bucket_storage._pre_backward_hook is not None:
                 self.bucket_storage._pre_backward_hook(self._named_unsharded_params())
@@ -1018,10 +1032,15 @@ class BucketRuntime:
         with dist._spmd_no_typecheck():
             self._post_backward()
 
-    def _post_backward(self) -> None:
+    def _post_backward(self, *, reshard: bool = True) -> None:
+        # reshard=False keeps the unsharded params for a backward still to run.
         if not self.bucket_storage._requires_gradient_sync:
             self.needs_sync = True
-            if self.is_unsharded and self.bucket_storage._reshard_after_backward:
+            if (
+                reshard
+                and self.is_unsharded
+                and self.bucket_storage._reshard_after_backward
+            ):
                 self.reshard()
             # After resharding, so a deferred grad's upcast never coexists with
             # the unsharded params.
@@ -1052,7 +1071,7 @@ class BucketRuntime:
             infos.append(bucket_param.param_info)
             sharded_params.append(bucket_param.sharded_param)
         self._run_post_reduce_hook()
-        if self.is_unsharded:
+        if reshard and self.is_unsharded:
             self.reshard()
         if not grads:
             return
