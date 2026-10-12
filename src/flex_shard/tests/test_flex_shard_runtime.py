@@ -18,7 +18,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.testing._internal.common_utils import run_tests, TestCase
 
-from .. import BucketSpec, flex_shard, is_flex_shard_param
+from .. import BucketSpec, flex_shard, is_flex_shard_param, MixedPrecisionPolicy
 from ..custom_placements.block_shard import (
     BucketedBlockShard,
     make_bucketed_block_placement_fn,
@@ -871,6 +871,55 @@ class TestFlexShardEagerRuntime(TestCase):
             finally:
                 gc.enable()
             self.assertEqual(allocated[1], allocated[2])
+
+    def test_shard_unshard_buffers(self):
+        # Shard all-gathers in place: with a narrower unsharded dtype, the
+        # local shard is cast straight into its chunk of the gather buffer. A
+        # refill allocates the persistent storage only at copy-out, as FSDP2
+        # allocates its unsharded parameters, so a prefetched bucket holds only
+        # its gather buffer.
+        with single_rank_cuda_mesh() as mesh:
+            torch.manual_seed(0)
+            model = nn.Sequential(nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8))
+            reference = copy.deepcopy(model).cuda()
+            flex_shard(
+                model,
+                buckets=[
+                    BucketSpec(
+                        [idx],
+                        placement_fn=per_param_placements,
+                        mesh=mesh,
+                        mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
+                        reshard_after_forward=True,
+                    )
+                    for idx in ("0", "2")
+                ],
+            )
+            _, bucket = _buckets(model)
+            # The first unshard creates the persistent buffers.
+            x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+            model(x).sum().backward()
+            handle = bucket.begin_unshard()
+            send_buf, gather_buf = handle.prepared.buffers
+            self.assertEqual(
+                send_buf.untyped_storage().data_ptr(),
+                gather_buf.untyped_storage().data_ptr(),
+            )
+            self.assertTrue(
+                all(b.untyped_storage().size() == 0 for b in bucket.persistent_buffers)
+            )
+            bucket.finish_unshard(handle)
+            self.assertTrue(
+                all(b.untyped_storage().size() > 0 for b in bucket.persistent_buffers)
+            )
+            for bucket_param, unsharded in zip(
+                bucket.bucket_params, bucket.unsharded_params, strict=True
+            ):
+                expected = reference.get_parameter(bucket_param.param_info.fqn)
+                torch.testing.assert_close(
+                    unsharded, expected.to(torch.bfloat16), atol=0, rtol=0
+                )
+            bucket.reshard()
 
     def test_released_refill_frees_storage(self):
         # A prefetch that refills a bucket's persistent storage, which begin

@@ -102,9 +102,10 @@ def begin_bucket_unshard(
 
     Eager unshards are persistent (see ``PlacementPreparedUnshard``); during
     graph capture the traced graph owns buffer lifetimes. Given the
-    ``persistent_buffers`` of an earlier unshard, with storage already
-    re-allocated on the current stream, the unshard refills them, in run or in
-    finish as the placement chooses.
+    ``persistent_buffers`` of an earlier unshard, the unshard refills them, in
+    run or in finish as the placement chooses. Their storage is re-allocated on
+    the current stream already, or, if the placement refills them in finish,
+    is re-allocated before finish.
     """
     placement = _get_bucket_placement(infos, "unshard")
 
