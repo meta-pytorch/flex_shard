@@ -58,6 +58,7 @@ each parameter's mesh, and updates local shards with AdamW.
 | `shard_placement_fn` returning `Shard(i)` | A `placement_fn` returning `Shard(i)`; one bucket may mix dims |
 | `fully_shard(layer.experts, mesh=efsdp_mesh)` | Expert `BucketSpec(..., mesh=efsdp_mesh)` |
 | `set_modules_to_forward_prefetch` / `set_modules_to_backward_prefetch` | `set_buckets_to_forward_prefetch` / `set_buckets_to_backward_prefetch` on entries of `sharded_bucket_storages` |
+| `unshard()`, `reshard()` and `set_reshard_after_forward` on one `fully_shard` group | The same methods on its bucket's storage, from `sharded_bucket_storages` or `model.bucket_storage_of(param)` |
 | Construct AdamW after sharding | Construct AdamW after sharding |
 | AdamW manages DTensor parameters | AdamW manages ordinary local parameter shards |
 
@@ -271,7 +272,10 @@ activation checkpointing without wrapping the model.
 Setting `reshard_after_forward=False` keeps gathered parameters available
 through backward, trading memory for fewer all-gathers. Such a bucket stays
 unsharded after a forward until its backward; call `model.reshard()` when that
-backward will not run, as with FSDP2's `FSDPModule.reshard()`.
+backward will not run, as with FSDP2's `FSDPModule.reshard()`. Like the methods
+of one `fully_shard` group, each bucket storage also has `unshard()`,
+`reshard()` and `set_reshard_after_forward()`; `model.bucket_storage_of(param)`
+finds the bucket of a parameter.
 
 For gradient accumulation, call `model.set_requires_gradient_sync(is_last)`
 before each microbatch, as with FSDP2; there is no `no_sync()` context
