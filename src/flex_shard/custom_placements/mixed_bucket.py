@@ -1101,6 +1101,12 @@ def _prepare_mixed_unshard_group(
             mesh,
             debug_fqn,
         )
+    if isinstance(placement, Shard):
+        # The mixed all-gather fills the group's gather buffer, even on a
+        # 1-rank mesh where Shard alone skips its all-gather.
+        return placement._prepare_unshard_bucket(
+            tensors, infos, mesh, debug_fqn, skip_single_rank_all_gather=False
+        )
     return placement.prepare_unshard_bucket(
         tensors,
         infos,
