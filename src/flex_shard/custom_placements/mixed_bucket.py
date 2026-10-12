@@ -192,6 +192,11 @@ class _MixedBucketMember:
     ) -> PlacementReduceGradResult:
         return self._mixed_bucket.reduce_prepared_grad(prepared, reduction)
 
+    def reduces_grads_in_param_layout(
+        self, infos: list[ParamInfo], world_size: int
+    ) -> bool:
+        return self._mixed_bucket.reduces_grads_in_param_layout(infos, world_size)
+
 
 class _MixedShard0(_MixedBucketMember, Shard):
     """Optimizer-visible Shard(0) member of one mixed bucket placement."""
@@ -1079,6 +1084,28 @@ class MixedBucketPlacement(Placement):
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
             ),
+        )
+
+    def reduces_grads_in_param_layout(
+        self, infos: list[ParamInfo], world_size: int
+    ) -> bool:
+        """Owner rows do (see _prepare_owner_rows_reduce_grad) when the
+        unsharded params are in the dtype their grads accumulate and reduce
+        in, so a gradient buffer in the dtype of the storage they view keeps
+        autograd's accumulation."""
+        dtype = _unsharded_dtype(infos[0])
+        return all(
+            _one_hot_block_owner(
+                _collective_placement(
+                    info.placement, info.fqn, info.global_shape, world_size
+                ),
+                world_size,
+            )
+            is not None
+            and _unsharded_dtype(info) == dtype
+            and info.unsharded_grad_dtype in (None, dtype)
+            and _grad_reduce_dtype(info) == dtype
+            for info in infos
         )
 
     def reduce_prepared_grad(
