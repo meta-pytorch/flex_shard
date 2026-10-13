@@ -269,6 +269,19 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         metadata: Fp8BucketedBlockShard._Fp8BucketMetadata
 
     @dataclass(frozen=True)
+    class _CopyOutPlan:
+        """Rank-row payload regions of one bucket, with device copy descriptors.
+
+        ``regions`` holds ``(rank, row byte offset, nbytes, out byte offset)``.
+        ``descriptors`` is keyed by device, row stride and copy unit, in bytes.
+        """
+
+        metadata: Fp8BucketedBlockShard._Fp8BucketMetadata
+        regions: tuple[tuple[int, int, int, int], ...]
+        vec_aligned: bool
+        descriptors: dict[tuple[torch.device, int, int], Any]
+
+    @dataclass(frozen=True)
     class _Fp8UnshardState:
         """Prepared-unshard state needed to all-gather and compact rank rows."""
 
@@ -336,6 +349,10 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         self._local_packed_cache: dict[
             tuple[int, int, torch.device, Any],
             Fp8BucketedBlockShard._LocalPackedCacheEntry,
+        ] = {}
+        self._copy_out_plans: dict[
+            int,
+            Fp8BucketedBlockShard._CopyOutPlan,
         ] = {}
 
     @property
@@ -1203,77 +1220,18 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         )
         fp8_bytes = compact[:fp8_nbytes]
         scale_bytes = compact[scale_byte_offset:]
-        row_stride_bytes = rank_rows.stride(0)
-        fp8_storage_regions = tuple(
-            (rank * row_stride_bytes, rank_fp8_numel)
-            for rank, rank_fp8_numel in enumerate(metadata.rank_fp8_numels)
-        )
-        scale_storage_regions = tuple(
-            (
-                rank * row_stride_bytes + scale_byte_start,
-                rank_scale_numel * torch.float32.itemsize,
-            )
-            for rank, (rank_scale_numel, scale_byte_start) in enumerate(
-                zip(
-                    metadata.rank_scale_numels,
-                    metadata.rank_scale_byte_offsets,
-                    strict=True,
-                )
-            )
-        )
 
         with _record_copy_out_if_eager():
             # Rank cuts partition one globally ordered block-row stream. Joining
             # each rank's valid regions therefore restores parameter order without
-            # scattering every chunk separately. View the physical row storage once,
-            # including any mixed-bucket padding between rows, so cat inputs do not
-            # need intermediate per-rank views. Retain byte cats for unaligned or
-            # odd inputs.
-            use_vec_copies = _is_vec_copy_viewable(rank_rows) and _is_vec_copy_viewable(
-                compact
-            )
-            if use_vec_copies:
-                rank_storage_bytes = rank_rows.as_strided(
-                    ((rank_rows.size(0) - 1) * row_stride_bytes + rank_rows.size(1),),
-                    (1,),
-                )
-                rank_storage_copy_units = rank_storage_bytes.view(_VEC_COPY_DTYPE)
-                compact_copy_units = compact.view(_VEC_COPY_DTYPE)
-                if all(
-                    rank_fp8_numel % _VEC_COPY_NBYTES == 0
-                    for rank_fp8_numel in metadata.rank_fp8_numels
-                ):
-                    _cat_byte_regions_from_flat_storage(
-                        fp8_storage_regions,
-                        rank_storage_copy_units,
-                        compact_copy_units[: fp8_nbytes // _VEC_COPY_NBYTES],
-                        copy_unit_nbytes=_VEC_COPY_NBYTES,
-                    )
-                else:
-                    _cat_byte_regions_from_flat_storage(
-                        fp8_storage_regions,
-                        rank_storage_bytes,
-                        fp8_bytes,
-                    )
-                _cat_byte_regions_from_flat_storage(
-                    scale_storage_regions,
-                    rank_storage_copy_units,
-                    compact_copy_units[scale_byte_offset // _VEC_COPY_NBYTES :],
-                    copy_unit_nbytes=_VEC_COPY_NBYTES,
-                )
-            else:
-                rank_byte_rows = rank_rows.unbind(0)
-                _cat_byte_regions_from_rank_rows(
-                    fp8_storage_regions,
-                    rank_byte_rows,
-                    fp8_bytes,
-                    row_stride_bytes=row_stride_bytes,
-                )
-                _cat_byte_regions_from_rank_rows(
-                    scale_storage_regions,
-                    rank_byte_rows,
-                    scale_bytes,
-                    row_stride_bytes=row_stride_bytes,
+            # scattering every chunk separately.
+            if not self._copy_out_rank_rows_triton(metadata, rank_rows, compact):
+                self._copy_out_rank_rows_cat(
+                    metadata,
+                    rank_rows,
+                    compact,
+                    fp8_nbytes=fp8_nbytes,
+                    scale_byte_offset=scale_byte_offset,
                 )
 
         fp8_flat = fp8_bytes.view(self.fp8_dtype)
@@ -1307,6 +1265,177 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             full_params=full_params,
             persistent_buffers=[compact] if prepared.persistent else [],
         )
+
+    def _copy_out_plan(self, metadata: _Fp8BucketMetadata) -> _CopyOutPlan:
+        plan = self._copy_out_plans.get(id(metadata))
+        if plan is not None and plan.metadata is metadata:
+            return plan
+
+        regions: list[tuple[int, int, int, int]] = []
+        out_offset = 0
+        for rank, fp8_numel in enumerate(metadata.rank_fp8_numels):
+            regions.append((rank, 0, fp8_numel, out_offset))
+            out_offset += fp8_numel
+        out_offset = _align_up(out_offset, _VEC_ALIGN_BYTES)
+        for rank, (scale_numel, scale_byte_start) in enumerate(
+            zip(
+                metadata.rank_scale_numels,
+                metadata.rank_scale_byte_offsets,
+                strict=True,
+            )
+        ):
+            nbytes = scale_numel * torch.float32.itemsize
+            regions.append((rank, scale_byte_start, nbytes, out_offset))
+            out_offset += nbytes
+        nonempty_regions = tuple(region for region in regions if region[2] > 0)
+        plan = Fp8BucketedBlockShard._CopyOutPlan(
+            metadata=metadata,
+            regions=nonempty_regions,
+            vec_aligned=all(
+                value % _VEC_COPY_NBYTES == 0
+                for region in nonempty_regions
+                for value in region[1:]
+            ),
+            descriptors={},
+        )
+        self._copy_out_plans[id(metadata)] = plan
+        return plan
+
+    def _copy_out_rank_rows_triton(
+        self,
+        metadata: _Fp8BucketMetadata,
+        rank_rows: torch.Tensor,
+        out: torch.Tensor,
+    ) -> bool:
+        """Join every rank's FP8 and scale regions into ``out`` with one kernel.
+
+        ``rank_rows`` and ``out`` are uint8. FP8 regions land in rank order at
+        the start of ``out``, scale regions from the 16-byte aligned offset
+        after them. The copy plan is built once per bucket layout and row
+        stride, so a gather costs one launch instead of a view per rank and
+        region. Returns False when the caller should fall back to cat: while
+        compiling or off CUDA.
+        """
+        if torch.compiler.is_compiling() or rank_rows.device.type != "cuda":
+            return False
+        plan = self._copy_out_plan(metadata)
+        row_stride_bytes = rank_rows.stride(0)
+        # The physical row storage, including any mixed-bucket padding between
+        # rows: offsets in the plan are relative to the first row's start.
+        source = rank_rows.as_strided(
+            ((rank_rows.size(0) - 1) * row_stride_bytes + rank_rows.size(1),),
+            (1,),
+        )
+        if (
+            plan.vec_aligned
+            and _is_vec_copy_viewable(rank_rows)
+            and _is_vec_copy_viewable(out)
+        ):
+            source = source.view(_VEC_COPY_DTYPE)
+            out = out.view(_VEC_COPY_DTYPE)
+        unit_nbytes = source.element_size()
+        descriptor_key = (rank_rows.device, row_stride_bytes, unit_nbytes)
+        descriptor = plan.descriptors.get(descriptor_key)
+        if descriptor is None:
+            from ._copy_kernels import SegmentCopyDescriptor
+
+            descriptor = SegmentCopyDescriptor.create(
+                src_offsets=[
+                    (rank * row_stride_bytes + row_offset) // unit_nbytes
+                    for rank, row_offset, _, _ in plan.regions
+                ],
+                numels=[nbytes // unit_nbytes for _, _, nbytes, _ in plan.regions],
+                dst_offsets=[
+                    out_offset // unit_nbytes for _, _, _, out_offset in plan.regions
+                ],
+                device=rank_rows.device,
+            )
+            plan.descriptors[descriptor_key] = descriptor
+
+        from ._copy_kernels import copy_segments_triton
+
+        copy_segments_triton(source, out, descriptor)
+        return True
+
+    def _copy_out_rank_rows_cat(
+        self,
+        metadata: _Fp8BucketMetadata,
+        rank_rows: torch.Tensor,
+        compact: torch.Tensor,
+        *,
+        fp8_nbytes: int,
+        scale_byte_offset: int,
+    ) -> None:
+        """Cat fallback of ``_copy_out_rank_rows_triton`` for compile and CPU."""
+        fp8_bytes = compact[:fp8_nbytes]
+        scale_bytes = compact[scale_byte_offset:]
+        row_stride_bytes = rank_rows.stride(0)
+        fp8_storage_regions = tuple(
+            (rank * row_stride_bytes, rank_fp8_numel)
+            for rank, rank_fp8_numel in enumerate(metadata.rank_fp8_numels)
+        )
+        scale_storage_regions = tuple(
+            (
+                rank * row_stride_bytes + scale_byte_start,
+                rank_scale_numel * torch.float32.itemsize,
+            )
+            for rank, (rank_scale_numel, scale_byte_start) in enumerate(
+                zip(
+                    metadata.rank_scale_numels,
+                    metadata.rank_scale_byte_offsets,
+                    strict=True,
+                )
+            )
+        )
+        # View the physical row storage once, including any mixed-bucket padding
+        # between rows, so cat inputs do not need intermediate per-rank views.
+        # Retain byte cats for unaligned or odd inputs.
+        use_vec_copies = _is_vec_copy_viewable(rank_rows) and _is_vec_copy_viewable(
+            compact
+        )
+        if use_vec_copies:
+            rank_storage_bytes = rank_rows.as_strided(
+                ((rank_rows.size(0) - 1) * row_stride_bytes + rank_rows.size(1),),
+                (1,),
+            )
+            rank_storage_copy_units = rank_storage_bytes.view(_VEC_COPY_DTYPE)
+            compact_copy_units = compact.view(_VEC_COPY_DTYPE)
+            if all(
+                rank_fp8_numel % _VEC_COPY_NBYTES == 0
+                for rank_fp8_numel in metadata.rank_fp8_numels
+            ):
+                _cat_byte_regions_from_flat_storage(
+                    fp8_storage_regions,
+                    rank_storage_copy_units,
+                    compact_copy_units[: fp8_nbytes // _VEC_COPY_NBYTES],
+                    copy_unit_nbytes=_VEC_COPY_NBYTES,
+                )
+            else:
+                _cat_byte_regions_from_flat_storage(
+                    fp8_storage_regions,
+                    rank_storage_bytes,
+                    fp8_bytes,
+                )
+            _cat_byte_regions_from_flat_storage(
+                scale_storage_regions,
+                rank_storage_copy_units,
+                compact_copy_units[scale_byte_offset // _VEC_COPY_NBYTES :],
+                copy_unit_nbytes=_VEC_COPY_NBYTES,
+            )
+        else:
+            rank_byte_rows = rank_rows.unbind(0)
+            _cat_byte_regions_from_rank_rows(
+                fp8_storage_regions,
+                rank_byte_rows,
+                fp8_bytes,
+                row_stride_bytes=row_stride_bytes,
+            )
+            _cat_byte_regions_from_rank_rows(
+                scale_storage_regions,
+                rank_byte_rows,
+                scale_bytes,
+                row_stride_bytes=row_stride_bytes,
+            )
 
 
 def _cat_byte_regions_from_flat_storage(
