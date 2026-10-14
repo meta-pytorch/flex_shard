@@ -6,17 +6,19 @@
 
 import copy
 import dataclasses
+import gc
 import warnings
 from unittest.mock import Mock, patch
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 from torch.testing._internal.common_utils import run_tests, TestCase
 
-from .. import BucketSpec, flex_shard, is_flex_shard_param
+from .. import BucketSpec, flex_shard, is_flex_shard_param, MixedPrecisionPolicy
 from ..custom_placements.block_shard import (
     BucketedBlockShard,
     make_bucketed_block_placement_fn,
@@ -126,6 +128,60 @@ class _SkipNet(nn.Module):
         if not self.skip:
             x = self.layers[1](x)
         return self.layers[2](x)
+
+
+class _ChunkedHeadNet(nn.Module):
+    """A layer, then a norm and an output projection; with ``skip_head``, the
+    forward returns the norm's output, as torchtitan's decoder does under its
+    chunked loss."""
+
+    def __init__(self, dim: int, vocab: int) -> None:
+        super().__init__()
+        self.layer = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, vocab, bias=False)
+        self.skip_head = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(self.layer(x))
+        return h if self.skip_head else self.head(h)
+
+
+def _chunked_loss_backward(
+    model: _ChunkedHeadNet,
+    x: torch.Tensor,
+    targets: torch.Tensor,
+    num_chunks: int,
+    head_storage=None,
+    after_chunk_backward=None,
+) -> None:
+    """torchtitan's ChunkedLossWrapper sequence: the head on each detached
+    chunk of the hidden states with a backward per chunk, then one backward
+    through the model. With ``head_storage``, the head's bucket stays
+    unsharded across the chunks and reduce-scatters at the last one."""
+    model.skip_head = True
+    hidden = model(x)
+    if head_storage is not None:
+        reshard_after_forward = head_storage.reshard_after_forward
+        reshard_after_backward = head_storage.reshard_after_backward
+        head_storage.set_reshard_after_forward(False)
+        head_storage.set_reshard_after_backward(False)
+        head_storage.set_requires_gradient_sync(False)
+        head_storage.unshard()
+    chunks = [chunk.detach().requires_grad_() for chunk in hidden.chunk(num_chunks)]
+    for idx, (chunk, target) in enumerate(
+        zip(chunks, targets.chunk(num_chunks), strict=True)
+    ):
+        if head_storage is not None and idx == num_chunks - 1:
+            head_storage.set_requires_gradient_sync(True)
+        F.cross_entropy(model.head(chunk), target, reduction="sum").backward()
+        if after_chunk_backward is not None:
+            after_chunk_backward(idx)
+    if head_storage is not None:
+        head_storage.set_reshard_after_forward(reshard_after_forward)
+        head_storage.set_reshard_after_backward(reshard_after_backward)
+        head_storage.reshard()
+    hidden.backward(torch.cat([chunk.grad for chunk in chunks]))
 
 
 class _TiedNet(nn.Module):
@@ -558,6 +614,310 @@ class TestFlexShardEagerRuntime(TestCase):
             # All but the first unshard of forward and of backward were prefetched.
             self.assertEqual(sum(hits), 4)
 
+    def test_explicit_prefetch_replaces_learned_order(self):
+        # As torchtitan sets FSDP2's explicit prefetch: in forward, the first
+        # bucket prefetches the next two; in backward, the last bucket the
+        # previous two; the buckets in between prefetch nothing. Every unshard
+        # after the first of each pass is then prefetched, two in flight at a
+        # time, none released, and training matches a plain model.
+        with single_rank_cuda_mesh() as mesh:
+            model = nn.Sequential(*(nn.Linear(8, 8) for _ in range(4)))
+            reference = copy.deepcopy(model).cuda()
+            flex_shard(
+                model,
+                buckets=[
+                    _bucket([f"{idx}.*"], mesh, reshard_after_forward=True)
+                    for idx in range(4)
+                ],
+            )
+            storages = model.sharded_bucket_storages
+            storages[0].set_buckets_to_forward_prefetch(storages[1:3])
+            storages[2].set_buckets_to_forward_prefetch([storages[3]])
+            storages[3].set_buckets_to_backward_prefetch([storages[2], storages[1]])
+            storages[1].set_buckets_to_backward_prefetch([storages[0]])
+            for idx in (1, 3):
+                storages[idx].set_buckets_to_forward_prefetch([])
+            for idx in (0, 2):
+                storages[idx].set_buckets_to_backward_prefetch([])
+            optim = torch.optim.SGD(model.parameters(), lr=0.1)
+            ref_optim = torch.optim.SGD(reference.parameters(), lr=0.1)
+            x = torch.randn(4, 8, device="cuda")
+            begin_unshard = bucket_runtime.BucketRuntime.begin_unshard
+            finish_unshard = bucket_runtime.BucketRuntime.finish_unshard
+            take = bucket_runtime.BucketCommContext.take_pending_unshard
+            hits = []
+            in_flight = []
+
+            def counting_take(context, bucket):
+                result = take(context, bucket)
+                hits.append(result is not None)
+                return result
+
+            def counting_finish_unshard(bucket, result):
+                in_flight.append(len(bucket.context.pending_unshards))
+                return finish_unshard(bucket, result)
+
+            for _ in range(2):
+                optim.zero_grad()
+                ref_optim.zero_grad()
+                with (
+                    patch.object(
+                        bucket_runtime.BucketRuntime,
+                        "begin_unshard",
+                        autospec=True,
+                        side_effect=begin_unshard,
+                    ) as unshards,
+                    patch.object(
+                        bucket_runtime.BucketRuntime,
+                        "finish_unshard",
+                        counting_finish_unshard,
+                    ),
+                    patch.object(
+                        bucket_runtime.BucketCommContext,
+                        "take_pending_unshard",
+                        counting_take,
+                    ),
+                ):
+                    output = model(x)
+                    output.sum().backward()
+                reference_output = reference(x)
+                torch.testing.assert_close(output, reference_output)
+                reference_output.sum().backward()
+                optim.step()
+                ref_optim.step()
+                self.assertEqual(unshards.call_count, 8)
+            # Each step, every unshard but the first of forward and of backward
+            # was prefetched, and the second bucket of each pass finished while
+            # the third's prefetch was in flight, which the learned order's one
+            # prefetch at a time does not do.
+            self.assertEqual(sum(hits), 12)
+            self.assertEqual(in_flight, [0, 1, 0, 0] * 4)
+            torch.testing.assert_close(model(x).detach(), reference(x).detach())
+
+    def test_prefetch_targets_must_be_bucket_storages(self):
+        with single_rank_cuda_mesh() as mesh:
+            model = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8))
+            flex_shard(
+                model,
+                buckets=[_bucket([f"{idx}.*"], mesh, True) for idx in range(2)],
+            )
+            with self.assertRaisesRegex(TypeError, "sharded_bucket_storages"):
+                model.sharded_bucket_storages[0].set_buckets_to_forward_prefetch(
+                    [model[1]]
+                )
+
+    def test_bucket_unshard_reshard(self):
+        # A bucket storage takes FSDPModule's unshard(), reshard() and
+        # set_reshard_after_forward() for its group, and bucket_storage_of()
+        # finds it from its local shard or unsharded param.
+        with single_rank_cuda_mesh() as mesh:
+            model = nn.Sequential(nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8))
+            flex_shard(
+                model,
+                buckets=[_bucket([idx], mesh, True) for idx in ("0", "2")],
+            )
+            first, second = model.sharded_bucket_storages
+            first_bucket, second_bucket = _buckets(model)
+            local_shard = model[2].weight
+            self.assertIs(model.bucket_storage_of(local_shard), second)
+            with self.assertRaisesRegex(ValueError, "not in this module's buckets"):
+                model.bucket_storage_of(nn.Parameter(torch.zeros(1)))
+
+            second.unshard()
+            self.assertTrue(second_bucket.is_unsharded)
+            self.assertFalse(first_bucket.is_unsharded)
+            self.assertIsNot(model[2].weight, local_shard)
+            self.assertIs(model.bucket_storage_of(model[2].weight), second)
+            second.reshard()
+            self.assertFalse(second_bucket.is_unsharded)
+            self.assertIs(model[2].weight, local_shard)
+
+            # reshard() releases the bucket's prefetched unshard.
+            first_bucket.context.prefetch(second_bucket)
+            second.reshard()
+            self.assertEqual(first_bucket.context.pending_unshards, [])
+            self.assertFalse(second_bucket.is_unsharded)
+
+            # Without reshard after forward, only that bucket keeps its params
+            # after the forward, until its backward.
+            self.assertTrue(second.reshard_after_forward)
+            self.assertTrue(second.reshard_after_backward)
+            second.set_reshard_after_forward(False)
+            self.assertFalse(second.reshard_after_forward)
+            output = model(torch.randn(4, 8, device="cuda", requires_grad=True))
+            self.assertFalse(first_bucket.is_unsharded)
+            self.assertTrue(second_bucket.is_unsharded)
+            output.register_hook(lambda grad: second.unshard())
+            with self.assertRaisesRegex(RuntimeError, "cannot run in backward"):
+                output.sum().backward()
+
+    def test_chunked_head(self):
+        # torchtitan's chunked loss with the norm and the head in one bucket:
+        # the forward skips the head, so the root's post-forward completes the
+        # bucket, whose re-gather in the final backward serves the norm. Each
+        # call of the head on a detached (leaf) chunk triggers its own
+        # post-backward, keeping the head's grads until the last chunk's
+        # reduce-scatter. The chunk backwards, which re-gather nothing, leave
+        # the layer bucket to the final backward. Training matches an
+        # unsharded reference.
+        num_chunks = 3
+        for head_reshard_after_forward in (False, True):
+            with (
+                self.subTest(head_reshard_after_forward=head_reshard_after_forward),
+                single_rank_cuda_mesh() as mesh,
+            ):
+                torch.manual_seed(0)
+                model = _ChunkedHeadNet(8, 16)
+                reference = copy.deepcopy(model).cuda()
+                flex_shard(
+                    model,
+                    buckets=[
+                        _bucket(["layer"], mesh, reshard_after_forward=False),
+                        # As torchtitan's: params without a grad stay out of
+                        # the reduce-scatter.
+                        dataclasses.replace(
+                            _bucket(
+                                ["norm", "head"],
+                                mesh,
+                                reshard_after_forward=head_reshard_after_forward,
+                            ),
+                            fsdp2_compatible=True,
+                        ),
+                    ],
+                )
+                head_storage = model.bucket_storage_of(model.head.weight)
+                head_shard, norm_shard = model.head.weight, model.norm.weight
+                layer_bucket, head_bucket = _buckets(model)
+                optim = torch.optim.SGD(model.parameters(), lr=0.1)
+                ref_optim = torch.optim.SGD(reference.parameters(), lr=0.1)
+                for _ in range(2):
+                    optim.zero_grad()
+                    ref_optim.zero_grad()
+                    x = torch.randn(6, 8, device="cuda")
+                    targets = torch.randint(16, (6,), device="cuda")
+                    observed = []
+
+                    def after_chunk_backward(idx):
+                        observed.append(
+                            (
+                                layer_bucket.is_unsharded,
+                                head_bucket.is_unsharded,
+                                head_shard.grad is not None,
+                                norm_shard.grad is not None,
+                            )
+                        )
+
+                    _chunked_loss_backward(
+                        model,
+                        x,
+                        targets,
+                        num_chunks,
+                        head_storage,
+                        after_chunk_backward,
+                    )
+                    _chunked_loss_backward(reference, x, targets, num_chunks)
+                    # The layer stays gathered through the chunk backwards. The
+                    # head reduce-scatters its grads alone at the last chunk;
+                    # the norm's come with the final backward.
+                    self.assertEqual(
+                        observed,
+                        [(True, True, False, False)] * (num_chunks - 1)
+                        + [(True, False, True, False)],
+                    )
+                    self.assertFalse(layer_bucket.is_unsharded)
+                    self.assertFalse(head_bucket.is_unsharded)
+                    self.assertEqual(
+                        head_storage.reshard_after_forward, head_reshard_after_forward
+                    )
+                    for param, ref_param in zip(
+                        model.parameters(), reference.parameters(), strict=True
+                    ):
+                        torch.testing.assert_close(param.grad, ref_param.grad)
+                    optim.step()
+                    ref_optim.step()
+
+    def test_chunked_head_releases_hidden_states(self):
+        # The post-backward trigger on the head's leaf chunk inputs must not
+        # keep them, or the hidden states their storage is part of, alive
+        # after the step. torchtitan turns automatic garbage collection off,
+        # so a reference cycle through the trigger would keep one hidden state
+        # per step until the next collection.
+        with single_rank_cuda_mesh() as mesh:
+            torch.manual_seed(0)
+            model = _ChunkedHeadNet(64, 16)
+            flex_shard(
+                model,
+                buckets=[
+                    _bucket(["layer"], mesh, reshard_after_forward=True),
+                    dataclasses.replace(
+                        _bucket(["norm", "head"], mesh, reshard_after_forward=False),
+                        fsdp2_compatible=True,
+                    ),
+                ],
+            )
+            head_storage = model.bucket_storage_of(model.head.weight)
+            optim = torch.optim.SGD(model.parameters(), lr=0.1)
+            x = torch.randn(1024, 64, device="cuda")
+            targets = torch.randint(16, (1024,), device="cuda")
+            allocated = []
+            gc.collect()
+            gc.disable()
+            try:
+                for _ in range(3):
+                    _chunked_loss_backward(model, x, targets, 4, head_storage)
+                    optim.step()
+                    optim.zero_grad()
+                    allocated.append(torch.cuda.memory_allocated())
+            finally:
+                gc.enable()
+            self.assertEqual(allocated[1], allocated[2])
+
+    def test_shard_unshard_buffers(self):
+        # On a 1-rank mesh Shard skips the all-gather, as FSDP2 does: the only
+        # buffer is the bucket's local storage, which finish casts into the
+        # unsharded params. A refill allocates the persistent storage only at
+        # copy-out, as FSDP2 allocates its unsharded parameters. The in-place
+        # all-gather on more ranks is checked in test_flex_shard_training.
+        with single_rank_cuda_mesh() as mesh:
+            torch.manual_seed(0)
+            model = nn.Sequential(nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8))
+            reference = copy.deepcopy(model).cuda()
+            flex_shard(
+                model,
+                buckets=[
+                    BucketSpec(
+                        [idx],
+                        placement_fn=per_param_placements,
+                        mesh=mesh,
+                        mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
+                        reshard_after_forward=True,
+                    )
+                    for idx in ("0", "2")
+                ],
+            )
+            _, bucket = _buckets(model)
+            # The first unshard creates the persistent buffers.
+            x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+            model(x).sum().backward()
+            handle = bucket.begin_unshard()
+            self.assertEqual(len(handle.prepared.buffers), 1)
+            self.assertTrue(handle.prepared.placement_state.local_copy_out)
+            self.assertTrue(
+                all(b.untyped_storage().size() == 0 for b in bucket.persistent_buffers)
+            )
+            bucket.finish_unshard(handle)
+            self.assertTrue(
+                all(b.untyped_storage().size() > 0 for b in bucket.persistent_buffers)
+            )
+            for bucket_param, unsharded in zip(
+                bucket.bucket_params, bucket.unsharded_params, strict=True
+            ):
+                expected = reference.get_parameter(bucket_param.param_info.fqn)
+                torch.testing.assert_close(
+                    unsharded, expected.to(torch.bfloat16), atol=0, rtol=0
+                )
+            bucket.reshard()
+
     def test_released_refill_frees_storage(self):
         # A prefetch that refills a bucket's persistent storage, which begin
         # re-allocates, and is then released unused frees that storage; later
@@ -718,7 +1078,8 @@ class TestFlexShardEagerRuntime(TestCase):
             with self.assertRaisesRegex(Exception, "eager-only"):
                 compiled_model(transformer_inputs(args, device="cuda"))
 
-    def test_torch_compile_traces_per_bucket_collectives(self):
+    def test_torch_compile_traces_per_bucket_unshards(self):
+        # The multi-rank collectives are checked in test_flex_shard_training.
         with single_rank_cuda_mesh() as mesh:
             args, model = flex_shard_transformer_model(mesh)
 
@@ -749,19 +1110,17 @@ class TestFlexShardEagerRuntime(TestCase):
             unshards = [t for t in top_targets if t == "autograd_function_apply"]
             self.assertEqual(len(model.sharded_bucket_storages), len(unshards))
 
-            # Collectives live in the fwd_body_*/bwd_body_* subgraphs that
-            # autograd_function_apply dispatches to, not at the top level.
+            # On a 1-rank mesh Shard runs no collectives, as FSDP2 does.
             subgraph_targets = set()
             for _, submodule in root.named_modules():
                 if isinstance(submodule, torch.fx.GraphModule):
                     subgraph_targets.update(
                         str(node.target) for node in submodule.graph.nodes
                     )
-
-            # Functional collectives keep the comm reorderable by graph passes.
-            self.assertIn("_c10d_functional.all_gather_into_tensor", subgraph_targets)
-            self.assertIn("_c10d_functional.reduce_scatter_tensor", subgraph_targets)
-            self.assertIn("_c10d_functional.wait_tensor", subgraph_targets)
+            self.assertNotIn(
+                "_c10d_functional.all_gather_into_tensor", subgraph_targets
+            )
+            self.assertNotIn("_c10d_functional.reduce_scatter_tensor", subgraph_targets)
 
     def test_torch_compile_frozen_params_do_not_widen_reduce_dtype(self):
         with single_rank_cuda_mesh() as mesh:

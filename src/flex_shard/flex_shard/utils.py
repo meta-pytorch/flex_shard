@@ -6,24 +6,17 @@
 
 from __future__ import annotations
 
-import functools
+import os
+from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
-from typing import Any, TYPE_CHECKING, TypeVar
+from typing import Any, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.tensor import DTensor
-from torch.utils._python_dispatch import (
-    _get_current_dispatch_mode_stack,
-    _pop_mode,
-    _push_mode,
-)
-from torch.utils.checkpoint import _CachedTorchDispatchMode, _CachingTorchDispatchMode
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from torch.distributed.device_mesh import DeviceMesh
 
     from .bucket_storage import BucketParamFQNsByIndex, ShardedBucketStorage
@@ -74,46 +67,6 @@ def _record_comm_if_eager(
 ) -> AbstractContextManager[Any]:
     """Return an eager profiler range for communication launch code."""
     return _record_function_if_eager(label, fqn)
-
-
-_SAC_MODES = (_CachingTorchDispatchMode, _CachedTorchDispatchMode)
-_R = TypeVar("_R")
-
-
-def _outside_selective_checkpoint(fn: Callable[..., _R]) -> Callable[..., _R]:
-    """Run eager ``fn`` hidden from selective activation checkpointing.
-
-    SAC requires a checkpointed region's recompute to run the ops its forward
-    ran, but whether a bucket hook there unshards, prefetches, or releases a
-    prefetch depends on runtime state that differs between the two. Unshards
-    run without grad and refill their buffers in place, so SAC has nothing to
-    save or replay. Other dispatch modes stay active; during compile, SAC tags
-    the traced graph instead, so nothing is hidden.
-    """
-
-    @functools.wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> _R:
-        if torch.compiler.is_compiling():
-            return fn(*args, **kwargs)
-        stack = _get_current_dispatch_mode_stack()
-        first_sac = next(
-            (i for i, mode in enumerate(stack) if isinstance(mode, _SAC_MODES)), None
-        )
-        if first_sac is None:
-            return fn(*args, **kwargs)
-        popped = [_pop_mode() for _ in range(len(stack) - first_sac)]
-        kept = [mode for mode in reversed(popped) if not isinstance(mode, _SAC_MODES)]
-        for mode in kept:
-            _push_mode(mode)
-        try:
-            return fn(*args, **kwargs)
-        finally:
-            for _ in kept:
-                _pop_mode()
-            for mode in reversed(popped):
-                _push_mode(mode)
-
-    return wrapper
 
 
 def _get_single_placement(placements: tuple[Placement, ...]) -> Placement:
@@ -362,3 +315,119 @@ def _validate_bucket_uniform_dtype_and_placement(
                     "one placement layout. Split parameters with incompatible "
                     "placements into separate buckets."
                 )
+
+
+def alloc_grads_in_param_layout(named_params: list[tuple[str, nn.Parameter]]) -> None:
+    """A ``BucketSpec.pre_backward_hook`` that allocates the missing grads
+    zeroed, as views of one buffer per storage the unsharded params view, at
+    their offsets, as Megatron-LM allocates ``main_grad``: a placement whose
+    gradient reduction layout is its parameter layout reduces that buffer as
+    is. The bucket runtime runs it for such a bucket with no hook of its own
+    (see ``Placement.reduces_grads_in_param_layout``)."""
+    buffers: dict[int, torch.Tensor] = {}
+    for _, param in named_params:
+        if not param.requires_grad or param.grad is not None:
+            continue
+        storage = param.untyped_storage()
+        buffer = buffers.get(storage._cdata)
+        if buffer is None:
+            buffer = torch.zeros(
+                storage.nbytes() // param.element_size(),
+                dtype=param.dtype,
+                device=param.device,
+            )
+            buffers[storage._cdata] = buffer
+        offset = param.storage_offset()
+        param.grad = buffer[offset : offset + param.numel()].view(param.shape)
+
+
+def mesh_rank_hosts(
+    global_ranks: Sequence[int], ranks_per_host: int | None = None
+) -> tuple[int, ...]:
+    """Each mesh rank's host, numbered 0, 1, ... in mesh order, with hosts of
+    ``ranks_per_host`` consecutive global ranks, as torchrun numbers them.
+    ``global_ranks`` are the mesh's ranks in mesh order. ``ranks_per_host``
+    defaults to torchrun's LOCAL_WORLD_SIZE; without it, every rank is its own
+    host."""
+    if ranks_per_host is None:
+        ranks_per_host = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    if ranks_per_host <= 0:
+        raise ValueError(f"ranks_per_host must be positive, got {ranks_per_host}.")
+    host_ids: dict[int, int] = {}
+    return tuple(
+        host_ids.setdefault(rank // ranks_per_host, len(host_ids))
+        for rank in global_ranks
+    )
+
+
+def _even_first_positions(count: int) -> list[int]:
+    """Each of 0, ..., count - 1's position in the order 0, 2, 4, ..., 1, 3, ..."""
+    return [
+        index // 2 if index % 2 == 0 else (count + 1) // 2 + index // 2
+        for index in range(count)
+    ]
+
+
+def assign_to_hosts_then_ranks(
+    loads: Sequence[int],
+    hosts: Sequence[int],
+    *,
+    carried_loads: Sequence[int] | None = None,
+    one_per_rank: bool = False,
+) -> list[int]:
+    """An owner rank for each load, largest first: onto the host with the least
+    load placed by this call, then the least carried load, then onto that
+    host's rank with the least load placed by this call, then the least
+    carried load. Remaining ties take hosts, and ranks within a host, in the
+    order 0, 2, 4, ..., 1, 3, ...
+
+    ``hosts`` gives each rank's host (see ``mesh_rank_hosts``) and
+    ``carried_loads`` each rank's load from earlier calls. With
+    ``one_per_rank``, each rank takes at most one load.
+
+    So the largest loads go to hosts 0, 2, 4, ... and heavy and light hosts
+    alternate in rank order. When owner rows lie back to back in rank order
+    and are cut into equal chunks, a heavy host's overflow then lands in a
+    light neighbor's chunks rather than pushing every later host out of its
+    own. A later call with carried loads puts its largest loads on the other
+    hosts."""
+    num_ranks = len(hosts)
+    num_hosts = len(set(hosts))
+    if sorted(set(hosts)) != list(range(num_hosts)):
+        raise ValueError(f"hosts must be numbered 0, 1, ..., got {tuple(hosts)}.")
+    if one_per_rank and len(loads) > num_ranks:
+        raise ValueError(
+            f"{len(loads)} loads don't fit one per rank on {num_ranks} ranks."
+        )
+    carried = [0] * num_ranks if carried_loads is None else list(carried_loads)
+    members: list[list[int]] = [[] for _ in range(num_hosts)]
+    for rank, host in enumerate(hosts):
+        members[host].append(rank)
+    host_position = _even_first_positions(num_hosts)
+    rank_position = [0] * num_ranks
+    for ranks in members:
+        for rank, position in zip(ranks, _even_first_positions(len(ranks))):
+            rank_position[rank] = position
+    host_carried = [sum(carried[rank] for rank in ranks) for ranks in members]
+    host_load = [0] * num_hosts
+    rank_load = [0] * num_ranks
+    taken = [False] * num_ranks
+    owners = [0] * len(loads)
+    for index in sorted(range(len(loads)), key=lambda index: -loads[index]):
+        host = min(
+            (
+                host
+                for host in range(num_hosts)
+                if not one_per_rank or not all(taken[rank] for rank in members[host])
+            ),
+            key=lambda host: (host_load[host], host_carried[host], host_position[host]),
+        )
+        rank = min(
+            (rank for rank in members[host] if not (one_per_rank and taken[rank])),
+            key=lambda rank: (rank_load[rank], carried[rank], rank_position[rank]),
+        )
+        owners[index] = rank
+        taken[rank] = True
+        host_load[host] += loads[index]
+        rank_load[rank] += loads[index]
+    return owners
