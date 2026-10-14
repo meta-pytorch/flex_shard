@@ -27,6 +27,8 @@ a persistent buffer, freed on reshard and refilled on the next unshard.
 from __future__ import annotations
 
 import math
+import os
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, TYPE_CHECKING
@@ -191,6 +193,7 @@ def make_fp8_bucketed_block_placement_fn(
     weight_factory: BlockwiseFp8WeightFactory,
     block_size: int = 128,
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+    column_blocks_for_long_rows: bool | None = None,
 ) -> PlacementFn:
     """Assign one FP8 bucketed block placement using the mesh rank count."""
 
@@ -203,6 +206,7 @@ def make_fp8_bucketed_block_placement_fn(
             weight_factory=weight_factory,
             block_size=block_size,
             fp8_dtype=fp8_dtype,
+            column_blocks_for_long_rows=column_blocks_for_long_rows,
         )
         return {fqn: (placement,) for fqn, _ in named_params}
 
@@ -233,13 +237,17 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
 
     @dataclass(frozen=True)
     class _BlockRowUnit:
-        """One indivisible row-block unit, including a possible partial tail."""
+        """One indivisible row-block unit, including a possible partial tail,
+        or with ``col_start`` set, one column block of a column-block parameter
+        (all its rows)."""
 
         fqn: str
         row_start: int
         row_end: int
         dense_numel: int
         cost_bytes: int
+        col_start: int | None = None
+        col_end: int | None = None
 
     @dataclass(frozen=True)
     class _Fp8Chunk:
@@ -255,6 +263,10 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         rank_dense_offset: int
         fp8_offset: int
         scale_offset: int
+        # A column-block parameter's chunk: its columns, all rows. Its local
+        # shard and payload are the [rows, cols] rectangle, row-major.
+        col_start: int | None = None
+        col_end: int | None = None
 
     @dataclass(frozen=True)
     class _Fp8PackChunk:
@@ -310,6 +322,23 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         descriptors: dict[tuple[torch.device, int, int], Any]
 
     @dataclass(frozen=True)
+    class _ColumnCopyOutPlan:
+        """Copy-out of a bucket with column-block parameters, in bytes.
+
+        ``regions`` holds the row chunks' FP8 data and scales as
+        ``(rank, row offset, nbytes, out offset)``. ``boxes`` holds each
+        column-block chunk's FP8 data and scales as ``(rank, row offset, rows,
+        row nbytes, out offset, out row stride)``: a row-major rectangle in the
+        rank's row, copied into the parameter's row-major matrix.
+        """
+
+        metadata: Fp8BucketedBlockShard._Fp8BucketMetadata
+        regions: tuple[tuple[int, int, int, int], ...]
+        boxes: tuple[tuple[int, int, int, int, int, int], ...]
+        vec_aligned: bool
+        descriptors: dict[tuple[torch.device, int, int], Any]
+
+    @dataclass(frozen=True)
     class _Fp8UnshardState:
         """Prepared-unshard state needed to all-gather and compact rank rows."""
 
@@ -354,7 +383,15 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         weight_factory: BlockwiseFp8WeightFactory,
         block_size: int = 128,
         fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+        column_blocks_for_long_rows: bool | None = None,
     ) -> None:
+        """``column_blocks_for_long_rows`` (experimental, default off; None reads
+        ``FLEX_SHARD_FP8_COLUMN_BLOCKS=1``): own a 2-D weight by
+        ``block_size``-column blocks when its rows are longer than most of the
+        bucket's and its column blocks then match the bucket's row blocks, e.g.
+        a transformer layer's w2 [D, F] next to weights with D-long rows. With
+        every unit the same size, the bucket's rank segments need far less
+        padding. Distributed checkpointing isn't tested with it yet."""
         if world_size <= 0:
             raise ValueError(
                 f"Fp8BucketedBlockShard world_size must be positive, got {world_size}."
@@ -370,6 +407,11 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         self.block_size = block_size
         self.fp8_dtype = fp8_dtype
         self.weight_factory = weight_factory
+        if column_blocks_for_long_rows is None:
+            column_blocks_for_long_rows = (
+                os.environ.get("FLEX_SHARD_FP8_COLUMN_BLOCKS") == "1"
+            )
+        self.column_blocks_for_long_rows = column_blocks_for_long_rows
         self._metadata_plans: dict[
             int,
             Fp8BucketedBlockShard._Fp8MetadataPlan,
@@ -381,6 +423,17 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         self._copy_out_plans: dict[
             tuple[int, int, bool],
             Fp8BucketedBlockShard._CopyOutPlan,
+        ] = {}
+        self._column_copy_out_plans: dict[
+            int, Fp8BucketedBlockShard._ColumnCopyOutPlan
+        ] = {}
+        self._column_boxes_by_metadata: dict[
+            int,
+            tuple[
+                Fp8BucketedBlockShard._Fp8BucketMetadata,
+                tuple[str, ...],
+                dict[int, tuple[tuple[int, int, int, int], ...]],
+            ],
         ] = {}
 
     @property
@@ -396,6 +449,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             and self.block_size == other.block_size
             and self.fp8_dtype == other.fp8_dtype
             and self.weight_factory is other.weight_factory
+            and self.column_blocks_for_long_rows == other.column_blocks_for_long_rows
         )
 
     def __hash__(self) -> int:
@@ -406,6 +460,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                 self.block_size,
                 self.fp8_dtype,
                 id(self.weight_factory),
+                self.column_blocks_for_long_rows,
             )
         )
 
@@ -503,6 +558,28 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                 f"but {fqn!r} has shape {tuple(shape)}."
             )
 
+    def _column_block_fqns(self, params: list[_BlockRowParam]) -> frozenset[str]:
+        """The parameters owned by column blocks: 2-D weights with rows longer
+        than the row length most of the bucket's block rows have, as many rows
+        as that length, and dims that are whole blocks, so each of their column
+        blocks has as many elements as the bucket's common row block."""
+        if not self.column_blocks_for_long_rows or not params:
+            return frozenset()
+        block_rows_by_row_length: Counter[int] = Counter()
+        for param in params:
+            out_dim, in_dim = param.matrix_shape
+            block_rows_by_row_length[in_dim] += _ceil_div(out_dim, self.block_size)
+        common_row_length = block_rows_by_row_length.most_common(1)[0][0]
+        return frozenset(
+            param.fqn
+            for param in params
+            if len(param.global_shape) == 2
+            and param.matrix_shape[0] == common_row_length
+            and param.matrix_shape[1] > common_row_length
+            and param.matrix_shape[0] % self.block_size == 0
+            and param.matrix_shape[1] % self.block_size == 0
+        )
+
     def _build_block_row_units(
         self,
         params: list[_BlockRowParam],
@@ -510,8 +587,26 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         fp8_itemsize = torch.empty((), dtype=self.fp8_dtype).element_size()
         scale_itemsize = torch.float32.itemsize
         units: list[Fp8BucketedBlockShard._BlockRowUnit] = []
+        column_fqns = self._column_block_fqns(params)
         for param in params:
             out_dim, in_dim = param.matrix_shape
+            if param.fqn in column_fqns:
+                # Column blocks left to right, each all rows wide.
+                dense_numel = out_dim * self.block_size
+                for col_start in range(0, in_dim, self.block_size):
+                    units.append(
+                        Fp8BucketedBlockShard._BlockRowUnit(
+                            fqn=param.fqn,
+                            row_start=0,
+                            row_end=out_dim,
+                            dense_numel=dense_numel,
+                            cost_bytes=dense_numel * fp8_itemsize
+                            + (out_dim // self.block_size) * scale_itemsize,
+                            col_start=col_start,
+                            col_end=col_start + self.block_size,
+                        )
+                    )
+                continue
             num_col_blocks = _ceil_div(in_dim, self.block_size)
             for row_start in range(0, out_dim, self.block_size):
                 row_end = min(row_start + self.block_size, out_dim)
@@ -608,14 +703,26 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                     last = rank_units[idx]
                     idx += 1
                 param = params_by_fqn[first.fqn]
-                _, in_dim = param.matrix_shape
+                out_dim, in_dim = param.matrix_shape
                 row_start = first.row_start
                 row_end = last.row_end
                 scale_row_start = row_start // self.block_size
                 scale_row_end = _ceil_div(row_end, self.block_size)
-                chunk_dense_numel = (row_end - row_start) * in_dim
+                if first.col_start is None:
+                    col_start = col_end = None
+                    chunk_cols = in_dim
+                    # Row ranges keep the matrix's row-major order.
+                    global_dense_offset = param.param_offset + row_start * in_dim
+                else:
+                    col_start, col_end = first.col_start, last.col_end
+                    assert col_start is not None and col_end is not None
+                    chunk_cols = col_end - col_start
+                    # Each column block holds out_dim * block_size elements of
+                    # the bucket's dense order.
+                    global_dense_offset = param.param_offset + col_start * out_dim
+                chunk_dense_numel = (row_end - row_start) * chunk_cols
                 scale_numel = (scale_row_end - scale_row_start) * _ceil_div(
-                    in_dim,
+                    chunk_cols,
                     self.block_size,
                 )
                 chunks.append(
@@ -626,17 +733,19 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                         row_end=row_end,
                         scale_row_start=scale_row_start,
                         scale_row_end=scale_row_end,
-                        global_dense_offset=param.param_offset + row_start * in_dim,
+                        global_dense_offset=global_dense_offset,
                         rank_dense_offset=rank_dense_offset,
                         fp8_offset=fp8_offset,
                         scale_offset=scale_offset,
+                        col_start=col_start,
+                        col_end=col_end,
                     )
                 )
                 rank_pack_chunks.append(
                     Fp8BucketedBlockShard._Fp8PackChunk(
                         param_index=param_indices_by_fqn[param.fqn],
                         fqn=param.fqn,
-                        local_shape=torch.Size((row_end - row_start, in_dim)),
+                        local_shape=torch.Size((row_end - row_start, chunk_cols)),
                         fp8_numel=chunk_dense_numel,
                         scale_numel=scale_numel,
                     )
@@ -735,6 +844,9 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         chunk: _Fp8Chunk,
         in_dim: int,
     ) -> int:
+        if chunk.col_start is not None:
+            assert chunk.col_end is not None
+            in_dim = chunk.col_end - chunk.col_start
         return (chunk.row_end - chunk.row_start) * in_dim
 
     def _quantize_local_weight(
@@ -1034,6 +1146,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         local_chunks = {
             chunk.fqn: chunk for chunk in metadata.chunks if chunk.rank == rank
         }
+        column_fqns = self._column_block_fqns(params)
 
         bucket_param_layouts = {}
         storage_layouts: dict[str, BucketParamStorageLayout] = {}
@@ -1043,7 +1156,21 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             # dims so the shard keeps the parameter's rank.
             stack_ones = (1,) * (len(param.global_shape) - 2)
             in_dim = param.global_shape[-1]
-            if chunk is None:
+            if param.fqn in column_fqns:
+                # A column-block parameter's shard is a [rows, cols] rectangle.
+                out_dim = param.global_shape[0]
+                if chunk is None:
+                    local_shape = torch.Size([out_dim, 0])
+                    local_numel = 0
+                    byte_offset = 0
+                    local_global_offset = param.param_offset
+                else:
+                    assert chunk.col_start is not None and chunk.col_end is not None
+                    local_shape = torch.Size([out_dim, chunk.col_end - chunk.col_start])
+                    local_numel = self._chunk_numel(chunk, in_dim)
+                    byte_offset = chunk.rank_dense_offset * dtype.itemsize
+                    local_global_offset = chunk.global_dense_offset
+            elif chunk is None:
                 local_shape = torch.Size([*stack_ones, 0, in_dim])
                 local_numel = 0
                 byte_offset = 0
@@ -1092,13 +1219,87 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         )
 
     @override
+    def _column_boxes(
+        self, infos: list[ParamInfo]
+    ) -> dict[int, tuple[tuple[int, int, int, int], ...]]:
+        metadata = self._fp8_metadata_from_infos(infos)
+        fqns = tuple(info.fqn for info in infos)
+        cached = self._column_boxes_by_metadata.get(id(metadata))
+        if cached is not None and cached[0] is metadata and cached[1] == fqns:
+            return cached[2]
+        index_by_fqn = {fqn: index for index, fqn in enumerate(fqns)}
+        boxes: dict[int, list[tuple[int, int, int, int]]] = {}
+        for chunk in metadata.chunks:
+            if chunk.col_start is not None:
+                assert chunk.col_end is not None
+                boxes.setdefault(index_by_fqn[chunk.fqn], []).append(
+                    (
+                        chunk.rank,
+                        chunk.global_dense_offset,
+                        chunk.col_start,
+                        chunk.col_end - chunk.col_start,
+                    )
+                )
+        result = {index: tuple(entries) for index, entries in boxes.items()}
+        self._column_boxes_by_metadata[id(metadata)] = (metadata, fqns, result)
+        return result
+
+    def _column_shard_start(self, info: ParamInfo) -> int | None:
+        """The first column of a column-block parameter's nonempty local
+        rectangle, else None: its local rows are all its rows, and only a
+        column-block shard has fewer columns than the parameter."""
+        if (
+            info.local_numel == 0
+            or len(info.global_shape) != 2
+            or info.local_shape[-1] == info.global_shape[-1]
+        ):
+            return None
+        param_layout = self._param_layout(info)
+        return (
+            param_layout.local_global_offset - param_layout.param_offset
+        ) // info.global_shape[0]
+
+    @override
+    def copy_param_to_storage(
+        self,
+        byte_storage: torch.Tensor,
+        info: ParamInfo,
+        param: torch.Tensor,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        col_start = self._column_shard_start(info)
+        if col_start is None:
+            super().copy_param_to_storage(byte_storage, info, param, rank, world_size)
+            return
+        param_data = param.detach()
+        if param_data.device.type == "meta":
+            return
+        shard = param_data.reshape(info.global_shape)[
+            :, col_start : col_start + info.local_shape[-1]
+        ].contiguous()
+        nbytes = shard.numel() * shard.element_size()
+        byte_storage[info.byte_offset : info.byte_offset + nbytes].copy_(
+            shard.view(-1).view(torch.uint8)
+        )
+
+    @override
     def global_layout(
         self, info: ParamInfo, rank: int, world_size: int
     ) -> GlobalLayout:
-        """Split this rank's matrix row range into one box per stacked matrix."""
+        """Split this rank's matrix row range into one box per stacked matrix;
+        a column-block shard is one box of its columns."""
         global_shape = tuple(info.global_shape)
         if info.local_numel == 0:
             return GlobalLayout(global_shape, (), (), ())
+        col_start = self._column_shard_start(info)
+        if col_start is not None:
+            return GlobalLayout(
+                global_shape=global_shape,
+                global_offsets=((0, col_start),),
+                local_offsets=((0, 0),),
+                local_sizes=(tuple(info.local_shape),),
+            )
         *stack_shape, out_dim, in_dim = global_shape
         stack_zeros = (0,) * len(stack_shape)
         stack_ones = (1,) * len(stack_shape)
@@ -1294,7 +1495,15 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             # Rank cuts partition one globally ordered block-row stream. Joining
             # each rank's valid regions therefore restores parameter order without
             # scattering every chunk separately.
-            if not self._copy_out_rank_rows_triton(metadata, rank_rows, compact):
+            if any(chunk.col_start is not None for chunk in metadata.chunks):
+                self._copy_out_with_column_chunks(
+                    metadata,
+                    state.infos,
+                    rank_rows,
+                    compact,
+                    scale_byte_offset=scale_byte_offset,
+                )
+            elif not self._copy_out_rank_rows_triton(metadata, rank_rows, compact):
                 self._copy_out_rank_rows_cat(
                     metadata,
                     rank_rows,
@@ -1337,6 +1546,168 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             full_params=full_params,
             persistent_buffers=[compact] if prepared.persistent else [],
         )
+
+    def _column_copy_out_plan(
+        self,
+        metadata: _Fp8BucketMetadata,
+        infos: list[ParamInfo],
+        scale_byte_offset: int,
+    ) -> _ColumnCopyOutPlan:
+        plan = self._column_copy_out_plans.get(id(metadata))
+        if plan is not None and plan.metadata is metadata:
+            return plan
+        # Each parameter's FP8 data and scales are row-major matrices, in
+        # parameter order, in the compact buffer.
+        layouts: dict[str, tuple[int, int, int, int, int]] = {}
+        fp8_offset = 0
+        scale_offset = 0
+        for info in infos:
+            out_dim, in_dim = _matrix_shape(info.global_shape)
+            scale_rows, scale_cols = _scale_shape(
+                _matrix_shape(info.global_shape), self.block_size
+            )
+            layouts[info.fqn] = (
+                fp8_offset,
+                scale_offset,
+                in_dim,
+                scale_rows,
+                scale_cols,
+            )
+            fp8_offset += info.global_numel
+            scale_offset += scale_rows * scale_cols
+        scale_nbytes = torch.float32.itemsize
+        regions: list[tuple[int, int, int, int]] = []
+        boxes: list[tuple[int, int, int, int, int, int]] = []
+        for chunk in metadata.chunks:
+            fp8_base, scale_base, in_dim, scale_rows, scale_cols = layouts[chunk.fqn]
+            fp8_src = chunk.fp8_offset
+            scale_src = (
+                metadata.rank_scale_byte_offsets[chunk.rank]
+                + chunk.scale_offset * scale_nbytes
+            )
+            if chunk.col_start is None:
+                regions.append(
+                    (
+                        chunk.rank,
+                        fp8_src,
+                        (chunk.row_end - chunk.row_start) * in_dim,
+                        fp8_base + chunk.row_start * in_dim,
+                    )
+                )
+                regions.append(
+                    (
+                        chunk.rank,
+                        scale_src,
+                        (chunk.scale_row_end - chunk.scale_row_start)
+                        * scale_cols
+                        * scale_nbytes,
+                        scale_byte_offset
+                        + (scale_base + chunk.scale_row_start * scale_cols)
+                        * scale_nbytes,
+                    )
+                )
+            else:
+                assert chunk.col_end is not None
+                cols = chunk.col_end - chunk.col_start
+                boxes.append(
+                    (
+                        chunk.rank,
+                        fp8_src,
+                        chunk.row_end - chunk.row_start,
+                        cols,
+                        fp8_base + chunk.col_start,
+                        in_dim,
+                    )
+                )
+                boxes.append(
+                    (
+                        chunk.rank,
+                        scale_src,
+                        scale_rows,
+                        cols // self.block_size * scale_nbytes,
+                        scale_byte_offset
+                        + (scale_base + chunk.col_start // self.block_size)
+                        * scale_nbytes,
+                        scale_cols * scale_nbytes,
+                    )
+                )
+        nonempty_regions = tuple(region for region in regions if region[2] > 0)
+        plan = Fp8BucketedBlockShard._ColumnCopyOutPlan(
+            metadata=metadata,
+            regions=nonempty_regions,
+            boxes=tuple(box for box in boxes if box[2] > 0 and box[3] > 0),
+            vec_aligned=all(
+                value % _VEC_COPY_NBYTES == 0
+                for region in nonempty_regions
+                for value in region[1:]
+            ),
+            descriptors={},
+        )
+        self._column_copy_out_plans[id(metadata)] = plan
+        return plan
+
+    def _copy_out_with_column_chunks(
+        self,
+        metadata: _Fp8BucketMetadata,
+        infos: list[ParamInfo],
+        rank_rows: torch.Tensor,
+        compact: torch.Tensor,
+        *,
+        scale_byte_offset: int,
+    ) -> None:
+        """Copy row chunks with one segment kernel (on CUDA, in eager mode) and
+        each column-block rectangle with one strided copy."""
+        plan = self._column_copy_out_plan(metadata, infos, scale_byte_offset)
+        row_stride = rank_rows.stride(0)
+        if (
+            plan.regions
+            and rank_rows.device.type == "cuda"
+            and not torch.compiler.is_compiling()
+        ):
+            source = rank_rows.as_strided(
+                ((rank_rows.size(0) - 1) * row_stride + rank_rows.size(1),), (1,)
+            )
+            out = compact
+            if (
+                plan.vec_aligned
+                and _is_vec_copy_viewable(rank_rows)
+                and _is_vec_copy_viewable(compact)
+            ):
+                source = source.view(_VEC_COPY_DTYPE)
+                out = out.view(_VEC_COPY_DTYPE)
+            unit = source.element_size()
+            key = (rank_rows.device, row_stride, unit)
+            descriptor = plan.descriptors.get(key)
+            if descriptor is None:
+                from ._copy_kernels import SegmentCopyDescriptor
+
+                descriptor = SegmentCopyDescriptor.create(
+                    src_offsets=[
+                        (rank * row_stride + offset) // unit
+                        for rank, offset, _, _ in plan.regions
+                    ],
+                    numels=[nbytes // unit for _, _, nbytes, _ in plan.regions],
+                    dst_offsets=[
+                        out_offset // unit for _, _, _, out_offset in plan.regions
+                    ],
+                    device=rank_rows.device,
+                )
+                plan.descriptors[key] = descriptor
+            from ._copy_kernels import copy_segments_triton
+
+            copy_segments_triton(source, out, descriptor)
+        else:
+            for rank, offset, nbytes, out_offset in plan.regions:
+                compact[out_offset : out_offset + nbytes].copy_(
+                    rank_rows[rank, offset : offset + nbytes]
+                )
+        for rank, offset, rows, row_nbytes, out_offset, out_stride in plan.boxes:
+            box = rank_rows[rank, offset : offset + rows * row_nbytes].view(
+                rows, row_nbytes
+            )
+            compact[
+                out_offset : out_offset + (rows - 1) * out_stride + row_nbytes
+            ].as_strided((rows, row_nbytes), (out_stride, 1)).copy_(box)
 
     def _copy_out_plan(
         self,
