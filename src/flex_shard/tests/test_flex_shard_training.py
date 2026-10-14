@@ -20,6 +20,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import FSDPTest, get_devtype
 from torch.testing._internal.common_utils import run_tests
+from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.checkpoint import (
     CheckpointPolicy,
     create_selective_checkpoint_contexts,
@@ -27,14 +28,12 @@ from torch.utils.checkpoint import (
 
 from .. import BucketSpec, flex_shard, MixedPrecisionPolicy
 from ..custom_placements.block_shard import (
-    BlockShard,
     BucketedBlockShard,
     make_bucketed_block_placement_fn,
 )
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..custom_placements.owned import make_bucketed_owned_full_param_placement_fn
 from ..custom_placements.shard import per_param_placements, Shard
-from ..dist_muon.placement import make_mixed_placement_fn
 from ..flex_shard import bucket_runtime
 from ..flex_shard.checkpoint import get_flex_shard_global_layouts
 from .common import (
@@ -42,6 +41,7 @@ from .common import (
     check_flex_shard_parity,
     expected_shard,
     flex_shard_cuda,
+    flex_shard_transformer_model,
     make_test_sgd,
     make_transformer_model,
     transformer_bucket_specs,
@@ -142,19 +142,6 @@ class _ReusedWeights(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.a(x) + self.b(x)
-
-
-class _GatedBlock(torch.nn.Module):
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.attn = torch.nn.Linear(dim, dim)
-        self.mlp = torch.nn.Linear(dim, dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = x + self.attn(x)
-        # The gate's backward unpacks saved activations, so a checkpointed
-        # block recomputes before either linear's pre-backward hook runs.
-        return h + torch.sigmoid(h) * self.mlp(h)
 
 
 class _FusedWgradLinearFn(torch.autograd.Function):
@@ -356,8 +343,9 @@ class TestFlexShardTraining(FSDPTest):
             reduce_dtype=torch.float32,
         )
         # 1 MiB FP32 grads stay in the caching allocator's small pool, so the
-        # 2 MiB packed buckets are the only large-pool blocks and the second
-        # pack reuses the first pack's freed block.
+        # 2 MiB packed buckets are the only large-pool blocks. With the default
+        # of one pending reduce-scatter, as in FSDP2, the second pack reuses the
+        # first pack's freed block.
         flex_shard(
             model,
             buckets=[
@@ -371,7 +359,6 @@ class TestFlexShardTraining(FSDPTest):
                 for index in range(2)
             ],
         )
-        model.set_max_pending_reduce_grads(1)
 
         # Grad-requiring inputs let each layer's input-grad trigger reduce
         # mid-backward, one bucket after the other.
@@ -661,7 +648,8 @@ class TestFlexShardTraining(FSDPTest):
         # reads that bucket as is; training matches an unsharded reference, with
         # and without
         # reshard-after-forward and no-sync. Whole-parameter BucketedOwned
-        # buckets (Muon's) do so in their owners' rows of the gathered bucket.
+        # buckets (Muon's) do so in their owners' rows of the gathered bucket,
+        # and get their grads allocated in that layout even without the hook.
         mesh = init_device_mesh(device_type.type, (self.world_size,))
         placement_fns = {
             "bucketed_block": make_bucketed_block_placement_fn(
@@ -770,8 +758,138 @@ class TestFlexShardTraining(FSDPTest):
                 self.assertGreater(len(in_place), 3)
                 self.assertTrue(all(sent_storage), sent_storage)
                 self.assertTrue(reduced_bucket)
-                self.assertTrue(
-                    all(found == gradient_bucket for found in reduced_bucket)
+                expect_bucket = gradient_bucket or placement == "owned"
+                self.assertTrue(all(found == expect_bucket for found in reduced_bucket))
+
+    @skip_if_lt_x_gpu(2)
+    def test_owner_rows_hold_no_padding(self):
+        # Whole-parameter owners keep rows of their own lengths: each rank
+        # stores its row alone, the gathered bucket holds the rows back to
+        # back, and uneven rows take one broadcast and one reduce per owner
+        # (the list all_gather and reduce_scatter), while equal rows keep the
+        # single collectives. Training matches an unsharded reference.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        names = (
+            "all_gather",
+            "all_gather_into_tensor",
+            "reduce_scatter",
+            "reduce_scatter_tensor",
+        )
+        for out_features, gradient_bucket in ((8, False), (8, True), (16, False)):
+            # Linear(16, 16) then Linear(16, out_features) on 2 ranks: largest
+            # first to the least-loaded rank gives rows of 256 and 152 elements
+            # for 8 output features, and 272 each for 16.
+            rows = (256, 152) if out_features == 8 else (272, 272)
+            with self.subTest(
+                out_features=out_features, gradient_bucket=gradient_bucket
+            ):
+                torch.manual_seed(0)
+                model = torch.nn.Sequential(
+                    torch.nn.Linear(16, 16),
+                    torch.nn.Linear(16, out_features),
+                ).to(device_type)
+                reference = copy.deepcopy(model)
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            ["0.*", "1.*"],
+                            placement_fn=make_bucketed_owned_full_param_placement_fn(),
+                            mesh=mesh,
+                            reshard_after_forward=False,
+                            pre_backward_hook=(
+                                alloc_grads_in_param_layout if gradient_bucket else None
+                            ),
+                        )
+                    ],
+                )
+                element_size = 4
+                self.assertEqual(
+                    model.sharded_bucket_storages[0].total_bytes,
+                    rows[self.rank] * element_size,
+                )
+                optimizer = make_test_sgd(model.parameters(), lr=0.1)
+                reference_optimizer = make_test_sgd(reference.parameters(), lr=0.1)
+                calls: Counter[str] = Counter()
+
+                def counting(name, original):
+                    def call(*args, **kwargs):
+                        calls[name] += 1
+                        return original(*args, **kwargs)
+
+                    return call
+
+                patches = [
+                    mock.patch.object(dist, name, counting(name, getattr(dist, name)))
+                    for name in names
+                ]
+                torch.manual_seed(1 + self.rank)
+                for patch in patches:
+                    patch.start()
+                try:
+                    for _ in range(3):
+                        optimizer.zero_grad(set_to_none=True)
+                        reference_optimizer.zero_grad(set_to_none=True)
+                        x = torch.randn(4, 16, device=device_type)
+                        output = model(x)
+                        # Unsharded until backward: the params view the
+                        # gathered rows.
+                        self.assertEqual(
+                            model[0].weight.untyped_storage().nbytes(),
+                            sum(rows) * element_size,
+                        )
+                        reference_output = reference(x)
+                        self.assertEqual(output, reference_output)
+                        output.square().sum().backward()
+                        reference_output.square().sum().backward()
+                        _average_reference_grads(reference)
+                        optimizer.step()
+                        reference_optimizer.step()
+                finally:
+                    for patch in patches:
+                        patch.stop()
+                uneven = rows[0] != rows[1]
+                self.assertEqual(calls["all_gather"] > 0, uneven, calls)
+                self.assertEqual(calls["reduce_scatter"] > 0, uneven, calls)
+                self.assertEqual(calls["all_gather_into_tensor"] > 0, not uneven, calls)
+                self.assertEqual(calls["reduce_scatter_tensor"] > 0, not uneven, calls)
+
+    @skip_if_lt_x_gpu(2)
+    def test_owner_rows_reduce_grads_in_param_layout(self):
+        # Owner rows reduce grads allocated in the parameter layout as is, so
+        # the bucket runtime allocates them there when the unsharded params are
+        # in the dtype their grads accumulate and reduce in, not when the grads
+        # accumulate in a wider dtype. Shard buckets copy theirs in.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        bf16 = torch.bfloat16
+        owned = make_bucketed_owned_full_param_placement_fn()
+        for placement_fn, mp_policy, expected in (
+            (owned, None, True),
+            (owned, MixedPrecisionPolicy(param_dtype=bf16, reduce_dtype=bf16), True),
+            (owned, MixedPrecisionPolicy(param_dtype=bf16), False),
+            (per_param_placements, None, False),
+        ):
+            with self.subTest(placement_fn=placement_fn, mp_policy=mp_policy):
+                model = torch.nn.Sequential(
+                    torch.nn.Linear(16, 16), torch.nn.Linear(16, 8)
+                ).to(device_type)
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            ["0.*", "1.*"],
+                            placement_fn=placement_fn,
+                            mesh=mesh,
+                            mp_policy=mp_policy,
+                        )
+                    ],
+                )
+                infos = list(model.sharded_bucket_storages[0].param_infos.values())
+                self.assertEqual(
+                    infos[0].placement.reduces_grads_in_param_layout(
+                        infos, self.world_size
+                    ),
+                    expected,
                 )
 
     @skip_if_lt_x_gpu(2)
@@ -876,6 +994,51 @@ class TestFlexShardTraining(FSDPTest):
                     )
 
     @skip_if_lt_x_gpu(2)
+    def test_finalize_backward_reduces_in_reverse_module_order(self):
+        # As FSDP2's finalize_backward, which a pipeline stage calls after its
+        # last backward, the reduce-scatters go in reverse module order, as
+        # backward runs, whatever order the buckets were given in. Then a
+        # block's dense bucket reuses the memory its routed experts, reduced
+        # first, freed. As in torchtitan, the norm and output projection's
+        # bucket comes first.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        torch.manual_seed(0)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 8),
+            torch.nn.ReLU(),
+            torch.nn.Linear(8, 8),
+            torch.nn.LayerNorm(8),
+            torch.nn.Linear(8, 6),
+        ).to(device_type)
+        flex_shard(
+            model,
+            buckets=[
+                BucketSpec(
+                    modules,
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    reshard_after_forward=False,
+                )
+                for modules in (["3", "4"], ["0"], ["2"])
+            ],
+        )
+        model.set_manual_backward_finalization(True)
+        model.set_requires_gradient_sync(False)
+        model.set_reshard_after_backward(False)
+        model(torch.randn(4, 8, device=device_type)).sum().backward()
+        model.set_requires_gradient_sync(True)
+        reduced = []
+        begin_reduce_grad = bucket_runtime.begin_reduce_grad
+
+        def recording_begin(tensors, infos, *args, **kwargs):
+            reduced.append(infos[0].fqn.split(".")[0])
+            return begin_reduce_grad(tensors, infos, *args, **kwargs)
+
+        with mock.patch.object(bucket_runtime, "begin_reduce_grad", recording_begin):
+            model.finalize_backward()
+        self.assertEqual(reduced, ["3", "2", "0"])
+
+    @skip_if_lt_x_gpu(2)
     def test_defer_post_backward(self):
         # A weight grad computed after its layer's backward, as with
         # TransformerEngine's delay_wgrad_compute: the layer's bucket defers its
@@ -935,7 +1098,71 @@ class TestFlexShardTraining(FSDPTest):
         # into two calls, so backward finalization is manual: the buckets keep
         # their grads until finalize_backward after the last microbatch. Two
         # steps, so the second unshard gathers the updated shards, which its
-        # outputs check.
+        # outputs check. With async_op, the schedule waits on the unshard's
+        # handle before it uses the params.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        for async_op in (False, True):
+            with self.subTest(async_op=async_op):
+                torch.manual_seed(0)
+                model = torch.nn.Sequential(
+                    torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 6)
+                ).to(device_type)
+                reference = copy.deepcopy(model)
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            ["0.*"],
+                            placement_fn=make_bucketed_block_placement_fn(
+                                dims=(0,), blocks_per_rank=(1,) * self.world_size
+                            ),
+                            mesh=mesh,
+                            reshard_after_forward=False,
+                        ),
+                        BucketSpec(
+                            ["2.*"],
+                            placement_fn=per_param_placements,
+                            mesh=mesh,
+                            reshard_after_forward=False,
+                        ),
+                    ],
+                )
+                model.set_manual_backward_finalization(True)
+                optimizer = make_test_sgd(model.parameters(), lr=0.1)
+                reference_optimizer = make_test_sgd(reference.parameters(), lr=0.1)
+                torch.manual_seed(1 + self.rank)
+                for _ in range(2):
+                    optimizer.zero_grad(set_to_none=True)
+                    reference_optimizer.zero_grad(set_to_none=True)
+                    handle = model.unshard(async_op=async_op)
+                    if async_op:
+                        handle.wait()
+                    for microbatch in range(2):
+                        model.set_requires_gradient_sync(microbatch == 1)
+                        x = torch.randn(4, 8, device=device_type)
+                        # The first layer's forward hooks never run.
+                        hidden = torch.relu(
+                            torch.nn.functional.linear(
+                                x, model[0].weight, model[0].bias
+                            )
+                        )
+                        detached = hidden.detach().requires_grad_()
+                        output = model[2](detached)
+                        reference_output = reference(x)
+                        self.assertEqual(output, reference_output)
+                        output.sum().backward()
+                        hidden.backward(detached.grad)
+                        reference_output.sum().backward()
+                    model.finalize_backward()
+                    _average_reference_grads(reference)
+                    optimizer.step()
+                    reference_optimizer.step()
+
+    @skip_if_lt_x_gpu(2)
+    def test_unshard_async_op_finished_by_forward(self):
+        # A pipeline schedule unshards a stage ahead of its forward with
+        # async_op=True. The forward finishes each bucket's pending all-gather
+        # in its pre-forward hook, so the handle's wait() is left with nothing.
         mesh = init_device_mesh(device_type.type, (self.world_size,))
         torch.manual_seed(0)
         model = torch.nn.Sequential(
@@ -946,47 +1173,251 @@ class TestFlexShardTraining(FSDPTest):
             model,
             buckets=[
                 BucketSpec(
-                    ["0.*"],
-                    placement_fn=make_bucketed_block_placement_fn(
-                        dims=(0,), blocks_per_rank=(1,) * self.world_size
-                    ),
-                    mesh=mesh,
-                    reshard_after_forward=False,
-                ),
-                BucketSpec(
-                    ["2.*"],
+                    [pattern],
                     placement_fn=per_param_placements,
                     mesh=mesh,
                     reshard_after_forward=False,
-                ),
+                )
+                for pattern in ("0.*", "2.*")
             ],
         )
-        model.set_manual_backward_finalization(True)
-        optimizer = make_test_sgd(model.parameters(), lr=0.1)
-        reference_optimizer = make_test_sgd(reference.parameters(), lr=0.1)
-        torch.manual_seed(1 + self.rank)
-        for _ in range(2):
-            optimizer.zero_grad(set_to_none=True)
-            reference_optimizer.zero_grad(set_to_none=True)
-            model.unshard()
-            for microbatch in range(2):
-                model.set_requires_gradient_sync(microbatch == 1)
-                x = torch.randn(4, 8, device=device_type)
-                # The first layer's forward hooks never run.
-                hidden = torch.relu(
-                    torch.nn.functional.linear(x, model[0].weight, model[0].bias)
+        (context,) = getattr(model, bucket_runtime._EAGER_COMM_CONTEXTS_ATTR).values()
+        handle = model.unshard(async_op=True)
+        self.assertEqual(len(context.pending_unshards), 2)
+        self.assertFalse(any(bucket.is_unsharded for bucket in context.buckets))
+        x = torch.randn(4, 8, device=device_type)
+        self.assertEqual(model(x), reference(x))
+        self.assertEqual(context.pending_unshards, [])
+        handle.wait()
+        self.assertTrue(all(bucket.is_unsharded for bucket in context.buckets))
+
+    def _two_bucket_mlp(self, mesh) -> torch.nn.Module:
+        torch.manual_seed(0)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 6)
+        ).to(device_type)
+        flex_shard(
+            model,
+            buckets=[
+                BucketSpec(
+                    [pattern],
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    reshard_after_forward=False,
                 )
-                detached = hidden.detach().requires_grad_()
-                output = model[2](detached)
-                reference_output = reference(x)
-                self.assertEqual(output, reference_output)
+                for pattern in ("0.*", "2.*")
+            ],
+        )
+        return model
+
+    @skip_if_lt_x_gpu(2)
+    def test_unshard_all_gathers_on_current_stream(self):
+        # As FSDP2's FSDPModule.unshard: the all-gathers run on the caller's
+        # stream, asynchronously with async_op=True, and the handle's wait()
+        # waits on their work.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        original = dist.all_gather_single
+        for async_op in (False, True):
+            with self.subTest(async_op=async_op):
+                model = self._two_bucket_mlp(mesh)
+                calls = []
+                waits = []
+
+                class RecordingWork:
+                    def __init__(self, work) -> None:
+                        self.work = work
+
+                    def wait(self, *wait_args, **wait_kwargs):
+                        waits.append(True)
+                        return self.work.wait(*wait_args, **wait_kwargs)
+
+                def record(*args, **kwargs):
+                    calls.append(
+                        (torch.cuda.current_stream(), kwargs.get("async_op", False))
+                    )
+                    work = original(*args, **kwargs)
+                    return None if work is None else RecordingWork(work)
+
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with (
+                    mock.patch.object(dist, "all_gather_single", record),
+                    torch.cuda.stream(stream),
+                ):
+                    handle = model.unshard(async_op=async_op)
+                    self.assertEqual(len(waits), 0)
+                    if async_op:
+                        handle.wait()
+                self.assertEqual(calls, [(stream, async_op)] * 2)
+                self.assertEqual(len(waits), 2 if async_op else 0)
+                torch.cuda.current_stream().wait_stream(stream)
+
+    @skip_if_lt_x_gpu(2)
+    def test_single_rank_bucket_skips_all_gather_and_reduce_scatter(self):
+        # As FSDP2 on a 1-rank group, e.g. torchtitan's routed experts when the
+        # expert-parallel degree equals the data-parallel one: the unshard
+        # casts the local shards straight into the unsharded params, with no
+        # all-gather or gather buffer, through a forward's hook and through
+        # unshard(async_op=True) alike, and the post-backward reduce keeps the
+        # packed grads as the sharded grads, with no reduce-scatter, on the
+        # current stream, so the cast sharded grads come from its allocator pool.
+        # Without collectives, the 1-rank group can use a fake backend.
+        mesh = init_device_mesh(
+            device_type.type, (self.world_size, 1), mesh_dim_names=("dp", "edp")
+        )["edp"]
+        torch.manual_seed(0)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 6)
+        ).to(device_type)
+        reference = copy.deepcopy(model).to(torch.bfloat16)
+        flex_shard(
+            model,
+            buckets=[
+                BucketSpec(
+                    [pattern],
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
+                    reshard_after_forward=False,
+                )
+                for pattern in ("0.*", "2.*")
+            ],
+        )
+        x = torch.randn(4, 8, device=device_type, dtype=torch.bfloat16)
+        device_module = torch.get_device_module(device_type)
+        backward_streams = set()
+
+        class RecordStreams(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                backward_streams.add(device_module.current_stream())
+                return func(*args, **(kwargs or {}))
+
+        def check_unsharded_params() -> None:
+            for module, reference_module in (
+                (model[0], reference[0]),
+                (model[2], reference[2]),
+            ):
+                self.assertEqual(module.weight.dtype, torch.bfloat16)
+                self.assertTrue(torch.equal(module.weight, reference_module.weight))
+                self.assertTrue(torch.equal(module.bias, reference_module.bias))
+
+        with (
+            mock.patch.object(
+                dist,
+                "all_gather_single",
+                side_effect=AssertionError("all-gather on a 1-rank mesh"),
+            ),
+            mock.patch.object(
+                dist,
+                "reduce_scatter_tensor",
+                side_effect=AssertionError("reduce-scatter on a 1-rank mesh"),
+            ),
+        ):
+            output = model(x)
+            check_unsharded_params()
+            reference_output = reference(x)
+            self.assertTrue(torch.equal(output, reference_output))
+            with RecordStreams():
                 output.sum().backward()
-                hidden.backward(detached.grad)
-                reference_output.sum().backward()
-            model.finalize_backward()
-            _average_reference_grads(reference)
-            optimizer.step()
-            reference_optimizer.step()
+            for context in model._flex_shard_eager_comm_contexts.values():
+                self.assertNotIn(context.reduce_grad_stream, backward_streams)
+            reference_output.sum().backward()
+            for param, reference_param in zip(
+                model.parameters(), reference.parameters(), strict=True
+            ):
+                self.assertTrue(torch.equal(param.grad, reference_param.grad.float()))
+            model.reshard()
+            model.unshard(async_op=True).wait()
+            check_unsharded_params()
+            model.reshard()
+
+    @skip_if_lt_x_gpu(2)
+    def test_shard_all_gathers_in_place(self):
+        # With a narrower unsharded dtype, Shard casts the local shard straight
+        # into its chunk of the gather buffer and all-gathers in place, as
+        # FSDP2's copy-in does. A 1-rank mesh skips the all-gather (see
+        # test_single_rank_bucket_skips_all_gather_and_reduce_scatter).
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        torch.manual_seed(0)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 8)
+        ).to(device_type)
+        flex_shard(
+            model,
+            buckets=[
+                BucketSpec(
+                    [pattern],
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
+                    reshard_after_forward=True,
+                )
+                for pattern in ("0.*", "2.*")
+            ],
+        )
+        bucket = [
+            bucket
+            for context in model._flex_shard_eager_comm_contexts.values()
+            for bucket in context.buckets
+        ][-1]
+        handle = bucket.begin_unshard()
+        send_buf, gather_buf = handle.prepared.buffers
+        self.assertEqual(
+            send_buf.untyped_storage().data_ptr(),
+            gather_buf.untyped_storage().data_ptr(),
+        )
+        bucket.finish_unshard(handle)
+        bucket.reshard()
+
+    @skip_if_lt_x_gpu(2)
+    def test_torch_compile_traces_per_bucket_collectives(self):
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        args, model = flex_shard_transformer_model(mesh)
+        graphs = []
+
+        def capture_backend(gm, example_inputs):
+            graphs.append(gm)
+            return gm.forward
+
+        compiled_model = torch.compile(model, backend=capture_backend, fullgraph=True)
+        compiled_model(transformer_inputs(args, device=device_type)).sum().backward()
+        self.assertEqual(1, len(graphs))
+        # Collectives live in the fwd_body_*/bwd_body_* subgraphs that
+        # autograd_function_apply dispatches to, not at the top level.
+        subgraph_targets = set()
+        for _, submodule in graphs[0].named_modules():
+            if isinstance(submodule, torch.fx.GraphModule):
+                subgraph_targets.update(
+                    str(node.target) for node in submodule.graph.nodes
+                )
+        # Functional collectives keep the comm reorderable by graph passes.
+        self.assertIn("_c10d_functional.all_gather_into_tensor", subgraph_targets)
+        self.assertIn("_c10d_functional.reduce_scatter_tensor", subgraph_targets)
+        self.assertIn("_c10d_functional.wait_tensor", subgraph_targets)
+
+    @skip_if_lt_x_gpu(2)
+    def test_unshard_leaves_no_memory_on_flex_shard_stream(self):
+        # A pipeline schedule unshards each stage with async_op=True. As in
+        # FSDP2, the all-gather buffers belong to the current stream, so after
+        # the copy-out its pool reuses them, rather than FlexShard's unshard
+        # stream keeping them reserved.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        model = self._two_bucket_mlp(mesh)
+        (context,) = getattr(model, bucket_runtime._EAGER_COMM_CONTEXTS_ATTR).values()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        for _ in range(2):
+            model.unshard(async_op=True).wait()
+            model.reshard()
+        torch.cuda.synchronize()
+        unshard_stream = context.unshard_stream.cuda_stream
+        segments = [
+            segment
+            for segment in torch.cuda.memory._snapshot()["segments"]
+            if segment["device"] == torch.cuda.current_device()
+            and segment["stream"] == unshard_stream
+        ]
+        self.assertEqual(segments, [])
 
     @skip_if_lt_x_gpu(2)
     def test_gradient_accumulation(self):
@@ -1297,9 +1728,9 @@ class TestFlexShardTraining(FSDPTest):
         bf16, fp32 = torch.bfloat16, torch.float32
         # Each case exercises one source of the unsharded accumulation dtype.
         # Grads of 256, from a backward without sync, and then 1, from a
-        # syncing one, accumulate to 257 only in fp32. As in FSDP2, the upcast
-        # is deferred: the backward without sync still holds the grad in the
-        # compute dtype when it reshards and widens it after.
+        # syncing one, accumulate to 257 only in fp32. As in FSDP2, the
+        # backward without sync starts the grad, so it keeps the upcast: the
+        # grad is already in the accumulation dtype when the bucket reshards.
         cases = (
             ("storage_dtype", fp32, None, bf16, None, fp32, 257.0),
             ("explicit_grad_dtype", bf16, fp32, None, None, fp32, 257.0),
@@ -1356,7 +1787,7 @@ class TestFlexShardTraining(FSDPTest):
                     model.set_requires_gradient_sync(False)
                     model(256 * x).backward()
                 unsharded_param = reshards.call_args.args[0].unsharded_params[0]
-                self.assertEqual(at_reshard, [[compute_dtype]])
+                self.assertEqual(at_reshard, [[accumulation_dtype]])
                 self.assertEqual(unsharded_param.grad.dtype, accumulation_dtype)
                 model.set_requires_gradient_sync(True)
                 model(x).backward()
@@ -1376,6 +1807,49 @@ class TestFlexShardTraining(FSDPTest):
                         world_size=self.world_size,
                     ),
                 )
+
+    @skip_if_lt_x_gpu(2)
+    def test_reshard_restores_deferred_grad_upcast(self):
+        # torch.distributed.pipelining runs a stage's forward and backward to
+        # infer its shapes, with manual backward finalization, then calls
+        # reshard(). That backward syncs, so it defers the upcast, and nothing
+        # finishes it; reshard() must restore the upcast, as FSDP2's
+        # post-backward does after every call.
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+        model = _AccumulatingWeight(device=device_type, dtype=torch.float32)
+        flex_shard(
+            model,
+            buckets=[
+                BucketSpec(
+                    ["*"],
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
+                    reshard_after_forward=False,
+                )
+            ],
+        )
+        x = torch.ones(1, 8, dtype=torch.bfloat16, device=device_type)
+        model.set_manual_backward_finalization(True)
+        model(256 * x).backward()
+        unsharded_param = model._parameters["weight"]
+        self.assertIsNone(unsharded_param.grad_dtype)
+        self.assertEqual(unsharded_param.grad.dtype, torch.bfloat16)
+
+        model.reshard()
+        self.assertEqual(unsharded_param.grad_dtype, torch.float32)
+        self.assertEqual(unsharded_param.grad.dtype, torch.float32)
+        # A backward without sync then adds 1 to the kept 256 in fp32.
+        model.set_manual_backward_finalization(False)
+        model.set_requires_gradient_sync(False)
+        model(x).backward()
+        grad = unsharded_param.grad
+        self.assertEqual(grad.dtype, torch.float32)
+        self.assertEqual(grad, torch.full_like(grad, 257.0))
 
     @skip_if_lt_x_gpu(2)
     def test_bucket_reduces_in_promoted_grad_dtype(self):
@@ -1426,11 +1900,12 @@ class TestFlexShardTraining(FSDPTest):
         self.assertEqual(model.a._parameters["weight"].grad.dtype, torch.bfloat16)
         model.set_requires_gradient_sync(True)
         model(x).backward()
-        # b's two uses sum in its bf16 compute dtype while its upcast is
-        # deferred, as in FSDP2, so each backward adds 256 rather than 257.
+        # As in FSDP2, b's first backward, without sync, starts its grad and
+        # keeps the upcast, so its two uses sum to 257 in fp32; the syncing
+        # backward defers the upcast and sums them to 256 in bf16.
         for module, grad_value, grad_dtype in (
             (model.a, 512.0, torch.bfloat16),
-            (model.b, 512.0, torch.float32),
+            (model.b, 513.0, torch.float32),
         ):
             grad = module._parameters["weight"].grad
             self.assertEqual(grad.dtype, grad_dtype)
@@ -1496,130 +1971,6 @@ class TestFlexShardTraining(FSDPTest):
         optim.step()
         ref_optim.step()
         check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
-
-    @skip_if_lt_x_gpu(2)
-    def test_submodule_buckets_under_selective_activation_checkpointing(self):
-        # Buckets inside checkpointed blocks unshard again in the recompute,
-        # which runs before their pre-backward hooks, after forward prefetched
-        # them from the previous block, or after a microbatch left them
-        # unsharded; selective activation checkpointing must not see it.
-        mesh = init_device_mesh(
-            device_type.type,
-            (self.world_size,),
-            mesh_dim_names=("fsdp",),
-        )
-        blocks_per_rank = (1,) * self.world_size
-        block_shard = BlockShard(blocks_per_rank=blocks_per_rank)
-
-        def dist_muon_mixed_placements(named_params, mesh):
-            # DistMuon's mixed buckets: block-sharded weights, owned biases.
-            owned = {
-                fqn: idx % mesh.size()
-                for idx, (fqn, _) in enumerate(named_params)
-                if fqn.endswith("bias")
-            }
-            blocks = {
-                fqn: blocks_per_rank
-                for fqn, _ in named_params
-                if fqn.endswith("weight")
-            }
-            return make_mixed_placement_fn(owned, blocks)(named_params, mesh)
-
-        placement_fns = {
-            "shard": per_param_placements,
-            "block_shard": lambda named_params, _mesh: {
-                fqn: (block_shard,) for fqn, _ in named_params
-            },
-            "bucketed_block": make_bucketed_block_placement_fn(
-                dims=(0,), blocks_per_rank=blocks_per_rank
-            ),
-            # Whole-parameter BucketedOwned buckets unshard through their
-            # owners' rows, without copies.
-            "owned": make_bucketed_owned_full_param_placement_fn(),
-            "dist_muon_mixed": dist_muon_mixed_placements,
-        }
-        begin_unshard = bucket_runtime.BucketRuntime.begin_unshard
-        gathers: list[bucket_runtime.BucketRuntime] = []
-
-        def count_gathers(bucket, *args, **kwargs):
-            gathers.append(bucket)
-            return begin_unshard(bucket, *args, **kwargs)
-
-        for (name, placement_fn), accumulate in (
-            (case, accumulate)
-            for case in placement_fns.items()
-            for accumulate in (False, True)
-        ):
-            with self.subTest(placement=name, accumulate=accumulate):
-                torch.manual_seed(0)
-                reference = torch.nn.Sequential(*(_GatedBlock(8) for _ in range(3)))
-                reference = reference.to(device_type)
-                # The same FlexShard model without and with checkpointing.
-                plain, model = copy.deepcopy(reference), copy.deepcopy(reference)
-                for module in (reference, model):
-                    for idx, block in enumerate(module):
-                        module[idx] = checkpoint_wrapper(
-                            block, context_fn=_prefer_recompute_context_fn
-                        )
-                buckets = [
-                    BucketSpec(
-                        [f"{idx}.*{part}"],
-                        placement_fn=placement_fn,
-                        mesh=mesh,
-                        reshard_after_forward=True,
-                    )
-                    for idx in range(len(model))
-                    for part in ("attn", "mlp")
-                ]
-                for module in (plain, model):
-                    flex_shard(module, buckets=buckets)
-                modules = (reference, plain, model)
-                optims = [make_test_sgd(m.parameters(), lr=0.1) for m in modules]
-                for _ in range(3):
-                    if accumulate:
-                        # The params stay unsharded after this microbatch, so
-                        # the next forward skips the all-gather and the
-                        # recompute re-gathers.
-                        for module in (plain, model):
-                            module.set_reshard_after_backward(False)
-                            module.set_requires_gradient_sync(False)
-                        x = torch.randn(4, 8, device=device_type)
-                        for module in modules:
-                            module(x).square().sum().backward()
-                        for module in (plain, model):
-                            module.set_reshard_after_backward(True)
-                            module.set_requires_gradient_sync(True)
-                    x = torch.randn(4, 8, device=device_type)
-                    ref_loss = reference(x).square().sum()
-                    plain_loss = plain(x).square().sum()
-                    gathers.clear()
-                    with mock.patch.object(
-                        bucket_runtime.BucketRuntime, "begin_unshard", count_gathers
-                    ):
-                        loss = model(x).square().sum()
-                        loss.backward()
-                    ref_loss.backward()
-                    plain_loss.backward()
-                    self.assertEqual(plain_loss, ref_loss)
-                    self.assertEqual(loss, ref_loss)
-                    if not accumulate:
-                        # One all-gather per bucket in forward and in backward:
-                        # the recompute finishes the next bucket's prefetch.
-                        self.assertEqual(len(gathers), 2 * len(buckets))
-                    for (plain_fqn, plain_param), (fqn, param) in zip(
-                        plain.named_parameters(), model.named_parameters(), strict=True
-                    ):
-                        self.assertEqual(
-                            fqn.replace("_checkpoint_wrapped_module.", ""), plain_fqn
-                        )
-                        self.assertEqual(param.grad, plain_param.grad)
-                    for optim in optims:
-                        optim.step()
-                        optim.zero_grad(set_to_none=True)
-                for plain_param, param in zip(
-                    plain.parameters(), model.parameters(), strict=True
-                ):
-                    self.assertEqual(param, plain_param)
 
     @skip_if_lt_x_gpu(2)
     def test_pre_backward_and_post_reduce_hooks(self):

@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Literal, TYPE_CHECKING
+from typing import Any, ClassVar, Literal, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -86,6 +86,26 @@ def set_global_layout(tensor: torch.Tensor, layout: GlobalLayout) -> None:
     tensor.global_offsets = layout.global_offsets
     tensor.local_offsets = layout.local_offsets
     tensor.local_sizes = layout.local_sizes
+
+
+_PARTIAL_GRAD_GROUP_ATTR = "_flex_shard_partial_grad_group"
+
+
+def set_partial_grad_group(tensor: torch.Tensor, group: dist.ProcessGroup) -> None:
+    """Declare that each rank of ``group`` computes only part of ``tensor``'s grad.
+
+    Call before ``flex_shard()``, for example on a norm weight under tensor
+    parallelism with sequence parallelism, where each rank's grad covers its
+    own tokens. FlexShard then sums the parameter's unsharded grad over
+    ``group`` before the reduce-scatter, as FSDP2 redistributes a ``Partial``
+    grad on a mesh dim it does not shard over.
+    """
+    setattr(tensor, _PARTIAL_GRAD_GROUP_ATTR, group)
+
+
+def get_partial_grad_group(tensor: torch.Tensor) -> dist.ProcessGroup | None:
+    """Return the group ``tensor`` declared its grad partial over, if any."""
+    return getattr(tensor, _PARTIAL_GRAD_GROUP_ATTR, None)
 
 
 def compose_global_layouts(outer: GlobalLayout, inner: GlobalLayout) -> GlobalLayout:
@@ -183,6 +203,14 @@ class Placement(ABC):
     def __hash__(self) -> int:
         """Return a hash consistent with placement equality."""
         raise NotImplementedError
+
+    #: Whether only ``finish_prepared_unshard`` writes a refill's persistent
+    #: buffers, as a copy-out on the current stream, never
+    #: ``run_prepared_unshard``. The bucket runtime then re-allocates their
+    #: storage right before finish rather than before run, as FSDP2 allocates
+    #: its unsharded parameters at copy-out, so a prefetched bucket holds only
+    #: its gather buffer until its hook takes it.
+    refills_persistent_buffers_in_finish: ClassVar[bool] = False
 
     def bucket_compatibility_key(self) -> object:
         """Return a key shared by placements that can use one bucket collective."""
@@ -300,8 +328,16 @@ class Placement(ABC):
     def run_prepared_unshard(
         self,
         prepared: PlacementPreparedUnshard,
-    ) -> None:
-        """Launch this placement's prepared unshard collective."""
+        *,
+        async_op: bool = False,
+    ) -> dist.Work | None:
+        """Launch this placement's prepared unshard collective.
+
+        With ``async_op``, return the collective's work, as ``torch.distributed``
+        collectives do; the caller waits on it before
+        ``finish_prepared_unshard``. A placement whose run reads the gathered
+        data waits on it itself and returns ``None``.
+        """
         raise NotImplementedError
 
     def finish_prepared_unshard(
@@ -331,6 +367,16 @@ class Placement(ABC):
         implements ``reduction`` for one reduce-scatter."""
         raise NotImplementedError
 
+    def reduces_grads_in_param_layout(
+        self, infos: list[ParamInfo], world_size: int
+    ) -> bool:
+        """Whether this bucket's gradient reduction reads, without copying
+        them in, grads allocated as views of one zeroed buffer per storage the
+        unsharded params view, at their offsets (see
+        ``BucketSpec.pre_backward_hook``). The bucket runtime then allocates
+        them there itself for a bucket with no pre-backward hook."""
+        return False
+
 
 @dataclass
 class PlacementPreparedUnshard:
@@ -352,7 +398,9 @@ class PlacementPreparedUnshard:
     waited on it. The placement writes the new values into them, in the same
     layout, where it chooses: run may gather straight into them on the unshard
     stream, or finish may copy into them on the current stream. Finish returns
-    them.
+    them. A placement whose finish alone writes them
+    (``Placement.refills_persistent_buffers_in_finish``) gets their storage
+    re-allocated right before finish instead.
     Eager unshards are persistent. During graph capture they are not, and the
     full params may view gathered buffers whose lifetime the traced graph owns.
     """
@@ -411,6 +459,7 @@ __all__ = [
     "BucketStorageLayout",
     "compose_global_layouts",
     "get_global_layout",
+    "get_partial_grad_group",
     "GlobalLayout",
     "GradientReduceOp",
     "GradientReduction",
@@ -421,4 +470,5 @@ __all__ = [
     "PlacementReduceGradResult",
     "PlacementUnshardResult",
     "set_global_layout",
+    "set_partial_grad_group",
 ]

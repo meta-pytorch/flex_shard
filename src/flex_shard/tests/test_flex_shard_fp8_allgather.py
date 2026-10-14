@@ -21,6 +21,9 @@ from ..custom_placements import (
     fp8_bucketed_block_shard as fp8_bucketed_block_shard_module,
 )
 from ..custom_placements.block_shard import BucketedBlockShard
+from ..custom_placements.dense_all_gather_reference import (
+    DenseAllGatherReferencePlacement,
+)
 from ..custom_placements.fp8_bucketed_block_shard import (
     _VEC_ALIGN_BYTES,
     Fp8BucketedBlockShard,
@@ -766,9 +769,10 @@ class TestFp8FusedCopyOut(TestCase):
     def _metadata(
         self,
         shapes: list[tuple[int, int]],
+        placement_cls: type[Fp8BucketedBlockShard] = Fp8BucketedBlockShard,
         world_size: int = 8,
     ) -> tuple[Fp8BucketedBlockShard, Fp8BucketedBlockShard._Fp8BucketMetadata]:
-        placement = Fp8BucketedBlockShard(
+        placement = placement_cls(
             world_size=world_size,
             weight_factory=_return_fp8_data,
             block_size=4,
@@ -845,7 +849,11 @@ class TestFp8FusedCopyOut(TestCase):
                         scale_byte_offset=scale_byte_offset,
                     )
                     self.assertTrue(torch.equal(fused, expected))
-                    plan = placement._copy_out_plan(metadata)
+                    plan = placement._copy_out_plan(
+                        metadata,
+                        data_elem_nbytes=1,
+                        with_scales=True,
+                    )
                     unit_nbytes = aligned_unit if offset == 0 else 1
                     self.assertIn(
                         (rank_rows.device, rank_rows.stride(0), unit_nbytes),
@@ -867,11 +875,11 @@ class TestFp8FusedCopyOut(TestCase):
             device=device_type,
         )
         placement._copy_out_rank_rows_triton(metadata, rank_rows, compact)
-        plan = placement._copy_out_plan(metadata)
+        plan = placement._copy_out_plan(metadata, data_elem_nbytes=1, with_scales=True)
         (descriptor,) = plan.descriptors.values()
         placement._copy_out_rank_rows_triton(metadata, rank_rows, compact)
         self.assertIs(
-            placement._copy_out_plan(metadata),
+            placement._copy_out_plan(metadata, data_elem_nbytes=1, with_scales=True),
             plan,
         )
         self.assertEqual(list(plan.descriptors.values()), [descriptor])
@@ -899,6 +907,39 @@ class TestFp8FusedCopyOut(TestCase):
         self.assertFalse(
             placement._copy_out_rank_rows_triton(metadata, rank_rows.cpu(), compact)
         )
+
+    def test_dense_reference_joins_rank_rows(self) -> None:
+        placement, metadata = self._metadata(
+            [(16, 8), (8, 8), (1, 3)],
+            placement_cls=DenseAllGatherReferencePlacement,
+        )
+        world_size = len(metadata.rank_fp8_numels)
+        for row_numel in (max(metadata.rank_fp8_numels) + 5, 64):
+            with self.subTest(row_numel=row_numel):
+                rank_rows = torch.randn(
+                    (world_size, row_numel),
+                    dtype=torch.bfloat16,
+                    device=device_type,
+                )
+                joined = rank_rows.new_empty(sum(metadata.rank_fp8_numels))
+                self.assertTrue(
+                    placement._copy_out_rank_rows_triton(
+                        metadata,
+                        rank_rows.view(torch.uint8),
+                        joined.view(torch.uint8),
+                        data_elem_nbytes=rank_rows.element_size(),
+                        with_scales=False,
+                    )
+                )
+                expected = torch.cat(
+                    [
+                        rank_rows[rank, :numel]
+                        for rank, numel in enumerate(metadata.rank_fp8_numels)
+                    ]
+                )
+                self.assertTrue(
+                    torch.equal(joined.view(torch.int16), expected.view(torch.int16))
+                )
 
     def test_segment_copy_splits_long_segments(self) -> None:
         from ..custom_placements._copy_kernels import (
