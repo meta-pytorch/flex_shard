@@ -11,6 +11,7 @@ from __future__ import annotations
 import heapq
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import Protocol
 
 import torch.distributed as dist
@@ -18,6 +19,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from ..flex_shard import BucketSpec, MixedPrecisionPolicy
+from ..flex_shard.utils import assign_to_hosts_then_ranks, mesh_rank_hosts
 from .placement import (
     BlockShardPlan,
     get_dim0_block_partitions,
@@ -148,6 +150,7 @@ class _BalancedMatrixAssignment:
         groups: Sequence[AssignmentGroup],
         *,
         num_ranks: int,
+        hosts: Sequence[int] | None = None,
     ) -> MatrixAssignment:
         rank_by_matrix: dict[str, int] = {}
         blocks_per_rank_by_group: dict[str, tuple[int, ...]] = {}
@@ -182,23 +185,32 @@ class _BalancedMatrixAssignment:
                     slot_loads[slot] = load + matrix.numel
                     heapq.heappush(slot_heap, (load + matrix.numel, slot))
 
-                slots = sorted(
-                    zip(slot_loads, slot_matrices, strict=True),
-                    key=lambda item: item[0],
-                    reverse=True,
-                )
-                available_ranks = sorted(
-                    range(num_ranks),
-                    key=lambda rank: (rank_loads[rank], rank),
-                )
-                for (slot_load, matrix_names), rank in zip(
-                    slots,
-                    available_ranks,
-                    strict=True,
-                ):
-                    for matrix_name in matrix_names:
+                if hosts is None:
+                    # The heaviest slot onto the least-loaded rank.
+                    slot_ranks = zip(
+                        sorted(
+                            range(num_ranks),
+                            key=lambda slot: slot_loads[slot],
+                            reverse=True,
+                        ),
+                        sorted(range(num_ranks), key=lambda rank: rank_loads[rank]),
+                        strict=True,
+                    )
+                else:
+                    # Hosts first, so heavy and light hosts alternate in rank
+                    # order (see assign_to_hosts_then_ranks).
+                    slot_ranks = enumerate(
+                        assign_to_hosts_then_ranks(
+                            slot_loads,
+                            hosts,
+                            carried_loads=rank_loads,
+                            one_per_rank=True,
+                        )
+                    )
+                for slot, rank in list(slot_ranks):
+                    for matrix_name in slot_matrices[slot]:
                         rank_by_matrix[matrix_name] = rank
-                    rank_loads[rank] += slot_load
+                    rank_loads[rank] += slot_loads[slot]
 
             for block_group in group.block_groups:
                 blocks_per_rank = [0] * len(block_group.eligible_ranks)
@@ -226,12 +238,22 @@ def assign_matrices(
     groups: Sequence[AssignmentGroup],
     *,
     num_ranks: int,
+    hosts: Sequence[int] | None = None,
 ) -> MatrixAssignment:
-    """Assign recipe-defined groups in their explicit sequence order."""
+    """Assign recipe-defined groups in their explicit sequence order.
+
+    With ``hosts`` (each rank's host, see ``mesh_rank_hosts``), a group's
+    whole matrices go to hosts first, then to ranks within them (see
+    ``assign_to_hosts_then_ranks``); without, the heaviest go to the least
+    loaded ranks. Block groups keep their eligible ranks' order, since their
+    blocks are computed in batches."""
     _validate_inputs(groups, num_ranks)
+    if hosts is not None and len(hosts) != num_ranks:
+        raise ValueError(f"hosts must give each of {num_ranks} ranks a host.")
     return _BalancedMatrixAssignment().assign(
         groups,
         num_ranks=num_ranks,
+        hosts=hosts,
     )
 
 
@@ -314,12 +336,19 @@ def materialize_dist_muon_buckets(
     partition_rank_axis_name: str,
     partition_axis_name: str,
     mp_policy: MixedPrecisionPolicy,
-    assignment_fn: MatrixAssignmentFn = assign_matrices,
+    assignment_fn: MatrixAssignmentFn | None = None,
 ) -> list[BucketSpec]:
     """Assign complete matrices and materialize their storage buckets.
 
     ``assignment_fn`` runs on every rank and must return the same assignment.
+    By default it is ``assign_matrices`` with the assignment mesh's hosts
+    (``mesh_rank_hosts``).
     """
+    if assignment_fn is None:
+        assignment_fn = partial(
+            assign_matrices,
+            hosts=mesh_rank_hosts(assignment_mesh.mesh.flatten().tolist()),
+        )
     if partition_mesh is None:
         partition_storage_mesh = assignment_mesh
         rank_groups = (tuple(range(assignment_mesh.size())),)

@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from typing import Literal, TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from typing_extensions import override
 
@@ -25,6 +26,7 @@ from ..flex_shard.placement_contract import (
     PlacementReduceGradResult,
     PlacementUnshardResult,
 )
+from ..flex_shard.utils import assign_to_hosts_then_ranks, mesh_rank_hosts
 from .block_shard import BlockShard
 
 if TYPE_CHECKING:
@@ -338,8 +340,10 @@ class BucketedOwned(Placement):
         )
 
     @override
-    def run_prepared_unshard(self, prepared: PlacementPreparedUnshard) -> None:
-        self._mixed_member().run_prepared_unshard(prepared)
+    def run_prepared_unshard(
+        self, prepared: PlacementPreparedUnshard, *, async_op: bool = False
+    ) -> dist.Work | None:
+        return self._mixed_member().run_prepared_unshard(prepared, async_op=async_op)
 
     @override
     def finish_prepared_unshard(
@@ -377,13 +381,34 @@ class BucketedOwned(Placement):
     ) -> PlacementReduceGradResult:
         return self._mixed_member().reduce_prepared_grad(prepared, reduction)
 
+    @override
+    def reduces_grads_in_param_layout(
+        self, infos: list[ParamInfo], world_size: int
+    ) -> bool:
+        return self._mixed_member().reduces_grads_in_param_layout(
+            self._member_infos(infos), world_size
+        )
+
 
 def _assign_params_to_ranks(
     named_params: list[tuple[str, nn.Parameter]],
     world_size: int,
+    hosts: Sequence[int] | None = None,
+    carried_loads: Sequence[int] | None = None,
 ) -> dict[str, int]:
-    """Greedily assign each full parameter to the currently least-loaded rank."""
-    loads = [(0, rank) for rank in range(world_size)]
+    """Greedily assign each full parameter, largest first: with ``hosts``
+    (each rank's host), to hosts first and then ranks within them (see
+    ``assign_to_hosts_then_ranks``); without, to the least-loaded rank.
+    ``carried_loads`` are each rank's loads from earlier buckets."""
+    if hosts is not None:
+        owners = assign_to_hosts_then_ranks(
+            [param.numel() for _fqn, param in named_params],
+            hosts,
+            carried_loads=carried_loads,
+        )
+        return {fqn: owner for (fqn, _param), owner in zip(named_params, owners)}
+    carried = [0] * world_size if carried_loads is None else list(carried_loads)
+    loads = [(carried[rank], rank) for rank in range(world_size)]
     heapq.heapify(loads)
     assignments: dict[str, int] = {}
     for fqn, param in sorted(
@@ -400,14 +425,25 @@ def _assign_params_to_ranks(
 def make_bucketed_owned_full_param_segments(
     named_params: list[tuple[str, nn.Parameter]],
     world_size: int,
+    *,
+    hosts: Sequence[int] | None = None,
+    carried_loads: Sequence[int] | None = None,
 ) -> dict[str, list[BucketedOwnedSegmentSpec]]:
     """Build one whole-parameter BucketedOwned segment per parameter.
 
-    Parameters are assigned to owners with greedy LPT by numel.
+    Parameters are assigned to owners with greedy LPT by numel; with ``hosts``
+    (each rank's host, see ``mesh_rank_hosts``), hosts first. ``carried_loads``
+    are each rank's owned numel from earlier buckets, which breaks ties.
     """
     if world_size <= 0:
         raise ValueError(f"world_size must be positive, but got {world_size}.")
-    assignments = _assign_params_to_ranks(named_params, world_size)
+    if hosts is not None and len(hosts) != world_size:
+        raise ValueError(f"hosts must give each of {world_size} ranks a host.")
+    if carried_loads is not None and len(carried_loads) != world_size:
+        raise ValueError(f"carried_loads must give each of {world_size} ranks a load.")
+    assignments = _assign_params_to_ranks(
+        named_params, world_size, hosts, carried_loads
+    )
     return {
         fqn: [
             BucketedOwnedSegmentSpec(
@@ -423,17 +459,36 @@ def make_bucketed_owned_full_param_segments(
     }
 
 
-def make_bucketed_owned_full_param_placement_fn() -> PlacementFn:
-    """Return a whole-parameter BucketedOwned placement function."""
+def make_bucketed_owned_full_param_placement_fn(
+    *, carry_loads: bool = False
+) -> PlacementFn:
+    """Return a whole-parameter BucketedOwned placement function. Owners
+    are balanced over the mesh's hosts first (``mesh_rank_hosts``), so heavy
+    and light hosts alternate in rank order.
+
+    With ``carry_loads``, the function keeps each mesh's per-rank owned numel
+    across calls, so a bucket's owners also balance against the buckets placed
+    before it, e.g. one owner bucket per transformer block, which would
+    otherwise all get the same owners. Every rank must then call it for the
+    same buckets in the same order, as SPMD code does."""
+    carried: dict[tuple[int, ...], list[int]] = {}
 
     def placement_fn(
         named_params: list[tuple[str, nn.Parameter]],
         mesh: DeviceMesh,
     ) -> dict[str, tuple[Placement, ...]]:
+        mesh_ranks = tuple(mesh.mesh.flatten().tolist())
+        loads = carried.setdefault(mesh_ranks, [0] * mesh.size())
         segments_by_fqn = make_bucketed_owned_full_param_segments(
             named_params,
             mesh.size(),
+            hosts=mesh_rank_hosts(list(mesh_ranks)),
+            carried_loads=loads if carry_loads else None,
         )
+        if carry_loads:
+            for segments in segments_by_fqn.values():
+                for segment in segments:
+                    loads[segment.owner_rank] += segment.numel
         placement = BucketedOwned(segments_by_fqn, view_kind="full_param")
         return {fqn: (placement,) for fqn, _ in named_params}
 

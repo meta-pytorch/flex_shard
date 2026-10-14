@@ -19,6 +19,13 @@ the same model's bucket collectives in a full model trace, following
 | CUDA and NCCL | A CUDA-enabled PyTorch build with NCCL and a compatible NVIDIA driver |
 | Triton | `~=3.8.0` on Linux |
 
+`Shard` placements call FSDP's native collective copies:
+`fsdp::_all_gather_copy_out_` from
+[pytorch/pytorch#197204](https://github.com/pytorch/pytorch/pull/197204), and
+`fsdp::chunk_cat_mixed_dtype` with `num_leading_dims` from
+[pytorch/pytorch#200179](https://github.com/pytorch/pytorch/pull/200179). Until a
+PyTorch release includes them, they need a PyTorch built with those pull requests.
+
 Install a CUDA-enabled PyTorch build satisfying this requirement, then install
 FlexShard from the repository:
 
@@ -48,9 +55,20 @@ each parameter's mesh, and updates local shards with AdamW.
 | --- | --- |
 | Apply `fully_shard` to child modules, then the root | Call `flex_shard` once with explicit buckets |
 | Shard parameters along dimension 0 | Use `per_param_placements`, which assigns each parameter `Shard(0)` |
+| `shard_placement_fn` returning `Shard(i)` | A `placement_fn` returning `Shard(i)`; one bucket may mix dims |
 | `fully_shard(layer.experts, mesh=efsdp_mesh)` | Expert `BucketSpec(..., mesh=efsdp_mesh)` |
+| `set_modules_to_forward_prefetch` / `set_modules_to_backward_prefetch` | `set_buckets_to_forward_prefetch` / `set_buckets_to_backward_prefetch` on entries of `sharded_bucket_storages` |
+| `unshard()`, `reshard()` and `set_reshard_after_forward` on one `fully_shard` group | The same methods on its bucket's storage, from `sharded_bucket_storages` or `model.bucket_storage_of(param)` |
 | Construct AdamW after sharding | Construct AdamW after sharding |
 | AdamW manages DTensor parameters | AdamW manages ordinary local parameter shards |
+| DCP checkpoints DTensor state dicts | DCP checkpoints local shards that declare their layouts; see [Distributed checkpoints](#distributed-checkpoints) |
+
+For training that is bitwise identical to FSDP2, give each `fully_shard` group
+one `BucketSpec` naming the same modules, with the same `Shard(i)` placements,
+and set `fsdp2_compatible=True`. The bucket then orders its parameters as
+`fully_shard` does and, like FSDP2, reduce-scatters only the parameters that got
+a gradient, so its all-gather and reduce-scatter buffers match FSDP2's byte for
+byte.
 
 ### Dense parameters on dp, expert parameters on efsdp
 
@@ -255,14 +273,21 @@ activation checkpointing without wrapping the model.
 Setting `reshard_after_forward=False` keeps gathered parameters available
 through backward, trading memory for fewer all-gathers. Such a bucket stays
 unsharded after a forward until its backward; call `model.reshard()` when that
-backward will not run, as with FSDP2's `FSDPModule.reshard()`.
+backward will not run, as with FSDP2's `FSDPModule.reshard()`. Like the methods
+of one `fully_shard` group, each bucket storage also has `unshard()`,
+`reshard()` and `set_reshard_after_forward()`; `model.bucket_storage_of(param)`
+finds the bucket of a parameter.
 
 For gradient accumulation, call `model.set_requires_gradient_sync(is_last)`
 before each microbatch, as with FSDP2; there is no `no_sync()` context
 manager. Backwards without sync skip the reduce-scatter and keep full
 gradients on the unsharded parameters, accumulating in the bucket's
 `reduce_dtype` when it is wider, and the next syncing backward reduce-scatters
-them. `model.set_reshard_after_backward(False)` also keeps the parameters
+them. A bucket called more than once per forward, such as an output projection
+shared by multi-token prediction, reduce-scatters the kept gradients on their
+own when the syncing backward first reaches it, and the new ones in a second
+reduce-scatter, as FSDP2's post-backward per call does.
+`model.set_reshard_after_backward(False)` also keeps the parameters
 unsharded between those microbatches, so only the first one all-gathers when
 `reshard_after_forward=False`. Unlike FSDP2, a syncing backward always
 reshards, so the optimizer step never leaves stale unsharded parameters. Both
@@ -293,12 +318,98 @@ raises, instead of reduce-scattering without the late gradients.
 Some schedules run a module's computation directly, bypassing the forward hooks
 that gather its bucket. One example is Megatron-LM's EP all-to-all overlap,
 which calls each layer's sub-modules. Like FSDP2, call `model.unshard()` first:
-it gathers every bucket and keeps it gathered until the end of a backward or
-`finalize_backward()` finishes it.
+it gathers every bucket and keeps it gathered until the end of a backward that
+re-gathers a bucket, or `finalize_backward()`, finishes it. With
+`async_op=True` it only starts the all-gathers and returns a handle, as FSDP2's
+does, so a multi-stage pipeline schedule can gather a stage while others
+compute: call the handle's `wait()` before using the parameters directly, or
+run the forward, which finishes its buckets' all-gathers.
 
-A regular FlexShard `state_dict()` contains rank-local shards. It is not a
-gathered model checkpoint. Existing FSDP2 checkpoint code needs an explicit
-compatibility check or conversion, even when the parameter split agrees.
+Like `fully_shard` on a list of modules, a bucket whose patterns name several
+modules handles forwards that skip some of them and calls of one of them on its
+own. torchtitan's chunked loss does both: the decoder's forward returns the
+norm's output without the output projection that shares its bucket, and the
+loss then applies the projection to each chunk of the hidden states, with a
+backward per chunk. The root module's post-forward completes the bucket's
+forward, so the norm's backward re-gathers it. A call of the projection on its
+own does not complete the bucket: its outputs get no pre-backward hook, and its
+post-backward reduce-scatters, or keeps the gradients without sync, as soon as
+its input gradients are computed. As FSDP2's final callback, the end of a
+backward finishes the buckets it left unsharded and resets per-backward state
+only if the backward re-gathered a bucket in a pre-backward hook; the backward
+of such a call only waits for its reduce-scatters. Combined with the per-bucket
+methods above, this reduce-scatters like FSDP2 under the chunked loss, bit for
+bit.
+
+## Outer shardings
+
+FlexShard shards each parameter over its bucket's 1D mesh. A parameter that is
+already a local shard of another sharding, such as tensor or expert
+parallelism, is passed in as that plain local tensor:
+
+- `set_global_layout(param, layout)`, before `flex_shard()`, declares where it
+  sits in the full parameter. `get_outer_layout` returns the layout from the
+  sharded parameter, and checkpoints compose it with FlexShard's own split.
+- `set_partial_grad_group(param, group)` declares a group whose ranks each
+  compute only part of the parameter's grad. One example is a norm weight
+  under sequence parallelism, where each rank sees its own tokens. FlexShard
+  sums the unsharded grad over that group before the reduce-scatter, as FSDP2
+  does with a `Partial` grad on a mesh dim it does not shard over.
+
+## Distributed checkpoints
+
+A FlexShard `state_dict()` holds each rank's local shards, which share storage
+with the sharded parameters. To checkpoint them with PyTorch distributed
+checkpointing (DCP), declare where each shard sits in the full tensor, through
+the fields of DCP's `CheckpointableTensor` protocol:
+
+- `set_state_dict_global_layouts(model, state_dict)` declares them on a model
+  state dict's parameters.
+- `register_optimizer_checkpoint_hook(optimizer, model)` makes
+  `optimizer.state_dict()` declare them on the optimizer's states. Register it
+  once the parameters are sharded, as right after `flex_shard()`.
+
+```python
+import torch.distributed.checkpoint as dcp
+from flex_shard import register_optimizer_checkpoint_hook, set_state_dict_global_layouts
+
+register_optimizer_checkpoint_hook(optimizer, model)
+
+
+def checkpoint_state_dict():
+    model_state_dict = model.state_dict()
+    set_state_dict_global_layouts(model, model_state_dict)
+    return {"model": model_state_dict, "optim": optimizer.state_dict()}
+
+
+dcp.save(checkpoint_state_dict(), checkpoint_id=path)
+
+state_dict = checkpoint_state_dict()
+dcp.load(state_dict, checkpoint_id=path)
+model.load_state_dict(state_dict["model"])
+optimizer.load_state_dict(state_dict["optim"])
+```
+
+DCP saves each shard as a chunk of the full tensor and loads chunks by their
+global offsets. A checkpoint therefore loads at a different number of ranks,
+and FSDP2 checkpoints of the same model load into FlexShard and back, as
+[`test_flex_shard_checkpoint.py`](src/flex_shard/tests/test_flex_shard_checkpoint.py)
+checks with AdamW. As for any `dcp.load` into `optimizer.state_dict()`, the
+optimizer needs its states first, for example from a step with zero gradients.
+
+The optimizer hook supports Adam and AdamW, whose states other than `step` are
+elementwise and have their parameter's shape. `step` is saved as replicated.
+
+The declarations are Python attributes of the state-dict tensors, so DCP has to
+receive those tensor objects:
+
+- A copy, such as a `.to(dtype)` cast before saving, needs
+  `set_state_dict_global_layouts` again.
+- DCP's process-based `async_save` (`AsyncCheckpointerType.PROCESS`) sends the
+  state dict to its checkpoint process through `torch.multiprocessing`, whose
+  tensor pickling keeps only the data. That process would save each shard as
+  if it were the full tensor, without raising. The default thread-based
+  `async_save` keeps the declarations.
 
 ## Limitations
 

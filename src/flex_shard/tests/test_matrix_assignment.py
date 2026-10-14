@@ -4,8 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from collections.abc import Sequence
 from typing import cast
+from unittest import mock
 from unittest.mock import MagicMock
 
 import torch
@@ -14,7 +16,11 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.testing._internal.common_utils import TestCase
 
 from ..custom_placements.block_shard import BucketedBlockShard
-from ..custom_placements.owned import BucketedOwned
+from ..custom_placements.owned import (
+    BucketedOwned,
+    make_bucketed_owned_full_param_placement_fn,
+    make_bucketed_owned_full_param_segments,
+)
 from ..dist_muon import (
     assign_matrices,
     AssignmentGroup,
@@ -28,6 +34,7 @@ from ..dist_muon import (
 from ..dist_muon.placement import get_dim0_block_partitions
 from ..flex_shard.bucket_storage import BucketSpec, MixedPrecisionPolicy
 from ..flex_shard.placement_contract import GlobalLayout, set_global_layout
+from ..flex_shard.utils import assign_to_hosts_then_ranks, mesh_rank_hosts
 
 
 def _materialize_with_assignment_fn(
@@ -242,3 +249,155 @@ class MatrixAssignmentTest(TestCase):
             get_dim0_block_partitions(
                 [("blocks", blocks)], num_partitions=2, partition_index=0
             )
+
+
+# DeepSeek V3 671B's whole Muon matrices of one MoE layer: attention wo and
+# wq_a, shared experts' gate and up, down, router.
+_MOE_LAYER = (
+    7168 * 16384,
+    1536 * 7168,
+    2048 * 7168,
+    2048 * 7168,
+    7168 * 2048,
+    256 * 7168,
+)
+
+
+class TwoLevelOwnerTest(TestCase):
+    def test_mesh_rank_hosts(self) -> None:
+        self.assertEqual(mesh_rank_hosts(range(8), 4), (0, 0, 0, 0, 1, 1, 1, 1))
+        # A mesh of global ranks, such as one pipeline stage's data-parallel
+        # ranks: hosts are numbered in mesh order.
+        self.assertEqual(mesh_rank_hosts((64, 65, 72, 73), 8), (0, 0, 1, 1))
+        self.assertEqual(mesh_rank_hosts(range(4), 1), (0, 1, 2, 3))
+        with mock.patch.dict(os.environ, {"LOCAL_WORLD_SIZE": "2"}):
+            self.assertEqual(mesh_rank_hosts(range(4)), (0, 0, 1, 1))
+
+    def test_heavy_and_light_hosts_alternate(self) -> None:
+        # A 4-layer MoE stage on 64 ranks, 8 hosts: each wo exceeds a host's
+        # share (117.4M against 87.2M), so the hosts holding one alternate
+        # with the others in rank order, and the next bucket flips them.
+        hosts = mesh_rank_hosts(range(64), 8)
+        group = AssignmentGroup(
+            matrices=tuple(
+                WholeMatrixSpec(f"layer{layer}.m{index}", numel)
+                for layer in range(4)
+                for index, numel in enumerate(_MOE_LAYER)
+            ),
+            block_groups=(),
+        )
+        assignment = assign_matrices((group,), num_ranks=64, hosts=hosts)
+        self.assertEqual(
+            sorted(
+                hosts[assignment.rank_by_matrix[f"layer{layer}.m0"]]
+                for layer in range(4)
+            ),
+            [0, 2, 4, 6],
+        )
+        loads = [0] * 8
+        for matrix in group.matrices:
+            loads[hosts[assignment.rank_by_matrix[matrix.name]]] += matrix.numel
+        self.assertEqual(loads[0::2], [_MOE_LAYER[0]] * 4)
+        self.assertEqual(loads[1::2], [sum(_MOE_LAYER) - _MOE_LAYER[0]] * 4)
+        # The second bucket, balancing carried loads: wo on the other hosts.
+        second = assign_to_hosts_then_ranks(
+            [matrix.numel for matrix in group.matrices],
+            hosts,
+            carried_loads=[
+                sum(
+                    m.numel
+                    for m in group.matrices
+                    if assignment.rank_by_matrix[m.name] == rank
+                )
+                for rank in range(64)
+            ],
+            one_per_rank=True,
+        )
+        self.assertEqual(
+            sorted(hosts[second[6 * layer]] for layer in range(4)), [1, 3, 5, 7]
+        )
+
+    def test_one_host_alternates_ranks(self) -> None:
+        group = AssignmentGroup(
+            matrices=tuple(
+                WholeMatrixSpec(f"m{index}", numel)
+                for index, numel in enumerate((100, 100, 100, 100, 10, 10, 10, 10))
+            ),
+            block_groups=(),
+        )
+        assignment = assign_matrices((group,), num_ranks=8, hosts=(0,) * 8)
+        self.assertEqual(
+            sorted(assignment.rank_by_matrix[f"m{index}"] for index in range(4)),
+            [0, 2, 4, 6],
+        )
+
+    def test_without_hosts_keeps_rank_order(self) -> None:
+        group = AssignmentGroup(
+            matrices=tuple(
+                WholeMatrixSpec(f"m{index}", numel)
+                for index, numel in enumerate((100, 100, 10, 10, 10, 10))
+            ),
+            block_groups=(),
+        )
+        two_level = assign_matrices(
+            (group,), num_ranks=8, hosts=mesh_rank_hosts(range(8), 4)
+        )
+        rank_order = assign_matrices((group,), num_ranks=8)
+        self.assertEqual({two_level.rank_by_matrix[m] for m in ("m0", "m1")}, {0, 4})
+        self.assertEqual({rank_order.rank_by_matrix[m] for m in ("m0", "m1")}, {0, 1})
+
+    def test_bucketed_owned_segments_place_hosts_first(self) -> None:
+        named_params = [
+            (f"p{index}", nn.Parameter(torch.empty(numel)))
+            for index, numel in enumerate((100, 100, 10, 10))
+        ]
+        two_level = make_bucketed_owned_full_param_segments(
+            named_params, 8, hosts=mesh_rank_hosts(range(8), 4)
+        )
+        rank_order = make_bucketed_owned_full_param_segments(named_params, 8)
+        self.assertEqual({two_level[p][0].owner_rank for p in ("p0", "p1")}, {0, 4})
+        self.assertEqual({rank_order[p][0].owner_rank for p in ("p0", "p1")}, {0, 1})
+
+    def test_placement_fn_carries_loads_across_buckets(self) -> None:
+        # 16 identical buckets of a DeepSeek V3 MoE block's owned matrices on
+        # 64 ranks of 8 hosts, one bucket per block as torchtitan builds them.
+        # Placed one at a time, every bucket gets the same 6 owners; carrying
+        # the loads spreads them over the ranks.
+        shapes = (
+            (7168, 16384),
+            (1536, 7168),
+            (576, 7168),
+            (256, 7168),
+            (2, 2048, 7168),
+            (7168, 2048),
+        )
+        mesh = MagicMock()
+        mesh.mesh = torch.arange(64)
+        mesh.size.return_value = 64
+
+        def owned_numel(placement_fn) -> list[int]:
+            loads = [0] * 64
+            for block in range(16):
+                named_params = [
+                    (
+                        f"layers.{block}.m{i}",
+                        nn.Parameter(torch.empty(s, device="meta")),
+                    )
+                    for i, s in enumerate(shapes)
+                ]
+                placements = placement_fn(named_params, mesh)
+                for fqn, (placement,) in placements.items():
+                    for segment in placement.segments_by_fqn[fqn]:
+                        loads[segment.owner_rank] += segment.numel
+            return loads
+
+        with mock.patch.dict(os.environ, {"LOCAL_WORLD_SIZE": "8"}):
+            per_bucket = owned_numel(make_bucketed_owned_full_param_placement_fn())
+            carried = owned_numel(
+                make_bucketed_owned_full_param_placement_fn(carry_loads=True)
+            )
+        self.assertEqual(sum(load > 0 for load in per_bucket), 6)
+        self.assertEqual(max(per_bucket), 16 * 7168 * 16384)
+        # Each rank owns at most one wo and about a fair share in all.
+        self.assertGreaterEqual(sum(load > 0 for load in carried), 60)
+        self.assertLessEqual(max(carried), 7168 * 16384 + sum(carried) // 64)

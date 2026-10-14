@@ -19,6 +19,7 @@ from torch._prims_common import make_contiguous_strides_for
 
 from .placement_contract import (
     get_global_layout,
+    get_partial_grad_group,
     GradientReduceOp,
     GradientReduction,
 )
@@ -28,6 +29,7 @@ from .utils import _get_single_placement, _set_param_on_module
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
+    from .bucket_runtime import BucketCommContext, BucketRuntime
     from .placement_contract import (
         BucketStorageLayout,
         GlobalLayout,
@@ -158,8 +160,15 @@ class BucketSpec:
             reduce-scatters once the first one's input grads are computed. For
             a bucket of sibling modules, e.g. consecutive transformer layers,
             whose parent would gather it for its whole forward and
-            reduce-scatter it only after its whole backward. Each of them must
-            run a forward of its own, once per forward. Eager only.
+            reduce-scatter it only after its whole backward. As with FSDP2, a
+            forward may skip some of them, and the root module's post-forward
+            then completes the group, e.g. a decoder that returns its norm's
+            output and leaves the output projection in its bucket to the
+            loss. One of them may also run on its own, e.g. that projection
+            on each chunk of the hidden states with a backward per chunk:
+            such a call does not complete the group, so its outputs get no
+            pre-backward hook, and its post-backward runs as soon as its input
+            grads are computed. Eager only.
         placement_fn: Required callable that maps this bucket's
             ``(named_params, mesh)`` to per-parameter placements.
             The minimal eager path expects one ``Placement`` per parameter.
@@ -207,7 +216,11 @@ class BucketSpec:
             their offsets, in the reduce dtype, let a placement whose gradient
             reduction layout is its parameter layout (``BucketedBlockShard``
             with equal rank ranges, whole-parameter ``BucketedOwned``)
-            reduce-scatter that buffer without copying the grads in. Eager only.
+            reduce-scatter that buffer without copying the grads in
+            (``alloc_grads_in_param_layout``). A whole-parameter
+            ``BucketedOwned`` bucket with no hook gets its grads allocated so
+            when its params are in the dtype their grads accumulate and reduce
+            in (``Placement.reduces_grads_in_param_layout``). Eager only.
         post_reduce_hook: Optional callable run with the same pairs once a
             syncing backward has taken their grads for the reduce-scatter, e.g.
             to release references to those grads. Eager only.
@@ -219,6 +232,16 @@ class BucketSpec:
             ``delay_wgrad_compute``, whose ``backward_dw()`` runs later. A
             syncing backward that runs the module's backward but ends with the
             bucket unfinished raises. Eager only.
+        fsdp2_compatible: Whether this bucket's collectives match those of the
+            FSDP2 ``fully_shard`` group it replaces, byte for byte, so training
+            is bitwise identical to FSDP2. The parameters take FSDP2's order: a
+            post-order walk over the modules the patterns name, in pattern
+            order, or over the whole module for parameter patterns, keeping
+            each module's own parameters. The reduce-scatter groups them by
+            sharded grad dtype, as FSDP2 does, and includes only the parameters
+            that got a grad, as FSDP2 does by default: every rank must then get
+            grads for the same parameters. Requires ``Shard`` placements. Eager
+            only.
     """
 
     patterns: list[str]
@@ -232,6 +255,7 @@ class BucketSpec:
     pre_backward_hook: BucketHook | None = None
     post_reduce_hook: BucketHook | None = None
     defer_post_backward: bool = False
+    fsdp2_compatible: bool = False
 
 
 @dataclass(frozen=True)
@@ -274,6 +298,9 @@ class ParamInfo:
     # Outer (TP/EP) layout declared by the input param; ``global_shape`` is then
     # the outer local shape.
     outer_layout: GlobalLayout | None = None
+    # Group over which each rank computes only part of the grad; FlexShard sums
+    # the unsharded grad over it before the reduce-scatter.
+    partial_grad_group: dist.ProcessGroup | None = None
     # Python attributes of the original parameter (e.g. framework tags), copied
     # onto its persistent unsharded parameter.
     param_attrs: dict[str, Any] = field(default_factory=dict)
@@ -343,6 +370,7 @@ class ShardedBucketStorage:
         gradient_divide_factor: float | None = None,
         defer_post_backward: bool = False,
         hook_module_fqns: list[str] | None = None,
+        fsdp2_compatible: bool = False,
     ) -> None:
         if byte_storage.dtype != torch.uint8:
             raise ValueError(f"Expected uint8 storage, got {byte_storage.dtype}")
@@ -355,6 +383,7 @@ class ShardedBucketStorage:
         self._pre_backward_hook = pre_backward_hook
         self._post_reduce_hook = post_reduce_hook
         self._defer_post_backward = defer_post_backward
+        self._fsdp2_compatible = fsdp2_compatible
         # The modules a bucket of module patterns hooks (BucketSpec.patterns).
         self._hook_module_fqns = hook_module_fqns
         # See set_requires_gradient_sync and set_reshard_after_backward.
@@ -362,6 +391,9 @@ class ShardedBucketStorage:
         self._reshard_after_backward = True
         # See set_separate_reduce_scatter_group.
         self._reduce_mesh: DeviceMesh | None = None
+        # See set_buckets_to_forward_prefetch and set_buckets_to_backward_prefetch.
+        self._forward_prefetch: list[ShardedBucketStorage] | None = None
+        self._backward_prefetch: list[ShardedBucketStorage] | None = None
         self._gradient_reduction = GradientReduction(
             gradient_reduce_op, gradient_divide_factor
         )
@@ -412,6 +444,7 @@ class ShardedBucketStorage:
             gradient_divide_factor=bucket_spec.gradient_divide_factor,
             defer_post_backward=bucket_spec.defer_post_backward,
             hook_module_fqns=_hook_module_fqns(module, bucket_spec.patterns),
+            fsdp2_compatible=bucket_spec.fsdp2_compatible,
         )
         bucket_storage.copy_params_from(named_params)
         bucket_storage.install_sharded_params(expected_param_device)
@@ -653,6 +686,7 @@ class ShardedBucketStorage:
             global_numel=param.numel(),
             bucket_layout=bucket_layout,
             outer_layout=get_global_layout(param),
+            partial_grad_group=get_partial_grad_group(param),
             param_attrs=dict(vars(param)),
             has_explicit_grad_dtype=has_explicit_grad_dtype,
             grad_dtype_override=param.grad_dtype if has_explicit_grad_dtype else None,
@@ -700,6 +734,7 @@ class ShardedBucketStorage:
                 global_shape=info.global_shape,
                 global_stride=info.global_stride,
                 mesh=self._mesh,
+                outer_layout=info.outer_layout,
             )
             for name in (fqn, *info.shared_fqns):
                 _set_param_on_module(self._module, name, new_param)
@@ -832,6 +867,98 @@ class ShardedBucketStorage:
         self._reshard_after_backward = reshard_after_backward
 
     @property
+    def reshard_after_backward(self) -> bool:
+        """Whether a backward without gradient sync reshards this bucket; see
+        ``set_reshard_after_backward``."""
+        return self._reshard_after_backward
+
+    @property
+    def reshard_after_forward(self) -> bool:
+        """Whether this bucket frees its unsharded parameters after forward;
+        see ``set_reshard_after_forward``."""
+        return self._reshard_after_forward
+
+    def set_reshard_after_forward(self, reshard_after_forward: bool) -> None:
+        """Set whether this bucket reshards after forward, like FSDP2's
+        ``set_reshard_after_forward`` on its group.
+
+        ``BucketSpec.reshard_after_forward`` sets the initial value; this one
+        applies from the next forward on, e.g. to keep the bucket gathered
+        across several calls of its module.
+        """
+        self._reshard_after_forward = reshard_after_forward
+
+    def unshard(self) -> None:
+        """Unshard this bucket now and keep it unsharded, like FSDP2's
+        ``FSDPModule.unshard()`` on its group, synchronously.
+
+        ``FlexShardModule.unshard`` documents the behavior and unshards every
+        bucket. Eager only.
+        """
+        context, bucket = self._runtime()
+        context.check_outside_backward("unshard")
+        bucket.unshard()
+
+    def reshard(self) -> None:
+        """Reshard this bucket now, like FSDP2's ``FSDPModule.reshard()`` on
+        its group, and release its prefetched unshard, if any.
+
+        Grads accumulated without sync stay. Unlike
+        ``FlexShardModule.reshard``, this keeps the bucket's backward state, so
+        a backward still to run re-gathers the bucket in its pre-backward hook.
+        Eager only.
+        """
+        context, bucket = self._runtime()
+        context.check_outside_backward("reshard")
+        context.release_pending_unshard(bucket)
+        if bucket.is_unsharded:
+            bucket.reshard()
+
+    def _runtime(self) -> tuple[BucketCommContext, BucketRuntime]:
+        """This bucket's communication context and runtime, which exist once
+        its storage is materialized."""
+        from .bucket_runtime import BucketCommContext
+
+        context = BucketCommContext.get(self._module, self.byte_storage.device)
+        if context is None:
+            raise RuntimeError(
+                "FlexShard: the bucket has no runtime until its storage is "
+                "materialized, e.g. by to_empty()."
+            )
+        return context, context.bucket_runtime(self)
+
+    def set_buckets_to_forward_prefetch(
+        self, buckets: list[ShardedBucketStorage]
+    ) -> None:
+        """Set the buckets this bucket prefetches in forward, like FSDP2's
+        ``set_modules_to_forward_prefetch``.
+
+        Right after this bucket unshards in its pre-forward hook, the listed
+        buckets start their all-gathers, in order, unless they are unsharded
+        already. Each stays in flight until its own hook takes it, or the
+        backward or ``FlexShardModule.reshard()`` releases it, so listing more
+        buckets overlaps more communication and holds more unsharded buckets
+        at once. Without a list, a bucket prefetches the next bucket in the
+        learned forward order, one prefetch at a time; a list, even an empty
+        one, replaces that. The buckets must come from the same ``flex_shard``
+        call. Eager only.
+        """
+        self._forward_prefetch = _check_prefetch_buckets(buckets)
+
+    def set_buckets_to_backward_prefetch(
+        self, buckets: list[ShardedBucketStorage]
+    ) -> None:
+        """Set the buckets this bucket prefetches in backward, like FSDP2's
+        ``set_modules_to_backward_prefetch``.
+
+        Right after this bucket re-gathers in its pre-backward hook, the listed
+        buckets start their all-gathers, as ``set_buckets_to_forward_prefetch``
+        describes. Without a list, a bucket prefetches the next bucket in the
+        reverse post-forward order; a list, even an empty one, replaces that.
+        """
+        self._backward_prefetch = _check_prefetch_buckets(buckets)
+
+    @property
     def world_size(self) -> int:
         """World size of the mesh."""
         return self._mesh.size()
@@ -840,6 +967,19 @@ class ShardedBucketStorage:
         """Get the local tensor view for a parameter by FQN (from sharded storage)."""
         info = self._param_infos[fqn]
         return info.placement.make_local_storage_view(self._byte_storage, info)
+
+
+def _check_prefetch_buckets(
+    buckets: list[ShardedBucketStorage],
+) -> list[ShardedBucketStorage]:
+    buckets = list(buckets)
+    for bucket in buckets:
+        if not isinstance(bucket, ShardedBucketStorage):
+            raise TypeError(
+                "Prefetch targets must be entries of "
+                f"FlexShardModule.sharded_bucket_storages, got {type(bucket).__name__}."
+            )
+    return buckets
 
 
 def _assign_params_to_buckets(
@@ -950,3 +1090,36 @@ def _hook_module_fqns(module: nn.Module, patterns: list[str]) -> list[str] | Non
                 "the modules it contains instead."
             )
     return list(patterns)
+
+
+def _fsdp2_param_order(
+    module: nn.Module,
+    patterns: list[str],
+    named_params: list[tuple[str, nn.Parameter]],
+) -> list[tuple[str, nn.Parameter]]:
+    """Order a bucket's params as ``fully_shard`` orders its group's params.
+
+    FSDP2 walks the modules it is given in post-order and takes each module's
+    own params when it first meets them. A bucket of module patterns walks
+    those modules, in pattern order. For parameter patterns, any module that
+    contains the bucket gives the same relative order, so walk the root.
+    """
+    hook_fqns = _hook_module_fqns(module, patterns)
+    roots = [module.get_submodule(fqn) for fqn in hook_fqns] if hook_fqns else [module]
+    bucket_param_ids = {id(param) for _, param in named_params}
+    positions: dict[int, int] = {}
+    visited: set[nn.Module] = set()
+
+    def visit(submodule: nn.Module) -> None:
+        visited.add(submodule)
+        for child in submodule.children():
+            if child not in visited:
+                visit(child)
+        for param in submodule.parameters(recurse=False):
+            if id(param) in bucket_param_ids:
+                positions.setdefault(id(param), len(positions))
+
+    for root in roots:
+        if root not in visited:
+            visit(root)
+    return sorted(named_params, key=lambda named_param: positions[id(named_param[1])])

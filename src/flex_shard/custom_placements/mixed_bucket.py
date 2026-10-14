@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
@@ -36,8 +37,16 @@ from .block_shard import (
 )
 from .fp8_bucketed_block_shard import _align_up, _VEC_ALIGN_BYTES, Fp8BucketedBlockShard
 from .owned import BucketedOwned
+from .owner_rows_transport import (
+    gather_owner_rows,
+    reduce_owner_rows,
+    owner_rows_transport_buffers,
+    owner_rows_transport_plan,
+    OwnerRowsTransportBuffers,
+    OwnerRowsTransportPlan,
+)
 from .shard import Shard
-from .utils import foreach_copy_, reduce_scatter_grads
+from .utils import foreach_copy_, reduce_scatter_grads, reduce_scatter_grads_uneven
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -90,16 +99,47 @@ class _MixedUnshardState:
 
 
 @dataclass(frozen=True)
+class _OwnerRowsGather:
+    """A gather through equal chunks (see owner_rows_transport): the plan, the
+    mesh ranks' hosts, the transport buffers, this mesh rank, and its params
+    with their starts in the gathered buffer."""
+
+    plan: OwnerRowsTransportPlan
+    hosts: tuple[int, ...]
+    buffers: OwnerRowsTransportBuffers
+    rank: int
+    sources: list[tuple[torch.Tensor, int]]
+
+
+@dataclass(frozen=True)
 class _OwnerRowsUnshardState:
     """Unshard state of a bucket whose groups each live whole on one owner,
     whose params view the gathered rows (see
-    MixedBucketPlacement._prepare_owner_rows_unshard)."""
+    MixedBucketPlacement._prepare_owner_rows_unshard). ``row_numels`` are the
+    rows' lengths, back to back in the gathered buffer. With ``transport``,
+    the rows go through equal chunks and the buffer is padded to whole chunks;
+    without, they're gathered at their own lengths."""
 
     groups: list[_MixedUnshardGroupState]
     world_size: int
-    row_numel: int
+    row_numels: tuple[int, ...]
     pg: Any
     debug_fqn: str | None
+    transport: _OwnerRowsGather | None = None
+
+
+@dataclass(frozen=True)
+class _OwnerRowsReduce:
+    """A reduce through equal chunks (see owner_rows_transport): the plan, the
+    mesh ranks' hosts, the transport buffers, this mesh rank, and the dtype
+    its row comes back in: its sharded grads' dtype, so the cast to it happens
+    on the way."""
+
+    plan: OwnerRowsTransportPlan
+    hosts: tuple[int, ...]
+    buffers: OwnerRowsTransportBuffers
+    rank: int
+    recv_dtype: torch.dtype
 
 
 @dataclass(frozen=True)
@@ -117,6 +157,11 @@ class _MixedReduceGradState:
     row_numel: int
     pg: Any
     debug_fqn: str | None
+    # Owner rows only: each rank's row length, back to back in the send buffer
+    # (see _owner_rows_reduce_state); row_numel is then this rank's. With
+    # transport, the send buffer is padded to whole chunks.
+    row_numels: tuple[int, ...] | None = None
+    transport: _OwnerRowsReduce | None = None
 
 
 class _MixedBucketMember:
@@ -160,8 +205,10 @@ class _MixedBucketMember:
             debug_fqn,
         )
 
-    def run_prepared_unshard(self, prepared: PlacementPreparedUnshard) -> None:
-        self._mixed_bucket.run_prepared_unshard(prepared)
+    def run_prepared_unshard(
+        self, prepared: PlacementPreparedUnshard, *, async_op: bool = False
+    ) -> dist.Work | None:
+        return self._mixed_bucket.run_prepared_unshard(prepared, async_op=async_op)
 
     def finish_prepared_unshard(
         self,
@@ -189,6 +236,11 @@ class _MixedBucketMember:
         reduction: GradientReduction,
     ) -> PlacementReduceGradResult:
         return self._mixed_bucket.reduce_prepared_grad(prepared, reduction)
+
+    def reduces_grads_in_param_layout(
+        self, infos: list[ParamInfo], world_size: int
+    ) -> bool:
+        return self._mixed_bucket.reduces_grads_in_param_layout(infos, world_size)
 
 
 class _MixedShard0(_MixedBucketMember, Shard):
@@ -422,8 +474,8 @@ class MixedBucketPlacement(Placement):
         rank: int,
         world_size: int,
     ) -> BucketStorageLayout | None:
-        """Lay out this rank's params as its row of the gathered buffer, padded
-        to the row's length, for a bucket whose params each live whole on one
+        """Lay out this rank's params as its row of the gathered buffer, at the
+        row's own length, for a bucket whose params each live whole on one
         owner, in one dtype (see _prepare_owner_rows_unshard), so the row is the
         all-gather's input as is. None for any other bucket."""
         dtype = local_params[0][1].dtype
@@ -433,11 +485,13 @@ class MixedBucketPlacement(Placement):
         ):
             return None
         groups = _group_local_params_by_placement(local_params)
-        offsets, owner_ranks, row_numel, _ = _plan_group_offsets(
+        group_numels = [sum(param.numel() for _, param, _ in group) for group in groups]
+        offsets, owner_ranks, _, _ = _plan_group_offsets(
             [group[0][2] for group in groups],
-            [sum(param.numel() for _, param, _ in group) for group in groups],
+            group_numels,
             world_size,
         )
+        row_numels = _owner_row_numels(owner_ranks, offsets, group_numels, world_size)
         param_layouts: dict[str, BucketParamStorageLayout] = {}
         for group, offset, owner_rank in zip(groups, offsets, owner_ranks, strict=True):
             for fqn, param, placement in group:
@@ -453,7 +507,7 @@ class MixedBucketPlacement(Placement):
                 offset += param.numel()
         return BucketStorageLayout(
             param_layouts=param_layouts,
-            total_bytes=row_numel * dtype.itemsize if rank in owner_ranks else 0,
+            total_bytes=row_numels[rank] * dtype.itemsize,
         )
 
     def prepare_unshard_bucket(
@@ -555,10 +609,13 @@ class MixedBucketPlacement(Placement):
             ),
         )
 
-    def run_prepared_unshard(self, prepared: PlacementPreparedUnshard) -> None:
+    def run_prepared_unshard(
+        self, prepared: PlacementPreparedUnshard, *, async_op: bool = False
+    ) -> dist.Work | None:
         if isinstance(prepared.placement_state, _OwnerRowsUnshardState):
-            self._run_owner_rows_unshard(prepared, prepared.placement_state)
-            return
+            return self._run_owner_rows_unshard(
+                prepared, prepared.placement_state, async_op=async_op
+            )
         if not isinstance(prepared.placement_state, _MixedUnshardState):
             raise AssertionError(
                 "Expected _MixedUnshardState, "
@@ -568,10 +625,11 @@ class MixedBucketPlacement(Placement):
             "FlexShard::mixed_all_gather",
             prepared.placement_state.debug_fqn,
         ):
-            dist.all_gather_into_tensor(
+            return dist.all_gather_into_tensor(
                 output_tensor=prepared.buffers[1],
                 input_tensor=prepared.buffers[0],
                 group=prepared.placement_state.pg,
+                async_op=async_op,
             )
 
     def finish_prepared_unshard(
@@ -680,27 +738,20 @@ class MixedBucketPlacement(Placement):
         contiguously in its owner's row of the gathered buffer, so the full
         params view those rows, as BucketedBlockShard's view its bucket, and
         refills gather straight into them. Each rank's row is its local storage
-        (see _owner_rows_storage_layout), which it sends as is. None for any
+        (see _owner_rows_storage_layout), which it sends as is. Rows keep their
+        own lengths, back to back (see _gathered_row_numels). None for any
         other bucket."""
         rank = mesh.get_local_rank()
         world_size = mesh.size()
         dtype = _unsharded_dtype(groups[0].infos[0])
-        if any(
-            _one_hot_block_owner(group.placement, world_size) is None
-            for group in groups
-        ) or any(
+        plan = _owner_rows_plan(groups, world_size)
+        if plan is None or any(
             _unsharded_dtype(info) != dtype for group in groups for info in group.infos
         ):
             return None
-        layouts = []
         for group in groups:
             group.placement._validate_bucket_inputs(group.tensors, group.infos)
-            layouts.append(group.placement._padded_bucket_layout(group.infos))
-        offsets, owner_ranks, row_numel, _ = _plan_group_offsets(
-            [group.placement for group in groups],
-            [layout.padded_segment_numel for layout in layouts],
-            world_size,
-        )
+        layouts, offsets, owner_ranks, row_numels = plan
         # This rank's params, each with its offset in this rank's row.
         owned = [
             (tensor, offset + layout.param_offsets[index])
@@ -710,13 +761,29 @@ class MixedBucketPlacement(Placement):
             if owner_rank == rank
             for index, tensor in enumerate(group.tensors)
         ]
-        send = _owner_row_view(owned, row_numel, dtype)
+        device = groups[0].tensors[0].device
+        transport = owner_rows_transport_plan(mesh, row_numels, device)
+        gather = None
+        if transport is not None:
+            # The owner writes straight from its params' storage, casting on
+            # the way, so there is no send row.
+            row_start = _row_starts(row_numels)[rank]
+            gather = _OwnerRowsGather(
+                plan=transport[0],
+                hosts=transport[1],
+                buffers=owner_rows_transport_buffers(mesh, transport[1]),
+                rank=rank,
+                sources=[(tensor, row_start + start) for tensor, start in owned],
+            )
+            send = torch.empty(0, dtype=dtype, device=device)
+        else:
+            send = _owner_row_view(owned, row_numels[rank], dtype)
         if send is None:
             # The params are not in such storage (e.g. they are in another
             # dtype, or this rank owns none): copy them in.
             with _record_copy_in_if_eager():
                 send = torch.zeros(
-                    row_numel, dtype=dtype, device=groups[0].tensors[0].device
+                    row_numels[rank], dtype=dtype, device=groups[0].tensors[0].device
                 )
                 foreach_copy_(
                     [send[start : start + tensor.numel()] for tensor, start in owned],
@@ -746,9 +813,10 @@ class MixedBucketPlacement(Placement):
             placement_state=_OwnerRowsUnshardState(
                 groups=group_states,
                 world_size=world_size,
-                row_numel=row_numel,
+                row_numels=row_numels,
                 pg=mesh.get_group(),
                 debug_fqn=debug_fqn,
+                transport=gather,
             ),
         )
 
@@ -756,19 +824,59 @@ class MixedBucketPlacement(Placement):
         self,
         prepared: PlacementPreparedUnshard,
         state: _OwnerRowsUnshardState,
-    ) -> None:
+        *,
+        async_op: bool = False,
+    ) -> dist.Work | None:
         if prepared.persistent_buffers is not None:
             # A refill gathers straight into the persistent rows.
             gathered = prepared.persistent_buffers[0]
         else:
-            gathered = prepared.buffers[0].new_empty(state.world_size * state.row_numel)
-            prepared.buffers.insert(1, gathered)
-        with _record_comm_if_eager("FlexShard::mixed_all_gather", state.debug_fqn):
-            dist.all_gather_into_tensor(
-                output_tensor=gathered,
-                input_tensor=prepared.buffers[0],
-                group=state.pg,
+            gathered = prepared.buffers[0].new_empty(
+                sum(state.row_numels)
+                if state.transport is None
+                else state.transport.plan.gathered_numel
             )
+            prepared.buffers.insert(1, gathered)
+        if state.transport is not None:
+            gather = state.transport
+            with _record_comm_if_eager("FlexShard::owner_rows_gather", state.debug_fqn):
+                return gather_owner_rows(
+                    gather.plan,
+                    gather.hosts,
+                    gather.buffers,
+                    rank=gather.rank,
+                    row_start=_row_starts(state.row_numels)[gather.rank],
+                    row_numel=state.row_numels[gather.rank],
+                    sources=gather.sources,
+                    gathered=gathered,
+                    pg=state.pg,
+                    async_op=async_op,
+                )
+        with _record_comm_if_eager("FlexShard::mixed_all_gather", state.debug_fqn):
+            if len(set(state.row_numels)) == 1:
+                return dist.all_gather_into_tensor(
+                    output_tensor=gathered,
+                    input_tensor=prepared.buffers[0],
+                    group=state.pg,
+                    async_op=async_op,
+                )
+            # Uneven rows: one broadcast per owner in one NCCL group, each
+            # straight into its row. NCCL 2.30 fuses the group into an
+            # all-gather-v that runs at the pace of the longest row;
+            # NCCL_ALLGATHERV_ENABLE=0 keeps the broadcasts, much faster
+            # across hosts.
+            rows = list(gathered.split(state.row_numels))
+            send = prepared.buffers[0]
+            if not state.row_numels[0] and not state.row_numels[1]:
+                # ProcessGroupNCCL2's allgather takes outputs whose first two
+                # share an address for one aliased buffer and gathers equal
+                # rows instead, and every empty tensor has address 0. So rank 0
+                # sends one spare element, into scratch.
+                rows[0] = gathered.new_empty(1)
+                prepared.buffers.append(rows[0])
+                if state.pg.rank() == 0:
+                    send = rows[0]
+            return dist.all_gather(rows, send, group=state.pg, async_op=async_op)
 
     def _finish_owner_rows_unshard(
         self,
@@ -791,7 +899,7 @@ class MixedBucketPlacement(Placement):
                 rows.copy_(gathered)
         else:
             rows = gathered
-        rows_by_rank = rows.view(state.world_size, state.row_numel)
+        row_starts = _row_starts(state.row_numels)
         full_params: list[torch.Tensor | None] = [None] * sum(
             len(group.indices) for group in state.groups
         )
@@ -803,10 +911,14 @@ class MixedBucketPlacement(Placement):
             for index, (param_index, info) in enumerate(
                 zip(group.indices, group_state.infos, strict=True)
             ):
-                start = group.offset + group_state.layout.param_offsets[index]
-                full_params[param_index] = rows_by_rank[
-                    owner_rank, start : start + info.global_numel
-                ].view(info.global_shape)
+                start = (
+                    row_starts[owner_rank]
+                    + group.offset
+                    + group_state.layout.param_offsets[index]
+                )
+                full_params[param_index] = rows[start : start + info.global_numel].view(
+                    info.global_shape
+                )
         return PlacementUnshardResult(
             full_params=full_params,
             persistent_buffers=[rows] if prepared.persistent else [],
@@ -818,31 +930,26 @@ class MixedBucketPlacement(Placement):
         mesh: DeviceMesh,
         debug_fqn: str | None,
     ) -> PlacementPreparedReduceGrad | None:
-        """Reduce-scatter the grads' gradient bucket as is, if they view one
-        that mirrors the owner rows the params view (see
+        """Reduce the grads' gradient bucket as is, if they view one that
+        mirrors the owner rows the params view (see
         ``BucketSpec.pre_backward_hook`` and _prepare_owner_rows_unshard):
         each grad already sits in its owner's row. None otherwise."""
-        world_size = mesh.size()
         bucket = groups[0].tensors[0]._base
-        if bucket is None or any(
-            _one_hot_block_owner(group.placement, world_size) is None
-            for group in groups
-        ):
+        plan = _owner_rows_plan(groups, mesh.size())
+        if bucket is None or plan is None:
             return None
-        layouts = [
-            group.placement._padded_bucket_layout(group.infos) for group in groups
-        ]
-        offsets, owner_ranks, row_numel, _ = _plan_group_offsets(
-            [group.placement for group in groups],
-            [layout.padded_segment_numel for layout in layouts],
-            world_size,
+        layouts, offsets, owner_ranks, row_numels = plan
+        transport = _owner_rows_reduce_transport(
+            groups, owner_ranks, mesh, row_numels, bucket.device
         )
+        numel = sum(row_numels) if transport is None else transport.plan.gathered_numel
         if (
             bucket.dtype != _grad_reduce_dtype(groups[0].infos[0])
-            or bucket.shape != (world_size * row_numel,)
+            or bucket.shape != (numel,)
             or not bucket.is_contiguous()
         ):
             return None
+        row_starts = _row_starts(row_numels)
         for group, layout, offset, owner_rank in zip(
             groups, layouts, offsets, owner_ranks, strict=True
         ):
@@ -854,37 +961,82 @@ class MixedBucketPlacement(Placement):
                     or tensor.shape != info.global_shape
                     or not tensor.is_contiguous()
                     or tensor.storage_offset() - bucket.storage_offset()
-                    != owner_rank * row_numel + offset + layout.param_offsets[index]
+                    != row_starts[owner_rank] + offset + layout.param_offsets[index]
                 ):
                     return None
         return PlacementPreparedReduceGrad(
             placement=self,
             buffers=[bucket],
-            placement_state=_MixedReduceGradState(
-                groups=[
-                    _MixedReduceGradGroupState(
-                        prepared=PlacementPreparedReduceGrad(
-                            placement=group.placement,
-                            buffers=[],
-                            placement_state=BlockShard._ReduceGradState(
-                                infos=group.infos,
-                                layout=layout,
-                                pg=mesh.get_group(),
-                                debug_fqn=debug_fqn,
-                            ),
-                        ),
-                        indices=group.indices,
-                        offset=offset,
-                        numel=layout.padded_segment_numel,
+            placement_state=_owner_rows_reduce_state(
+                groups, layouts, offsets, row_numels, mesh, debug_fqn, transport
+            ),
+        )
+
+    def _pack_owner_rows_reduce_grad(
+        self,
+        groups: list[_PlacementGroup],
+        mesh: DeviceMesh,
+        debug_fqn: str | None,
+    ) -> PlacementPreparedReduceGrad | None:
+        """Copy the grads of a bucket whose groups each live whole on one
+        owner into the owners' rows, laid out as the unshard's (see
+        _prepare_owner_rows_unshard), when they don't already view such a
+        gradient bucket. None for any other bucket."""
+        plan = _owner_rows_plan(groups, mesh.size())
+        if plan is None:
+            return None
+        layouts, offsets, owner_ranks, row_numels = plan
+        dtype = _grad_reduce_dtype(groups[0].infos[0])
+        if any(
+            _grad_reduce_dtype(info) != dtype
+            for group in groups
+            for info in group.infos
+        ):
+            return None
+        row_starts = _row_starts(row_numels)
+        device = groups[0].tensors[0].device
+        transport = _owner_rows_reduce_transport(
+            groups, owner_ranks, mesh, row_numels, device
+        )
+        with _record_function_if_eager(
+            "FlexShard::mixed_reduce_scatter_copy_in",
+            debug_fqn,
+        ):
+            # The grads fill their rows but for the padding torch.compile adds
+            # (see _gathered_row_numels), and the transport's tail padding up
+            # to whole chunks, which no row holds.
+            alloc = torch.zeros if torch.compiler.is_compiling() else torch.empty
+            send = alloc(
+                sum(row_numels) if transport is None else transport.plan.gathered_numel,
+                dtype=dtype,
+                device=device,
+            )
+            dsts: list[torch.Tensor] = []
+            srcs: list[torch.Tensor] = []
+            for group, layout, offset, owner_rank in zip(
+                groups, layouts, offsets, owner_ranks, strict=True
+            ):
+                group.placement._validate_bucket_inputs(group.tensors, group.infos)
+                for index, (tensor, info) in enumerate(
+                    zip(group.tensors, group.infos, strict=True)
+                ):
+                    if tensor.shape != info.global_shape:
+                        raise ValueError(
+                            f"FlexShard full gradient {info.fqn!r} has shape "
+                            f"{tuple(tensor.shape)}, expected "
+                            f"{tuple(info.global_shape)}."
+                        )
+                    start = (
+                        row_starts[owner_rank] + offset + layout.param_offsets[index]
                     )
-                    for group, layout, offset in zip(
-                        groups, layouts, offsets, strict=True
-                    )
-                ],
-                world_size=world_size,
-                row_numel=row_numel,
-                pg=mesh.get_group(),
-                debug_fqn=debug_fqn,
+                    dsts.append(send[start : start + tensor.numel()])
+                    srcs.append(tensor.reshape(-1))
+            foreach_copy_(dsts, srcs)
+        return PlacementPreparedReduceGrad(
+            placement=self,
+            buffers=[send],
+            placement_state=_owner_rows_reduce_state(
+                groups, layouts, offsets, row_numels, mesh, debug_fqn, transport
             ),
         )
 
@@ -899,6 +1051,8 @@ class MixedBucketPlacement(Placement):
         groups = _group_tensors_by_placement(tensors, infos, world_size)
         _validate_mixed_groups(groups)
         owner_rows = self._prepare_owner_rows_reduce_grad(groups, mesh, debug_fqn)
+        if owner_rows is None:
+            owner_rows = self._pack_owner_rows_reduce_grad(groups, mesh, debug_fqn)
         if owner_rows is not None:
             return owner_rows
         prepared_groups: list[tuple[PlacementPreparedReduceGrad, list[int], int]] = []
@@ -1054,6 +1208,28 @@ class MixedBucketPlacement(Placement):
             ),
         )
 
+    def reduces_grads_in_param_layout(
+        self, infos: list[ParamInfo], world_size: int
+    ) -> bool:
+        """Owner rows do (see _prepare_owner_rows_reduce_grad) when the
+        unsharded params are in the dtype their grads accumulate and reduce
+        in, so a gradient buffer in the dtype of the storage they view keeps
+        autograd's accumulation."""
+        dtype = _unsharded_dtype(infos[0])
+        return all(
+            _one_hot_block_owner(
+                _collective_placement(
+                    info.placement, info.fqn, info.global_shape, world_size
+                ),
+                world_size,
+            )
+            is not None
+            and _unsharded_dtype(info) == dtype
+            and info.unsharded_grad_dtype in (None, dtype)
+            and _grad_reduce_dtype(info) == dtype
+            for info in infos
+        )
+
     def reduce_prepared_grad(
         self,
         prepared: PlacementPreparedReduceGrad,
@@ -1068,14 +1244,35 @@ class MixedBucketPlacement(Placement):
         send = prepared.buffers[0]
         recv = torch.empty(
             state.row_numel,
-            dtype=send.dtype,
+            dtype=send.dtype if state.transport is None else state.transport.recv_dtype,
             device=send.device,
         )
+        uneven_rows = state.row_numels is not None and len(set(state.row_numels)) > 1
         with _record_comm_if_eager(
             "FlexShard::mixed_reduce_scatter",
             state.debug_fqn,
         ):
-            reduce_scatter_grads(recv, send, reduction, state.pg)
+            if state.transport is not None:
+                reduce = state.transport
+                reduce_owner_rows(
+                    reduce.plan,
+                    reduce.hosts,
+                    reduce.buffers,
+                    rank=reduce.rank,
+                    row_start=_row_starts(state.row_numels)[reduce.rank],
+                    send=send,
+                    recv=recv,
+                    reduction=reduction,
+                    pg=state.pg,
+                )
+            elif uneven_rows:
+                # One reduce per owner in one NCCL group, each straight from
+                # its row.
+                reduce_scatter_grads_uneven(
+                    recv, list(send.split(state.row_numels)), reduction, state.pg
+                )
+            else:
+                reduce_scatter_grads(recv, send, reduction, state.pg)
             for group in state.groups:
                 _release_group_scratch_lease(group.prepared)
 
@@ -1087,7 +1284,16 @@ class MixedBucketPlacement(Placement):
             state.debug_fqn,
         ):
             for group in state.groups:
-                group_recv = recv.narrow(0, group.offset, group.numel)
+                if (
+                    uneven_rows
+                    and _one_hot_block_owner(group.prepared.placement, state.world_size)
+                    != state.pg.rank()
+                ):
+                    # Another rank owns the group, and this rank's row, which
+                    # may be shorter, holds none of it.
+                    group_recv = recv[:0]
+                else:
+                    group_recv = recv.narrow(0, group.offset, group.numel)
                 group_grads = _finish_mixed_reduce_group(
                     group.prepared,
                     group_recv,
@@ -1120,6 +1326,12 @@ def _prepare_mixed_unshard_group(
             infos,
             mesh,
             debug_fqn,
+        )
+    if isinstance(placement, Shard):
+        # The mixed all-gather fills the group's gather buffer, even on a
+        # 1-rank mesh where Shard alone skips its all-gather.
+        return placement._prepare_unshard_bucket(
+            tensors, infos, mesh, debug_fqn, skip_single_rank_all_gather=False
         )
     return placement.prepare_unshard_bucket(
         tensors,
@@ -1390,6 +1602,132 @@ def _plan_group_offsets(
         owner_ranks,
         _align_up(regular_base + regular_numel, row_alignment),
         regular_base,
+    )
+
+
+def _owner_row_numels(
+    owner_ranks: list[int | None],
+    offsets: list[int],
+    group_numels: list[int],
+    world_size: int,
+) -> list[int]:
+    """Each rank's row length in a bucket whose groups each live whole on one
+    owner: where its last group ends, 0 for a rank owning none."""
+    row_numels = [0] * world_size
+    for owner_rank, offset, numel in zip(
+        owner_ranks, offsets, group_numels, strict=True
+    ):
+        if owner_rank is None:
+            raise AssertionError("Owner rows require one owner per group.")
+        row_numels[owner_rank] = max(row_numels[owner_rank], offset + numel)
+    return row_numels
+
+
+def _gathered_row_numels(row_numels: list[int]) -> tuple[int, ...]:
+    """The gathered buffer's rows, back to back: each at its owner's length, so
+    a bucket holds no padding and uneven rows take one broadcast and one reduce
+    per owner. Under torch.compile every row takes the longest's length, so
+    one all-gather and one reduce-scatter trace as before."""
+    if torch.compiler.is_compiling():
+        return (max(row_numels),) * len(row_numels)
+    return tuple(row_numels)
+
+
+def _row_starts(row_numels: tuple[int, ...]) -> list[int]:
+    return list(itertools.accumulate(row_numels[:-1], initial=0))
+
+
+def _owner_rows_plan(
+    groups: list[_PlacementGroup],
+    world_size: int,
+) -> tuple[list[Any], list[int], list[int], tuple[int, ...]] | None:
+    """The owner-rows layout of a bucket whose groups each live whole on one
+    owner: each group's padded layout, its offset in its owner's row, the
+    owners, and the gathered rows' lengths. None for any other bucket."""
+    if any(
+        _one_hot_block_owner(group.placement, world_size) is None for group in groups
+    ):
+        return None
+    layouts = [group.placement._padded_bucket_layout(group.infos) for group in groups]
+    group_numels = [layout.padded_segment_numel for layout in layouts]
+    offsets, owner_ranks, _, _ = _plan_group_offsets(
+        [group.placement for group in groups], group_numels, world_size
+    )
+    row_numels = _gathered_row_numels(
+        _owner_row_numels(owner_ranks, offsets, group_numels, world_size)
+    )
+    return layouts, offsets, owner_ranks, row_numels
+
+
+def _owner_rows_reduce_state(
+    groups: list[_PlacementGroup],
+    layouts: list[Any],
+    offsets: list[int],
+    row_numels: tuple[int, ...],
+    mesh: DeviceMesh,
+    debug_fqn: str | None,
+    transport: _OwnerRowsReduce | None = None,
+) -> _MixedReduceGradState:
+    return _MixedReduceGradState(
+        groups=[
+            _MixedReduceGradGroupState(
+                prepared=PlacementPreparedReduceGrad(
+                    placement=group.placement,
+                    buffers=[],
+                    placement_state=BlockShard._ReduceGradState(
+                        infos=group.infos,
+                        layout=layout,
+                        pg=mesh.get_group(),
+                        debug_fqn=debug_fqn,
+                    ),
+                ),
+                indices=group.indices,
+                offset=offset,
+                numel=layout.padded_segment_numel,
+            )
+            for group, layout, offset in zip(groups, layouts, offsets, strict=True)
+        ],
+        world_size=mesh.size(),
+        row_numel=row_numels[mesh.get_local_rank()],
+        pg=mesh.get_group(),
+        debug_fqn=debug_fqn,
+        row_numels=row_numels,
+        transport=transport,
+    )
+
+
+def _owner_rows_reduce_transport(
+    groups: list[_PlacementGroup],
+    owner_ranks: list[int],
+    mesh: DeviceMesh,
+    row_numels: tuple[int, ...],
+    device: torch.device,
+) -> _OwnerRowsReduce | None:
+    """The reduce through equal chunks for owner rows, if the transport takes
+    them (see owner_rows_transport_plan). This rank's row comes back in its
+    sharded grads' dtype (the params' dtype, or their explicit grad_dtype),
+    so the cast happens on the way; in the reduce dtype if they disagree."""
+    transport = owner_rows_transport_plan(mesh, row_numels, device)
+    if transport is None:
+        return None
+    rank = mesh.get_local_rank()
+    dtypes = {
+        info.grad_dtype_override if info.has_explicit_grad_dtype else info.dtype
+        for group, owner_rank in zip(groups, owner_ranks, strict=True)
+        if owner_rank == rank
+        for info in group.infos
+    }
+    recv_dtype = (
+        next(iter(dtypes))
+        if len(dtypes) == 1 and None not in dtypes
+        else _grad_reduce_dtype(groups[0].infos[0])
+    )
+    return _OwnerRowsReduce(
+        plan=transport[0],
+        hosts=transport[1],
+        buffers=owner_rows_transport_buffers(mesh, transport[1]),
+        rank=rank,
+        recv_dtype=recv_dtype,
     )
 
 

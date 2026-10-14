@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
@@ -25,12 +26,13 @@ from ..flex_shard.placement_contract import (
     PlacementUnshardResult,
 )
 from ..flex_shard.utils import (
+    _get_single_placement,
     _record_comm_if_eager,
     _record_copy_in_if_eager,
     _record_copy_out_if_eager,
     _record_function_if_eager,
 )
-from .utils import copy_tensor_to_dtype, reduce_scatter_grads
+from .utils import foreach_copy_, reduce_grads_on_one_rank, reduce_scatter_grads
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -40,7 +42,21 @@ if TYPE_CHECKING:
 
 
 class Shard(Placement):
-    """Symmetric sharding — parameter split along dim across all ranks."""
+    """Symmetric sharding — parameter split along dim across all ranks.
+
+    Parameters sharded on different dims share one bucket. As in FSDP2, a
+    ``Shard(i)`` parameter with ``i > 0`` must split evenly; its chunks are
+    reordered to dim 0 around the collectives, and only ``Shard(0)`` pads uneven
+    chunks. A bucket copies its parameters directly between their layouts and
+    the collective buffers with FSDP's native collective copies, as FSDP2's
+    ``with_native_copy`` functions do: ``fsdp::_all_gather_copy_out_`` from
+    pytorch/pytorch#197204 and ``fsdp::chunk_cat_mixed_dtype`` with
+    ``num_leading_dims`` from pytorch/pytorch#200179.
+    """
+
+    # Finish copies the gathered values into a refill's persistent buffers;
+    # run gathers into a separate buffer.
+    refills_persistent_buffers_in_finish = True
 
     @dataclass(frozen=True)
     class _ReduceGradLayout:
@@ -57,6 +73,8 @@ class Shard(Placement):
         pg: Any
         debug_fqn: str | None
         padded_layout: Shard._PaddedUnshardLayout
+        # A 1-rank unshard without all-gather: finish copies the local shards.
+        local_copy_out: bool = False
 
     @dataclass(frozen=True)
     class _ReduceGradState:
@@ -80,6 +98,22 @@ class Shard(Placement):
 
     def __repr__(self) -> str:
         return f"Shard({self.dim})"
+
+    @override
+    def bucket_compatibility_key(self) -> object:
+        return type(self)
+
+    def _check_shardable(self, fqn: str, shape: torch.Size, world_size: int) -> None:
+        if not 0 <= self.dim < len(shape):
+            raise ValueError(
+                f"{self!r} is invalid for parameter {fqn!r} with shape {tuple(shape)}."
+            )
+        if self.dim > 0 and shape[self.dim] % world_size != 0:
+            raise NotImplementedError(
+                f"{self!r} requires parameter {fqn!r} with shape {tuple(shape)} to "
+                f"split evenly over {world_size} ranks, as in FSDP2; only Shard(0) "
+                "supports uneven sharding."
+            )
 
     @override
     def compute_local_shape(
@@ -130,24 +164,19 @@ class Shard(Placement):
         param_placements: dict[str, tuple[Placement, ...]],
         mesh: DeviceMesh,
     ) -> BucketStorageLayout | None:
-        if self.dim != 0:
-            raise NotImplementedError(
-                "Shard bucket storage currently supports only Shard(0)."
-            )
-
         rank = mesh.get_local_rank()
         world_size = mesh.size()
         param_layouts: dict[str, BucketParamStorageLayout] = {}
         byte_offset = 0
         for fqn, param in named_params:
-            if param.ndim == 0:
-                raise ValueError(
-                    f"Shard(0) is invalid for parameter {fqn!r} with scalar shape."
-                )
-            local_shape = self.compute_local_shape(param.shape, rank, world_size)
+            placement = _get_single_placement(param_placements[fqn])
+            if not isinstance(placement, Shard):
+                raise AssertionError(f"Expected Shard for {fqn!r}, got {placement!r}")
+            placement._check_shardable(fqn, param.shape, world_size)
+            local_shape = placement.compute_local_shape(param.shape, rank, world_size)
             local_numel = local_shape.numel()
             # Rank 0 has the largest chunk; reserve its capacity on every rank.
-            padded_numel = self.compute_local_numel(param.shape, 0, world_size)
+            padded_numel = placement.compute_local_numel(param.shape, 0, world_size)
             storage_nbytes = padded_numel * param.dtype.itemsize
             param_layouts[fqn] = BucketParamStorageLayout(
                 local_shape=local_shape,
@@ -214,13 +243,14 @@ class Shard(Placement):
             storage_offset=bucket_byte_offset // itemsize,
         )
 
-    def _copy_out_dim0_unshard(
+    def _copy_out_unshard(
         self,
         gathered: torch.Tensor,
         infos: list[ParamInfo],
         world_size: int,
         layout: Shard._PaddedUnshardLayout,
         persistent_buffers: list[torch.Tensor] | None = None,
+        local_copy_out: bool = False,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """Return full params and the padded buffers backing them.
 
@@ -230,7 +260,6 @@ class Shard(Placement):
         """
         full_params: list[torch.Tensor] = []
         padded_full_params: list[torch.Tensor] = []
-        split_out: list[torch.Tensor] = []
         for idx, (info, padded_local_numel) in enumerate(
             zip(infos, layout.padded_local_numels, strict=True)
         ):
@@ -248,13 +277,24 @@ class Shard(Placement):
                 full_params.append(
                     padded_full_param[: info.global_numel].view(info.global_shape)
                 )
-            split_out.append(padded_full_param.view(world_size, padded_local_numel))
 
-        torch.split_with_sizes_copy(
-            gathered.view(world_size, -1),
-            layout.padded_local_numels,
-            dim=1,
-            out=split_out,
+        if local_copy_out:
+            # The local shards are the full params: cast each straight into
+            # its buffer, as FSDP2 initializes unsharded params on a 1-rank
+            # group.
+            foreach_copy_(
+                padded_full_params,
+                list(gathered.split(list(layout.padded_local_numels))),
+            )
+            return full_params, padded_full_params
+        # One copy places every rank's chunk: each padded param is a
+        # [leading size, world size, rest] view of its full layout.
+        torch.ops.fsdp._all_gather_copy_out_(
+            padded_full_params,
+            gathered,
+            list(layout.padded_local_numels),
+            [math.prod(info.global_shape[: info.placement.dim]) for info in infos],
+            world_size,
         )
         return full_params, padded_full_params
 
@@ -267,10 +307,22 @@ class Shard(Placement):
         debug_fqn: str | None,
     ) -> PlacementPreparedUnshard:
         """Prepare buffers for the bucket all-gather unshard."""
-        if self.dim != 0:
-            raise NotImplementedError(
-                "Shard bucket all-gather currently supports only Shard(0)."
-            )
+        return self._prepare_unshard_bucket(
+            tensors, infos, mesh, debug_fqn, skip_single_rank_all_gather=True
+        )
+
+    def _prepare_unshard_bucket(
+        self,
+        tensors: list[torch.Tensor],
+        infos: list[ParamInfo],
+        mesh: DeviceMesh,
+        debug_fqn: str | None,
+        *,
+        skip_single_rank_all_gather: bool,
+    ) -> PlacementPreparedUnshard:
+        """Prepare the send and gather buffers, or on a 1-rank mesh only the
+        local storage when ``skip_single_rank_all_gather``. MixedBucket, which
+        all-gathers every group in one collective, needs the buffers."""
         ws = mesh.size()
         dtype = infos[0].unsharded_dtype
         device = tensors[0].device
@@ -279,17 +331,38 @@ class Shard(Placement):
 
         with _record_copy_in_if_eager():
             padded_layout = self._padded_unshard_layout(infos)
-            send_buf = self._get_padded_bucket_storage_view(
+            local_storage = self._get_padded_bucket_storage_view(
                 tensors,
                 infos,
                 padded_layout,
             )
-            send_buf = copy_tensor_to_dtype(send_buf, dtype)
-            gather_buf = torch.empty(
-                ws * send_buf.numel(),
-                dtype=dtype,
-                device=device,
-            )
+            numel = local_storage.numel()
+            if ws == 1 and skip_single_rank_all_gather:
+                # As FSDP2 on a 1-rank group: no all-gather and no gather
+                # buffer. Finish copies the local shards into the unsharded
+                # params.
+                return PlacementPreparedUnshard(
+                    placement=self,
+                    buffers=[local_storage],
+                    placement_state=Shard._UnshardState(
+                        infos=infos,
+                        world_size=ws,
+                        pg=mesh.get_group(),
+                        debug_fqn=debug_fqn,
+                        padded_layout=padded_layout,
+                        local_copy_out=True,
+                    ),
+                )
+            gather_buf = torch.empty(ws * numel, dtype=dtype, device=device)
+            if local_storage.dtype == dtype:
+                send_buf = local_storage
+            else:
+                # Cast straight into this rank's chunk of the gather buffer and
+                # all-gather in place, as FSDP2's copy-in does, rather than
+                # into a send buffer that would live until finish.
+                send_buf = gather_buf.narrow(0, mesh.get_local_rank() * numel, numel)
+                if numel > 0:
+                    foreach_copy_([send_buf], [local_storage])
 
         return PlacementPreparedUnshard(
             placement=self,
@@ -304,22 +377,27 @@ class Shard(Placement):
         )
 
     @override
-    def run_prepared_unshard(self, prepared: PlacementPreparedUnshard) -> None:
+    def run_prepared_unshard(
+        self, prepared: PlacementPreparedUnshard, *, async_op: bool = False
+    ) -> dist.Work | None:
         """Launch the prepared bucket all-gather."""
         if not isinstance(prepared.placement_state, Shard._UnshardState):
             raise AssertionError(
                 "Expected Shard._UnshardState, "
                 f"got {type(prepared.placement_state).__name__}"
             )
+        if prepared.placement_state.local_copy_out:
+            return None
         send_buf = prepared.buffers[0]
         with _record_comm_if_eager(
             "FlexShard::all_gather",
             prepared.placement_state.debug_fqn,
         ):
-            dist.all_gather_single(
+            return dist.all_gather_single(
                 prepared.buffers[1],
                 send_buf,
                 group=prepared.placement_state.pg,
+                async_op=async_op,
             )
 
     @override
@@ -335,12 +413,13 @@ class Shard(Placement):
             )
         with _record_copy_out_if_eager():
             state = prepared.placement_state
-            full_params, padded_full_params = self._copy_out_dim0_unshard(
-                prepared.buffers[1],
+            full_params, padded_full_params = self._copy_out_unshard(
+                prepared.buffers[0 if state.local_copy_out else 1],
                 state.infos,
                 state.world_size,
                 state.padded_layout,
                 persistent_buffers=prepared.persistent_buffers,
+                local_copy_out=state.local_copy_out,
             )
 
         return PlacementUnshardResult(
@@ -356,22 +435,43 @@ class Shard(Placement):
     ) -> tuple[torch.Tensor, Shard._ReduceGradLayout]:
         dtype = infos[0].grad_reduce_dtype
         device = tensors[0].device
+        # Per grad: the number of dims before its shard dim, which the copy-in
+        # keeps in each chunk, or 0 to chunk along dim 0.
+        num_leading_dims = [0] * len(tensors)
+        if world_size > 1:
+            tensors = list(tensors)
+            for idx, (tensor, info) in enumerate(zip(tensors, infos, strict=True)):
+                if (shard_dim := info.placement.dim) == 0:
+                    continue
+                if tensor.is_contiguous():
+                    num_leading_dims[idx] = shard_dim
+                else:
+                    # As FSDP2 does, reorder the grad along dim 0 so that each
+                    # rank's chunk is contiguous.
+                    tensors[idx] = torch.cat(
+                        torch.chunk(tensor, world_size, dim=shard_dim), dim=0
+                    )
         padded_sizes: list[torch.Size] = []
-        for tensor in tensors:
+        for tensor, leading_dims in zip(tensors, num_leading_dims, strict=True):
             padded_size = list(tensor.shape)
-            padded_size[self.dim] = (
-                (tensor.size(self.dim) + world_size - 1) // world_size
-            ) * world_size
+            if leading_dims == 0:
+                padded_size[0] = (
+                    (tensor.size(0) + world_size - 1) // world_size
+                ) * world_size
             padded_sizes.append(torch.Size(padded_size))
 
         input_numel = sum(s.numel() for s in padded_sizes)
         send_buf = torch.empty(input_numel, dtype=dtype, device=device)
         send_buf_2d = send_buf.view(world_size, -1)
         # Grads may differ in dtype (per-parameter grad_dtype). The copy-in
-        # casts each to the reduce dtype as it copies, one fused kernel for
-        # CUDA bf16 + fp32 (fsdp::chunk_cat_mixed_dtype, pytorch/pytorch#194434).
+        # casts each to the reduce dtype as it copies, in fused kernels for CUDA
+        # bf16 or fp16 into fp32.
         torch.ops.fsdp.chunk_cat_mixed_dtype(
-            tensors, dim=self.dim, num_chunks=world_size, out=send_buf_2d
+            tensors,
+            dim=0,
+            num_chunks=world_size,
+            out=send_buf_2d,
+            num_leading_dims=num_leading_dims,
         )
         return send_buf, Shard._ReduceGradLayout(padded_sizes)
 
@@ -440,31 +540,31 @@ class Shard(Placement):
                 "Expected Shard._ReduceGradState, "
                 f"got {type(prepared.placement_state).__name__}"
             )
+        state = prepared.placement_state
         send_buf = prepared.buffers[0]
-        recv_buf = torch.empty(
-            send_buf.numel() // prepared.placement_state.world_size,
-            dtype=send_buf.dtype,
-            device=send_buf.device,
-        )
-        with _record_comm_if_eager(
-            "FlexShard::post_backward_reduce",
-            prepared.placement_state.debug_fqn,
-        ):
-            reduce_scatter_grads(
-                recv_buf, send_buf, reduction, prepared.placement_state.pg
+        if state.world_size == 1:
+            # As FSDP2 on a 1-rank group, no reduce-scatter; unlike FSDP2, no
+            # output buffer either: the packed grads are this rank's shards.
+            reduce_grads_on_one_rank(send_buf, reduction)
+            recv_buf, buffers = send_buf, []
+        else:
+            recv_buf = torch.empty(
+                send_buf.numel() // state.world_size,
+                dtype=send_buf.dtype,
+                device=send_buf.device,
             )
+            with _record_comm_if_eager(
+                "FlexShard::post_backward_reduce", state.debug_fqn
+            ):
+                reduce_scatter_grads(recv_buf, send_buf, reduction, state.pg)
+            buffers = [recv_buf]
         with _record_function_if_eager(
-            "FlexShard::reduce_scatter_copy_out",
-            prepared.placement_state.debug_fqn,
+            "FlexShard::reduce_scatter_copy_out", state.debug_fqn
         ):
             sharded_grads = self._unpack_reduce_scatter_grad(
-                recv_buf,
-                prepared.placement_state.infos,
-                prepared.placement_state.layout,
-                prepared.placement_state.rank,
-                prepared.placement_state.world_size,
+                recv_buf, state.infos, state.layout, state.rank, state.world_size
             )
-        return PlacementReduceGradResult(sharded_grads, [recv_buf])
+        return PlacementReduceGradResult(sharded_grads, buffers)
 
 
 def make_shard_placement_fn(dim: int = 0) -> PlacementFn:

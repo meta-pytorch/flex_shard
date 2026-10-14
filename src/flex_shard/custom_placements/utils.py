@@ -144,6 +144,16 @@ def _gradient_reduce_scatter_op(
     )
 
 
+def reduce_grads_on_one_rank(grads: torch.Tensor, reduction: GradientReduction) -> None:
+    """Apply ``reduction`` in place to packed gradients of a 1-rank group, with
+    the same result as ``reduce_scatter_grads`` without the collective."""
+    _, pre_factor, post_factor = _gradient_reduce_scatter_op(reduction, 1, grads.dtype)
+    if pre_factor is not None:
+        raise AssertionError("A 1-rank gradient reduction has no pre-divide factor.")
+    if post_factor is not None:
+        grads.div_(post_factor)
+
+
 def reduce_scatter_grads(
     output: torch.Tensor,
     input: torch.Tensor,
@@ -158,6 +168,24 @@ def reduce_scatter_grads(
     if pre_factor is not None:
         input = input / pre_factor
     dist.reduce_scatter_tensor(output=output, input=input, op=reduce_op, group=group)
+    if post_factor is not None:
+        output.div_(post_factor)
+
+
+def reduce_scatter_grads_uneven(
+    output: torch.Tensor,
+    inputs: list[torch.Tensor],
+    reduction: GradientReduction,
+    group: Any,
+) -> None:
+    """``reduce_scatter_grads`` for uneven chunks: ``inputs[r]`` is reduced into
+    rank r's ``output``, as one NCCL reduce per rank in one group."""
+    reduce_op, pre_factor, post_factor = _gradient_reduce_scatter_op(
+        reduction, group.size(), output.dtype
+    )
+    if pre_factor is not None:
+        inputs = [chunk / pre_factor for chunk in inputs]
+    dist.reduce_scatter(output, inputs, op=reduce_op, group=group)
     if post_factor is not None:
         output.div_(post_factor)
 

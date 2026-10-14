@@ -339,7 +339,9 @@ class BlockShard(Placement):
         )
 
     @override
-    def run_prepared_unshard(self, prepared: PlacementPreparedUnshard) -> None:
+    def run_prepared_unshard(
+        self, prepared: PlacementPreparedUnshard, *, async_op: bool = False
+    ) -> dist.Work | None:
         if not isinstance(prepared.placement_state, BlockShard._UnshardState):
             raise AssertionError(
                 "Expected BlockShard._UnshardState, "
@@ -349,10 +351,11 @@ class BlockShard(Placement):
             "FlexShard::all_gather",
             prepared.placement_state.debug_fqn,
         ):
-            dist.all_gather_into_tensor(
+            return dist.all_gather_into_tensor(
                 output_tensor=prepared.buffers[1],
                 input_tensor=prepared.buffers[0],
                 group=prepared.placement_state.pg,
+                async_op=async_op,
             )
 
     @override
@@ -964,7 +967,9 @@ class BucketedBlockShard(Placement):
         )
 
     @override
-    def run_prepared_unshard(self, prepared: PlacementPreparedUnshard) -> None:
+    def run_prepared_unshard(
+        self, prepared: PlacementPreparedUnshard, *, async_op: bool = False
+    ) -> dist.Work | None:
         if not isinstance(prepared.placement_state, BucketedBlockShard._UnshardState):
             raise AssertionError(
                 "Expected BucketedBlockShard._UnshardState, "
@@ -987,8 +992,14 @@ class BucketedBlockShard(Placement):
         if world_size * send_buf.numel() != gathered_bucket.numel():
             output = gathered_bucket.new_empty(world_size * send_buf.numel())
         with _record_comm_if_eager("FlexShard::all_gather", state.debug_fqn):
-            dist.all_gather_into_tensor(output, send_buf, group=state.pg)
+            work = dist.all_gather_into_tensor(
+                output, send_buf, group=state.pg, async_op=async_op
+            )
         if output is not gathered_bucket:
+            # The copy into the bucket reads the gathered segments.
+            if work is not None:
+                work.wait()
+                work = None
             bucket_layout = self._bucket_layout(state.infos[0])
             bucket_views, segment_views = _rank_range_views(
                 gathered_bucket,
@@ -998,6 +1009,7 @@ class BucketedBlockShard(Placement):
             )
             with _record_copy_out_if_eager():
                 foreach_copy_(bucket_views, segment_views)
+        return work
 
     @override
     def finish_prepared_unshard(
