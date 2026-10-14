@@ -69,6 +69,30 @@ def _align_up(value: int, alignment: int) -> int:
 _COPY_UNIT_DTYPES = {8: torch.int64, 4: torch.int32, 2: torch.int16, 1: torch.uint8}
 
 
+def _copy_box_(dst: torch.Tensor, src: torch.Tensor) -> int:
+    """``dst.copy_(src)`` for 2-D boxes with unit column stride, through the
+    widest integer unit that divides both boxes' row bytes, row strides and
+    offsets: a strided copy moves one element per load, so 8-byte units copy
+    an FP8 box about twice as fast. Returns the unit's size in bytes."""
+    itemsize = dst.element_size()
+    if dst.dtype == src.dtype and not torch.compiler.is_compiling():
+        for nbytes, unit in _COPY_UNIT_DTYPES.items():
+            if nbytes <= itemsize:
+                break
+            if all(
+                box.stride(1) == 1
+                and box.size(1) * itemsize % nbytes == 0
+                and box.stride(0) * itemsize % nbytes == 0
+                and box.storage_offset() * itemsize % nbytes == 0
+                and box.data_ptr() % nbytes == 0
+                for box in (dst, src)
+            ):
+                dst.view(unit).copy_(src.view(unit))
+                return nbytes
+    dst.copy_(src)
+    return itemsize
+
+
 def _rank_range_views(
     bucket: torch.Tensor,
     padded_segments: torch.Tensor,
@@ -1220,8 +1244,9 @@ class BucketedBlockShard(Placement):
         # Column rectangles: one strided copy each.
         for index, offset, col_start, cols in plan.box_copies:
             rows = tensors[index].shape[0]
-            out[offset : offset + rows * cols].view(rows, cols).copy_(
-                tensors[index][:, col_start : col_start + cols]
+            _copy_box_(
+                out[offset : offset + rows * cols].view(rows, cols),
+                tensors[index][:, col_start : col_start + cols],
             )
         sources = [tensor.view(-1) for tensor in tensors]
         itemsize = out.element_size()
@@ -1348,11 +1373,11 @@ class BucketedBlockShard(Placement):
                     rows = info.global_shape[0]
                     grad = tensor.reshape(info.global_shape)
                     for _, bucket_offset, col_start, cols in column_boxes[index]:
-                        copy_srcs.append(grad[:, col_start : col_start + cols])
-                        copy_dsts.append(
+                        _copy_box_(
                             global_grad_bucket[
                                 bucket_offset : bucket_offset + rows * cols
-                            ].view(rows, cols)
+                            ].view(rows, cols),
+                            grad[:, col_start : col_start + cols],
                         )
                     continue
                 param_layout = self._param_layout(info)
