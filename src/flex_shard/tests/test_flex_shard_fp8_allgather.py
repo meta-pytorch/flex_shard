@@ -1362,6 +1362,110 @@ class TestFp8ColumnBlocks(TestCase):
             )
             self.assertTrue(torch.equal(got, self._local(placement, info, rank, full)))
 
+    def test_refill_writes_the_first_unshards_bytes_without_full_params(self) -> None:
+        # The eager CUDA copy-out copies every column rectangle in one box
+        # kernel per copy unit; while compiling, one strided copy each. A refill
+        # writes the persistent buffer and makes no full params.
+        torch.manual_seed(0)
+        fulls = [
+            torch.randn(shape, dtype=torch.bfloat16, device=device_type)
+            for shape in self.shapes
+        ]
+        placement = self._placement(columns=True)
+        rank_infos = [self._infos(r, placement) for r in range(self.world_size)]
+        payloads = []
+        for rank, infos in enumerate(rank_infos):
+            metadata = placement._fp8_metadata_from_infos(infos)
+            tensors = [
+                self._local(placement, info, rank, full)
+                for info, full in zip(infos, fulls, strict=True)
+            ]
+            payloads.append(
+                placement._pack_local_quantized_chunks(tensors, infos, rank, metadata)
+            )
+        metadata = placement._fp8_metadata_from_infos(rank_infos[0])
+
+        def finish(persistent_buffers):
+            prepared = PlacementPreparedUnshard(
+                placement=placement,
+                buffers=[payloads[0], torch.stack(payloads).view(-1)],
+                placement_state=Fp8BucketedBlockShard._Fp8UnshardState(
+                    infos=rank_infos[0], pg=None, debug_fqn=None, metadata=metadata
+                ),
+                persistent=True,
+                persistent_buffers=persistent_buffers,
+            )
+            return placement.finish_prepared_unshard(prepared)
+
+        first = finish(None)
+        self.assertEqual(len(first.full_params), len(self.shapes))
+        (compact,) = first.persistent_buffers
+        for compiling in (False, True):
+            with self.subTest(compiling=compiling):
+                buffer = torch.zeros_like(compact)
+                with patch.object(
+                    torch.compiler, "is_compiling", return_value=compiling
+                ):
+                    refill = finish([buffer])
+                self.assertEqual(refill.full_params, [])
+                self.assertEqual(len(refill.persistent_buffers), 1)
+                self.assertIs(refill.persistent_buffers[0], buffer)
+                self.assertTrue(torch.equal(buffer, compact))
+
+
+class TestCopyBoxesTriton(TestCase):
+    def test_copies_boxes_through_each_unit(self) -> None:
+        if device_type.type != "cuda":
+            self.skipTest("copy_boxes_triton is a CUDA kernel")
+        from ..custom_placements._copy_kernels import (
+            BoxCopyDescriptor,
+            copy_boxes_triton,
+        )
+
+        generator = torch.Generator().manual_seed(0)
+
+        def pick(choices):
+            return choices[int(torch.randint(len(choices), (1,), generator=generator))]
+
+        for unit in (8, 4, 2, 1):
+            for shift in sorted({0, unit % 8}):
+                with self.subTest(unit=unit, shift=shift):
+                    source_buf = torch.randint(
+                        0, 256, (1 << 18,), dtype=torch.uint8, device=device_type
+                    )
+                    output_buf = torch.zeros(
+                        1 << 18, dtype=torch.uint8, device=device_type
+                    )
+                    source, output = source_buf[shift:], output_buf[shift:]
+                    expected = output.clone()
+                    boxes, src_end, dst_end = [], 0, 0
+                    for _ in range(40):
+                        rows = pick([1, 3, 17, 70])
+                        row_numel = pick([1, 3, 16, 96])
+                        src_stride = row_numel + pick([0, 5])
+                        dst_stride = row_numel + pick([0, 7, 64])
+                        if (dst_end + rows * dst_stride) * unit > output.numel() or (
+                            src_end + rows * src_stride
+                        ) * unit > source.numel():
+                            break
+                        boxes.append(
+                            (src_end, rows, row_numel, src_stride, dst_end, dst_stride)
+                        )
+                        for row in range(rows):
+                            src = (src_end + row * src_stride) * unit
+                            dst = (dst_end + row * dst_stride) * unit
+                            expected[dst : dst + row_numel * unit] = source[
+                                src : src + row_numel * unit
+                            ]
+                        src_end += rows * src_stride
+                        dst_end += rows * dst_stride
+                    descriptor = BoxCopyDescriptor.create(
+                        boxes, unit_nbytes=unit, device=output.device
+                    )
+                    self.assertGreater(descriptor.ntiles, len(boxes))
+                    copy_boxes_triton(source, output, descriptor)
+                    self.assertTrue(torch.equal(output, expected))
+
 
 class TestCopyBox(TestCase):
     def test_copies_through_the_widest_unit(self):
