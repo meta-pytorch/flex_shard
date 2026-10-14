@@ -400,7 +400,10 @@ class PlacementPreparedUnshard:
     stream, or finish may copy into them on the current stream. Finish returns
     them. A placement whose finish alone writes them
     (``Placement.refills_persistent_buffers_in_finish``) gets their storage
-    re-allocated right before finish instead.
+    re-allocated right before finish instead. A placement whose run of this
+    unshard writes only its own buffers sets ``run_writes_persistent_buffers``
+    to False: a forward prefetch's unshard stream then need not wait on the
+    current stream at all (see ``begin_bucket_unshard``).
     Eager unshards are persistent. During graph capture they are not, and the
     full params may view gathered buffers whose lifetime the traced graph owns.
     """
@@ -410,6 +413,7 @@ class PlacementPreparedUnshard:
     placement_state: Any
     persistent: bool = False
     persistent_buffers: list[torch.Tensor] | None = None
+    run_writes_persistent_buffers: bool = True
 
 
 @dataclass
