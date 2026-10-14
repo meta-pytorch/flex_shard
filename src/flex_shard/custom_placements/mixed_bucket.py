@@ -28,7 +28,12 @@ from ..flex_shard.utils import (
     _record_copy_out_if_eager,
     _record_function_if_eager,
 )
-from .block_shard import _grad_reduce_dtype, _unsharded_dtype, BlockShard
+from .block_shard import (
+    _grad_reduce_dtype,
+    _unsharded_dtype,
+    BlockShard,
+    BucketedBlockShard,
+)
 from .fp8_bucketed_block_shard import _align_up, _VEC_ALIGN_BYTES, Fp8BucketedBlockShard
 from .owned import BucketedOwned
 from .shard import Shard
@@ -924,6 +929,30 @@ class MixedBucketPlacement(Placement):
                         ),
                     )
                     group_numel = layout.padded_segment_numel
+                    group_dtype = _grad_reduce_dtype(group.infos[0])
+                    group_device = group.tensors[0].device
+                elif isinstance(
+                    group.placement, Fp8BucketedBlockShard
+                ) and group.placement._packs_reduce_scatter_grad_in_one_pass(
+                    group.tensors, _grad_reduce_dtype(group.infos[0])
+                ):
+                    # The grads are packed straight into the bucket's send
+                    # buffer below, in one pass, rather than into a
+                    # world-size buffer of their own first.
+                    group_numel = max(
+                        group.placement._bucket_layout(group.infos[0]).rank_numels
+                    )
+                    prepared = PlacementPreparedReduceGrad(
+                        placement=group.placement,
+                        buffers=[],
+                        placement_state=BucketedBlockShard._ReduceGradState(
+                            infos=group.infos,
+                            rank=mesh.get_local_rank(),
+                            pg=mesh.get_group(),
+                            debug_fqn=debug_fqn,
+                            padded_segment_numel=group_numel,
+                        ),
+                    )
                     group_dtype = _grad_reduce_dtype(group.infos[0])
                     group_device = group.tensors[0].device
                 else:
