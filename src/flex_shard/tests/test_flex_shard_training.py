@@ -825,6 +825,70 @@ class TestFlexShardTraining(FSDPTest):
                     self.assertEqual(param.grad.float(), expected, **tolerance)
 
     @skip_if_lt_x_gpu(2)
+    def test_separate_reduce_scatter_group(self):
+        # Reduce-scatters move to one dedicated process group over the mesh's
+        # ranks, shared by the buckets, while all-gathers stay on the mesh's
+        # group; the gradients stay bitwise equal, and False goes back.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        torch.manual_seed(0)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 6)
+        ).to(device_type)
+        shared = copy.deepcopy(model)
+        for module in (model, shared):
+            flex_shard(
+                module,
+                buckets=[
+                    BucketSpec(
+                        [f"{index}.*"],
+                        placement_fn=per_param_placements,
+                        mesh=mesh,
+                    )
+                    for index in (0, 2)
+                ],
+            )
+        with mock.patch.object(dist, "new_group", wraps=dist.new_group) as new_group:
+            model.set_separate_reduce_scatter_group()
+        self.assertEqual(new_group.call_count, 1)
+        storages = model.sharded_bucket_storages
+        (reduce_mesh,) = {
+            id(storage.reduce_mesh): storage.reduce_mesh for storage in storages
+        }.values()
+        self.assertIsNot(reduce_mesh.get_group(), mesh.get_group())
+        self.assertEqual(reduce_mesh.mesh.tolist(), mesh.mesh.tolist())
+
+        torch.manual_seed(1 + self.rank)
+        x = torch.randn(4, 8, device=device_type)
+        with (
+            mock.patch.object(
+                dist, "all_gather_single", wraps=dist.all_gather_single
+            ) as all_gather,
+            mock.patch.object(
+                dist, "reduce_scatter_tensor", wraps=dist.reduce_scatter_tensor
+            ) as reduce_scatter,
+        ):
+            model(x).sum().backward()
+        self.assertEqual(
+            {call.kwargs["group"] for call in all_gather.call_args_list},
+            {mesh.get_group()},
+        )
+        self.assertEqual(
+            {call.kwargs["group"] for call in reduce_scatter.call_args_list},
+            {reduce_mesh.get_group()},
+        )
+        shared(x).sum().backward()
+        for param, shared_param in zip(model.parameters(), shared.parameters()):
+            self.assertTrue(torch.equal(param.grad, shared_param.grad))
+
+        # Enabling again keeps the group; False goes back to the mesh's.
+        with mock.patch.object(dist, "new_group", wraps=dist.new_group) as new_group:
+            model.set_separate_reduce_scatter_group()
+        self.assertEqual(new_group.call_count, 0)
+        self.assertTrue(all(storage.reduce_mesh is reduce_mesh for storage in storages))
+        model.set_separate_reduce_scatter_group(False)
+        self.assertTrue(all(storage.reduce_mesh is mesh for storage in storages))
+
+    @skip_if_lt_x_gpu(2)
     def test_finalize_backward(self):
         # Grads accumulated without sync reduce-scatter outside backward, as a
         # pipeline stage does after its last backward: after automatic

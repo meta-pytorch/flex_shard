@@ -39,6 +39,8 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+
     from .placement_contract import Placement
 
 
@@ -280,6 +282,29 @@ class FlexShardModule:
         """
         for bucket_storage in self._bucket_storages(recurse):
             bucket_storage.set_requires_gradient_sync(requires_gradient_sync)
+
+    def set_separate_reduce_scatter_group(
+        self,
+        enable: bool = True,
+        *,
+        recurse: bool = True,
+    ) -> None:
+        """Run gradient reduce-scatters on a process group of their own, like
+        FSDP2's ``set_separate_reduce_scatter_group`` (experimental).
+
+        A bucket's all-gathers and reduce-scatters run on separate streams but
+        by default through its mesh's process group: one NCCL communicator,
+        which runs one collective at a time, so a backward all-gather waits
+        behind the reduce-scatter issued before it. With ``True``, the
+        reduce-scatters run on a dedicated process group over the same ranks
+        (``dist.new_group``, one per distinct set of ranks), so the two can
+        progress together when the network allows. Like other process-group
+        setup, call it on every rank of the buckets' meshes, before the first
+        backward. ``False`` goes back to the meshes' groups. 1-D meshes only.
+        """
+        reduce_meshes: dict[tuple[str, tuple[int, ...]], DeviceMesh] = {}
+        for bucket_storage in self._bucket_storages(recurse):
+            bucket_storage.set_separate_reduce_scatter_group(enable, reduce_meshes)
 
     def set_reshard_after_backward(
         self,

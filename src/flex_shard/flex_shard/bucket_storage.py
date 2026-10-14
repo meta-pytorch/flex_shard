@@ -360,6 +360,8 @@ class ShardedBucketStorage:
         # See set_requires_gradient_sync and set_reshard_after_backward.
         self._requires_gradient_sync = True
         self._reshard_after_backward = True
+        # See set_separate_reduce_scatter_group.
+        self._reduce_mesh: DeviceMesh | None = None
         self._gradient_reduction = GradientReduction(
             gradient_reduce_op, gradient_divide_factor
         )
@@ -753,6 +755,65 @@ class ShardedBucketStorage:
         self._gradient_reduction = replace(
             self._gradient_reduction, divide_factor=factor
         )
+
+    @property
+    def reduce_mesh(self) -> DeviceMesh:
+        """The mesh this bucket reduce-scatters its gradients over: its mesh,
+        unless ``set_separate_reduce_scatter_group`` gave the reduce-scatters a
+        process group of their own over the same ranks."""
+        return self._mesh if self._reduce_mesh is None else self._reduce_mesh
+
+    def set_separate_reduce_scatter_group(
+        self,
+        enable: bool,
+        reduce_meshes: dict[tuple[str, tuple[int, ...]], DeviceMesh] | None = None,
+    ) -> None:
+        """Run this bucket's reduce-scatters on a process group of their own,
+        over its mesh's ranks, or with ``enable=False`` on its mesh's group.
+
+        ``FlexShardModule.set_separate_reduce_scatter_group`` documents the
+        behavior and sets every bucket. ``reduce_meshes`` holds the reduce
+        meshes made so far, by device type and ranks, so buckets over the same
+        ranks share one process group.
+        """
+        if not enable or self._mesh.size() == 1:
+            # A 1-rank mesh has no reduce-scatter to separate.
+            self._reduce_mesh = None
+            return
+        if self._mesh.ndim != 1:
+            raise NotImplementedError(
+                "A separate reduce-scatter group needs a 1-D bucket mesh, got "
+                f"{self._mesh.ndim} dims."
+            )
+        from torch.distributed.device_mesh import DeviceMesh
+
+        ranks = tuple(self._mesh.mesh.flatten().tolist())
+        key = (self._mesh.device_type, ranks)
+        if reduce_meshes is None:
+            reduce_meshes = {}
+        if key not in reduce_meshes:
+            if self._reduce_mesh is not None:
+                # Already enabled: keep its group.
+                reduce_meshes[key] = self._reduce_mesh
+            else:
+                # Local synchronization: ranks outside this mesh don't wait in
+                # new_group's barrier, as for FSDP2's group.
+                group = dist.new_group(
+                    list(ranks),
+                    use_local_synchronization=True,
+                    group_desc="flex_shard_reduce_scatter",
+                )
+                if group == dist.GroupMember.NON_GROUP_MEMBER:
+                    raise AssertionError(
+                        f"This rank is not in its bucket mesh's ranks {ranks}."
+                    )
+                reduce_meshes[key] = DeviceMesh.from_group(
+                    group,
+                    self._mesh.device_type,
+                    mesh=self._mesh.mesh,
+                    mesh_dim_names=self._mesh.mesh_dim_names,
+                )
+        self._reduce_mesh = reduce_meshes[key]
 
     def set_requires_gradient_sync(self, requires_gradient_sync: bool) -> None:
         """Set whether backward reduce-scatters this bucket's gradients.
