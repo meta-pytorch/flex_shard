@@ -30,6 +30,7 @@ from ..custom_placements.fp8_bucketed_block_shard import (
 )
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..flex_shard.bucket_storage import ParamInfo, ShardedBucketStorage
+from ..flex_shard.placement_contract import PlacementPreparedUnshard
 from .common import single_rank_cpu_mesh
 
 
@@ -1166,6 +1167,200 @@ class TestReduceScatterCopyIn(TestCase):
         )
         self.assertTrue(torch.equal(prepared.buffers[0].view(expected.shape), expected))
         self.assertEqual(placement._reduce_copy_in_plans, {})
+
+
+class TestFp8ColumnBlocks(TestCase):
+    """Column blocks for long-row weights: the planner, the unshard, the
+    reduce-scatter copy-in and the storage copy agree with each rank's
+    global_layout boxes."""
+
+    # The last weight's rows (24) are longer than the others' (8), and it has
+    # 8 rows: its 4-column blocks hold 32 elements, as the 4-row blocks do.
+    shapes = [(16, 8), (8, 8), (12, 8), (8, 24)]
+    world_size = 4
+    block = 4
+
+    def _infos(self, rank: int, placement: Fp8BucketedBlockShard) -> list[ParamInfo]:
+        named_params = [
+            (
+                f"w{index}",
+                nn.Parameter(torch.empty(shape, device="meta", dtype=torch.bfloat16)),
+            )
+            for index, shape in enumerate(self.shapes)
+        ]
+        return _make_fp8_param_infos(
+            named_params, placement, _FakeMesh(self.world_size, rank)
+        )
+
+    def _placement(self, *, columns: bool, factory=_return_fp8_data):
+        return Fp8BucketedBlockShard(
+            world_size=self.world_size,
+            weight_factory=factory,
+            block_size=self.block,
+            column_blocks_for_long_rows=columns,
+        )
+
+    def _local(self, placement, info, rank, full: torch.Tensor) -> torch.Tensor:
+        local = torch.zeros(info.local_shape, dtype=full.dtype, device=full.device)
+        layout = placement.global_layout(info, rank, self.world_size)
+        for global_offset, local_offset, size in zip(
+            layout.global_offsets, layout.local_offsets, layout.local_sizes, strict=True
+        ):
+            local[tuple(slice(o, o + n) for o, n in zip(local_offset, size))] = full[
+                tuple(slice(o, o + n) for o, n in zip(global_offset, size))
+            ]
+        return local
+
+    def test_plans_column_blocks_for_long_rows(self) -> None:
+        for columns in (False, True):
+            with self.subTest(columns=columns):
+                placement = self._placement(columns=columns)
+                infos = self._infos(0, placement)
+                metadata = placement._fp8_metadata_from_infos(infos)
+                column_fqns = {
+                    c.fqn for c in metadata.chunks if c.col_start is not None
+                }
+                self.assertEqual(column_fqns, {"w3"} if columns else set())
+        # Llama 3.1 405B's layer at 256 ranks: 9.5% padding with row blocks only.
+        layer = {
+            "wqkv": (18432, 16384),
+            "wo": (16384, 16384),
+            "w13": (2, 53248, 16384),
+            "w2": (16384, 53248),
+        }
+        named_params = [
+            (fqn, nn.Parameter(torch.empty(shape, device="meta", dtype=torch.bfloat16)))
+            for fqn, shape in layer.items()
+        ]
+        numel = sum(param.numel() for _, param in named_params)
+        for columns, expected in ((False, 13_631_488), (True, 12_582_912)):
+            placement = Fp8BucketedBlockShard(
+                world_size=256,
+                weight_factory=_return_fp8_data,
+                column_blocks_for_long_rows=columns,
+            )
+            infos = _make_fp8_param_infos(named_params, placement, _FakeMesh(256))
+            rank_numels = placement._bucket_layout(infos[0]).rank_numels
+            self.assertEqual(max(rank_numels), expected)
+            self.assertEqual(sum(rank_numels), numel)
+        # The dense reference keeps row blocks: its dense payload handles only them.
+        reference = DenseAllGatherReferencePlacement(
+            world_size=self.world_size,
+            weight_factory=_return_fp8_data,
+            block_size=self.block,
+            column_blocks_for_long_rows=True,
+        )
+        metadata = reference._fp8_metadata_from_infos(self._infos(0, reference))
+        self.assertTrue(all(c.col_start is None for c in metadata.chunks))
+        raw = self._placement(columns=True)
+        member = MixedBucketPlacement({}).fp8_bucketed_block_shard(raw)
+        self.assertTrue(member.column_blocks_for_long_rows)
+
+    def test_unshard_matches_reference_quantization(self) -> None:
+        if device_type.type != "cuda":
+            self.skipTest("The FP8 quantization kernels run on CUDA.")
+        torch.manual_seed(0)
+        fulls = [
+            torch.randn(shape, dtype=torch.bfloat16, device=device_type)
+            for shape in self.shapes
+        ]
+        for compiling in (False, True):
+            with self.subTest(compiling=compiling):
+                factory = _RecordingWeightFactory()
+                placement = self._placement(columns=True, factory=factory)
+                rank_infos = [self._infos(r, placement) for r in range(self.world_size)]
+                payloads = []
+                for rank, infos in enumerate(rank_infos):
+                    metadata = placement._fp8_metadata_from_infos(infos)
+                    tensors = [
+                        self._local(placement, info, rank, full)
+                        for info, full in zip(infos, fulls, strict=True)
+                    ]
+                    payloads.append(
+                        placement._pack_local_quantized_chunks(
+                            tensors, infos, rank, metadata
+                        )
+                    )
+                metadata = placement._fp8_metadata_from_infos(rank_infos[0])
+                prepared = PlacementPreparedUnshard(
+                    placement=placement,
+                    buffers=[payloads[0], torch.stack(payloads).view(-1)],
+                    placement_state=Fp8BucketedBlockShard._Fp8UnshardState(
+                        infos=rank_infos[0], pg=None, debug_fqn=None, metadata=metadata
+                    ),
+                )
+                with patch.object(
+                    torch.compiler, "is_compiling", return_value=compiling
+                ):
+                    placement.finish_prepared_unshard(prepared)
+                for call, full in zip(factory.calls, fulls, strict=True):
+                    reference_fp8, reference_scale = _reference_blockwise_quant_weight(
+                        full, self.block
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            call.fp8_data.view(torch.uint8),
+                            reference_fp8.view(torch.uint8),
+                        )
+                    )
+                    self.assertTrue(torch.equal(call.recip_scale, reference_scale))
+
+    def test_reduce_scatter_rows_hold_each_ranks_boxes(self) -> None:
+        torch.manual_seed(0)
+        grads = [
+            torch.randn(shape, dtype=torch.bfloat16, device=device_type)
+            for shape in self.shapes
+        ]
+        placement = self._placement(columns=True)
+        rank_infos = [self._infos(r, placement) for r in range(self.world_size)]
+        layout = placement._bucket_layout(rank_infos[0][0])
+        mesh = _FakeMesh(self.world_size)
+        for compiling in (False, True):
+            with self.subTest(compiling=compiling):
+                with patch.object(
+                    torch.compiler, "is_compiling", return_value=compiling
+                ):
+                    prepared = placement.prepare_reduce_grad(
+                        grads, rank_infos[0], mesh, None
+                    )
+                rows = prepared.buffers[0].view(self.world_size, -1)
+                for rank, infos in enumerate(rank_infos):
+                    rank_offset = layout.rank_offsets[rank]
+                    for info, grad in zip(infos, grads, strict=True):
+                        if info.local_numel == 0:
+                            continue
+                        start = (
+                            placement._param_layout(info).local_global_offset
+                            - rank_offset
+                        )
+                        got = rows[rank, start : start + info.local_numel].view(
+                            info.local_shape
+                        )
+                        self.assertTrue(
+                            torch.equal(got, self._local(placement, info, rank, grad))
+                        )
+                    self.assertTrue(
+                        torch.all(rows[rank, layout.rank_numels[rank] :] == 0)
+                    )
+
+    def test_storage_copy_writes_column_rectangles(self) -> None:
+        torch.manual_seed(0)
+        full = torch.randn(self.shapes[-1], dtype=torch.bfloat16, device=device_type)
+        placement = self._placement(columns=True)
+        for rank in range(self.world_size):
+            info = self._infos(rank, placement)[-1]
+            if info.local_numel == 0:
+                continue
+            storage = torch.zeros(
+                info.byte_offset + info.storage_nbytes,
+                dtype=torch.uint8,
+                device=device_type,
+            )
+            placement.copy_param_to_storage(storage, info, full, rank, self.world_size)
+            got = (
+                storage[info.byte_offset :].view(torch.bfloat16).view(info.local_shape)
+            )
+            self.assertTrue(torch.equal(got, self._local(placement, info, rank, full)))
 
 
 class TestFp8BlockwiseWeightQuantization(TestCase):

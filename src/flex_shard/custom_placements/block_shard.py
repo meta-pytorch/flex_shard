@@ -579,6 +579,10 @@ class BucketedBlockShard(Placement):
         # The gcd of every offset and length above.
         alignment: int
         descriptors: dict[tuple[torch.device, int], Any]
+        # Column-rectangle shards (see _column_boxes) as (param index,
+        # destination offset, first column, columns): the grad's columns,
+        # row-major, at the destination.
+        box_copies: tuple[tuple[int, int, int, int], ...] = ()
 
     def __init__(
         self,
@@ -1079,6 +1083,15 @@ class BucketedBlockShard(Placement):
                 return None
         return bucket
 
+    def _column_boxes(
+        self, infos: list[ParamInfo]
+    ) -> dict[int, tuple[tuple[int, int, int, int], ...]]:
+        """By parameter index, the rank shards that are column rectangles of a
+        2-D parameter rather than ranges of its row-major elements, as (rank,
+        bucket offset, first column, columns); each is row-major in the
+        bucket's order. BucketedBlockShard has none."""
+        return {}
+
     def _reduce_copy_in_plan(
         self,
         infos: list[ParamInfo],
@@ -1096,14 +1109,26 @@ class BucketedBlockShard(Placement):
         ]
         param_segments: list[list[tuple[int, int, int]]] = [[] for _ in infos]
         zero_segments: list[tuple[int, int]] = []
+        column_boxes = self._column_boxes(infos)
+        box_copies: list[tuple[int, int, int, int]] = []
         for rank, (rank_offset, rank_numel) in enumerate(
             zip(bucket_layout.rank_offsets, bucket_layout.rank_numels, strict=True)
         ):
             row_start = rank * row_stride
             covered: list[tuple[int, int]] = []
-            for segments, (param_offset, param_numel) in zip(
-                param_segments, param_ranges, strict=True
+            for index, (segments, (param_offset, param_numel)) in enumerate(
+                zip(param_segments, param_ranges, strict=True)
             ):
+                if index in column_boxes:
+                    rows = infos[index].global_shape[0]
+                    for box_rank, bucket_offset, col_start, cols in column_boxes[index]:
+                        if box_rank == rank:
+                            start = bucket_offset - rank_offset
+                            box_copies.append(
+                                (index, row_start + start, col_start, cols)
+                            )
+                            covered.append((start, start + rows * cols))
+                    continue
                 start = max(param_offset, rank_offset)
                 end = min(param_offset + param_numel, rank_offset + rank_numel)
                 if start < end:
@@ -1139,6 +1164,7 @@ class BucketedBlockShard(Placement):
             zero_segments=tuple(zero_segments),
             alignment=math.gcd(*values) or 1,
             descriptors={},
+            box_copies=tuple(box_copies),
         )
         self._reduce_copy_in_plans[key] = plan
         return plan
@@ -1191,6 +1217,12 @@ class BucketedBlockShard(Placement):
         out = send_rows.as_strided(
             ((send_rows.size(0) - 1) * row_stride + send_rows.size(1),), (1,)
         )
+        # Column rectangles: one strided copy each.
+        for index, offset, col_start, cols in plan.box_copies:
+            rows = tensors[index].shape[0]
+            out[offset : offset + rows * cols].view(rows, cols).copy_(
+                tensors[index][:, col_start : col_start + cols]
+            )
         sources = [tensor.view(-1) for tensor in tensors]
         itemsize = out.element_size()
         unit_nbytes = next(
@@ -1264,7 +1296,11 @@ class BucketedBlockShard(Placement):
             debug_fqn=debug_fqn,
             padded_segment_numel=padded_segment_numel,
         )
-        if world_size * padded_segment_numel == bucket_layout.global_numel:
+        column_boxes = self._column_boxes(infos)
+        if (
+            world_size * padded_segment_numel == bucket_layout.global_numel
+            and not column_boxes
+        ):
             grad_bucket = self._gradient_bucket_of(
                 tensors, infos, bucket_layout.global_numel, dtype
             )
@@ -1306,7 +1342,19 @@ class BucketedBlockShard(Placement):
             )
             copy_dsts: list[torch.Tensor] = []
             copy_srcs: list[torch.Tensor] = []
-            for tensor, info in zip(tensors, infos, strict=True):
+            for index, (tensor, info) in enumerate(zip(tensors, infos, strict=True)):
+                if index in column_boxes:
+                    # Each rank's columns, row-major, in the bucket's order.
+                    rows = info.global_shape[0]
+                    grad = tensor.reshape(info.global_shape)
+                    for _, bucket_offset, col_start, cols in column_boxes[index]:
+                        copy_srcs.append(grad[:, col_start : col_start + cols])
+                        copy_dsts.append(
+                            global_grad_bucket[
+                                bucket_offset : bucket_offset + rows * cols
+                            ].view(rows, cols)
+                        )
+                    continue
                 param_layout = self._param_layout(info)
                 copy_srcs.append(tensor.reshape(-1))
                 copy_dsts.append(
