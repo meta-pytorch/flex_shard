@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
@@ -25,6 +26,7 @@ from ..flex_shard.placement_contract import (
     PlacementUnshardResult,
 )
 from ..flex_shard.utils import (
+    _get_single_placement,
     _record_comm_if_eager,
     _record_copy_in_if_eager,
     _record_copy_out_if_eager,
@@ -40,7 +42,17 @@ if TYPE_CHECKING:
 
 
 class Shard(Placement):
-    """Symmetric sharding — parameter split along dim across all ranks."""
+    """Symmetric sharding — parameter split along dim across all ranks.
+
+    Parameters sharded on different dims share one bucket. As in FSDP2, a
+    ``Shard(i)`` parameter with ``i > 0`` must split evenly; its chunks are
+    reordered to dim 0 around the collectives, and only ``Shard(0)`` pads uneven
+    chunks. A bucket copies its parameters directly between their layouts and
+    the collective buffers with FSDP's native collective copies, as FSDP2's
+    ``with_native_copy`` functions do: ``fsdp::_all_gather_copy_out_`` from
+    pytorch/pytorch#197204 and ``fsdp::chunk_cat_mixed_dtype`` with
+    ``num_leading_dims`` from pytorch/pytorch#200179.
+    """
 
     @dataclass(frozen=True)
     class _ReduceGradLayout:
@@ -80,6 +92,22 @@ class Shard(Placement):
 
     def __repr__(self) -> str:
         return f"Shard({self.dim})"
+
+    @override
+    def bucket_compatibility_key(self) -> object:
+        return type(self)
+
+    def _check_shardable(self, fqn: str, shape: torch.Size, world_size: int) -> None:
+        if not 0 <= self.dim < len(shape):
+            raise ValueError(
+                f"{self!r} is invalid for parameter {fqn!r} with shape {tuple(shape)}."
+            )
+        if self.dim > 0 and shape[self.dim] % world_size != 0:
+            raise NotImplementedError(
+                f"{self!r} requires parameter {fqn!r} with shape {tuple(shape)} to "
+                f"split evenly over {world_size} ranks, as in FSDP2; only Shard(0) "
+                "supports uneven sharding."
+            )
 
     @override
     def compute_local_shape(
@@ -130,24 +158,19 @@ class Shard(Placement):
         param_placements: dict[str, tuple[Placement, ...]],
         mesh: DeviceMesh,
     ) -> BucketStorageLayout | None:
-        if self.dim != 0:
-            raise NotImplementedError(
-                "Shard bucket storage currently supports only Shard(0)."
-            )
-
         rank = mesh.get_local_rank()
         world_size = mesh.size()
         param_layouts: dict[str, BucketParamStorageLayout] = {}
         byte_offset = 0
         for fqn, param in named_params:
-            if param.ndim == 0:
-                raise ValueError(
-                    f"Shard(0) is invalid for parameter {fqn!r} with scalar shape."
-                )
-            local_shape = self.compute_local_shape(param.shape, rank, world_size)
+            placement = _get_single_placement(param_placements[fqn])
+            if not isinstance(placement, Shard):
+                raise AssertionError(f"Expected Shard for {fqn!r}, got {placement!r}")
+            placement._check_shardable(fqn, param.shape, world_size)
+            local_shape = placement.compute_local_shape(param.shape, rank, world_size)
             local_numel = local_shape.numel()
             # Rank 0 has the largest chunk; reserve its capacity on every rank.
-            padded_numel = self.compute_local_numel(param.shape, 0, world_size)
+            padded_numel = placement.compute_local_numel(param.shape, 0, world_size)
             storage_nbytes = padded_numel * param.dtype.itemsize
             param_layouts[fqn] = BucketParamStorageLayout(
                 local_shape=local_shape,
@@ -214,7 +237,7 @@ class Shard(Placement):
             storage_offset=bucket_byte_offset // itemsize,
         )
 
-    def _copy_out_dim0_unshard(
+    def _copy_out_unshard(
         self,
         gathered: torch.Tensor,
         infos: list[ParamInfo],
@@ -230,7 +253,6 @@ class Shard(Placement):
         """
         full_params: list[torch.Tensor] = []
         padded_full_params: list[torch.Tensor] = []
-        split_out: list[torch.Tensor] = []
         for idx, (info, padded_local_numel) in enumerate(
             zip(infos, layout.padded_local_numels, strict=True)
         ):
@@ -248,13 +270,15 @@ class Shard(Placement):
                 full_params.append(
                     padded_full_param[: info.global_numel].view(info.global_shape)
                 )
-            split_out.append(padded_full_param.view(world_size, padded_local_numel))
 
-        torch.split_with_sizes_copy(
-            gathered.view(world_size, -1),
-            layout.padded_local_numels,
-            dim=1,
-            out=split_out,
+        # One copy places every rank's chunk: each padded param is a
+        # [leading size, world size, rest] view of its full layout.
+        torch.ops.fsdp._all_gather_copy_out_(
+            padded_full_params,
+            gathered,
+            list(layout.padded_local_numels),
+            [math.prod(info.global_shape[: info.placement.dim]) for info in infos],
+            world_size,
         )
         return full_params, padded_full_params
 
@@ -267,10 +291,6 @@ class Shard(Placement):
         debug_fqn: str | None,
     ) -> PlacementPreparedUnshard:
         """Prepare buffers for the bucket all-gather unshard."""
-        if self.dim != 0:
-            raise NotImplementedError(
-                "Shard bucket all-gather currently supports only Shard(0)."
-            )
         ws = mesh.size()
         dtype = infos[0].unsharded_dtype
         device = tensors[0].device
@@ -335,7 +355,7 @@ class Shard(Placement):
             )
         with _record_copy_out_if_eager():
             state = prepared.placement_state
-            full_params, padded_full_params = self._copy_out_dim0_unshard(
+            full_params, padded_full_params = self._copy_out_unshard(
                 prepared.buffers[1],
                 state.infos,
                 state.world_size,
@@ -356,22 +376,43 @@ class Shard(Placement):
     ) -> tuple[torch.Tensor, Shard._ReduceGradLayout]:
         dtype = infos[0].grad_reduce_dtype
         device = tensors[0].device
+        # Per grad: the number of dims before its shard dim, which the copy-in
+        # keeps in each chunk, or 0 to chunk along dim 0.
+        num_leading_dims = [0] * len(tensors)
+        if world_size > 1:
+            tensors = list(tensors)
+            for idx, (tensor, info) in enumerate(zip(tensors, infos, strict=True)):
+                if (shard_dim := info.placement.dim) == 0:
+                    continue
+                if tensor.is_contiguous():
+                    num_leading_dims[idx] = shard_dim
+                else:
+                    # As FSDP2 does, reorder the grad along dim 0 so that each
+                    # rank's chunk is contiguous.
+                    tensors[idx] = torch.cat(
+                        torch.chunk(tensor, world_size, dim=shard_dim), dim=0
+                    )
         padded_sizes: list[torch.Size] = []
-        for tensor in tensors:
+        for tensor, leading_dims in zip(tensors, num_leading_dims, strict=True):
             padded_size = list(tensor.shape)
-            padded_size[self.dim] = (
-                (tensor.size(self.dim) + world_size - 1) // world_size
-            ) * world_size
+            if leading_dims == 0:
+                padded_size[0] = (
+                    (tensor.size(0) + world_size - 1) // world_size
+                ) * world_size
             padded_sizes.append(torch.Size(padded_size))
 
         input_numel = sum(s.numel() for s in padded_sizes)
         send_buf = torch.empty(input_numel, dtype=dtype, device=device)
         send_buf_2d = send_buf.view(world_size, -1)
         # Grads may differ in dtype (per-parameter grad_dtype). The copy-in
-        # casts each to the reduce dtype as it copies, one fused kernel for
-        # CUDA bf16 + fp32 (fsdp::chunk_cat_mixed_dtype, pytorch/pytorch#194434).
+        # casts each to the reduce dtype as it copies, in fused kernels for CUDA
+        # bf16 or fp16 into fp32.
         torch.ops.fsdp.chunk_cat_mixed_dtype(
-            tensors, dim=self.dim, num_chunks=world_size, out=send_buf_2d
+            tensors,
+            dim=0,
+            num_chunks=world_size,
+            out=send_buf_2d,
+            num_leading_dims=num_leading_dims,
         )
         return send_buf, Shard._ReduceGradLayout(padded_sizes)
 
