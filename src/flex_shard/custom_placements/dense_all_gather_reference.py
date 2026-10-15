@@ -25,6 +25,7 @@ from ..flex_shard.placement_contract import (
 from ..flex_shard.utils import _record_copy_in_if_eager, _record_copy_out_if_eager
 from .fp8_bucketed_block_shard import (
     _align_up,
+    _compact_scale_offsets,
     _matrix_shape,
     _quantize_dense_weight_to_blockwise_fp8,
     _scale_shape,
@@ -155,7 +156,10 @@ class DenseAllGatherReferencePlacement(Fp8BucketedBlockShard):
             )
         # The FP8 placement's compact layout: fp8 data, then aligned scales.
         fp8_nbytes = sum(metadata.rank_fp8_numels)
-        scale_nbytes = sum(metadata.rank_scale_numels) * torch.float32.itemsize
+        scale_offsets, scale_numel = _compact_scale_offsets(
+            state.infos, self.block_size
+        )
+        scale_nbytes = scale_numel * torch.float32.itemsize
         scale_byte_offset = _align_up(fp8_nbytes, _VEC_ALIGN_BYTES)
         compact = (
             prepared.persistent_buffers[0]
@@ -188,18 +192,18 @@ class DenseAllGatherReferencePlacement(Fp8BucketedBlockShard):
                 )
             full_params: list[torch.Tensor] = []
             offset = 0
-            scale_offset = 0
-            for info in state.infos:
+            for info, scale_offset in zip(state.infos, scale_offsets, strict=True):
                 matrix_shape = _matrix_shape(info.global_shape)
                 scale_shape = _scale_shape(matrix_shape, self.block_size)
-                scale_numel = scale_shape[0] * scale_shape[1]
                 fp8_data, recip_scale = _quantize_dense_weight_to_blockwise_fp8(
                     dense_flat[offset : offset + info.global_numel].view(matrix_shape),
                     self.block_size,
                     self.fp8_dtype,
                 )
                 fp8_view = fp8_flat[offset : offset + info.global_numel]
-                scale_view = scale_flat[scale_offset : scale_offset + scale_numel]
+                scale_view = scale_flat[
+                    scale_offset : scale_offset + scale_shape[0] * scale_shape[1]
+                ]
                 fp8_view.view(matrix_shape).copy_(fp8_data)
                 scale_view.view(scale_shape).copy_(recip_scale)
                 full_params.append(
@@ -211,8 +215,7 @@ class DenseAllGatherReferencePlacement(Fp8BucketedBlockShard):
                     )
                 )
                 offset += info.global_numel
-                scale_offset += scale_numel
-        if offset != fp8_flat.numel() or scale_offset != scale_flat.numel():
+        if offset != fp8_flat.numel() or scale_numel != scale_flat.numel():
             raise AssertionError("Dense reference bucket metadata is inconsistent.")
         return PlacementUnshardResult(
             full_params=full_params,
