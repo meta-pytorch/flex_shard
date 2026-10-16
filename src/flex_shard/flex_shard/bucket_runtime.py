@@ -25,10 +25,12 @@ from .bucket_comm import (
     begin_explicit_bucket_unshard,
     begin_bucket_unshard,
     begin_reduce_grad,
+    DeferredUnshardRelease,
     ReduceGradHandle,
     UnshardHandle,
 )
 from .bucket_storage import ParamInfo, ShardedBucketStorage
+from .placement_contract import PlacementUnshardResult
 from .utils import (
     _get_bucket_storage_debug_fqn,
     _module_path_common_prefix,
@@ -224,6 +226,10 @@ class BucketCommContext:
     forward_order: list[BucketRuntime] = field(default_factory=list)
     post_forward_order: list[BucketRuntime] = field(default_factory=list)
     pending_unshards: list[PendingUnshard] = field(default_factory=list)
+    # The last forward unshard's buffers, kept past its copy-out until the next
+    # unshard finishes or the root module's forward ends (see
+    # BucketRuntime.unshard).
+    deferred_unshard_release: DeferredUnshardRelease | None = None
     reduce_grad_states: list[PendingReduceGrad] = field(default_factory=list)
     retired_reduce_grad_states: list[PendingReduceGrad] = field(default_factory=list)
     post_backward_callback_queued: bool = False
@@ -303,11 +309,14 @@ class BucketCommContext:
         *,
         explicit: bool = False,
         on_current_stream: bool = False,
+        forward: bool = False,
     ) -> None:
         """Start ``bucket``'s unshard ahead of its hook. Learned-order prefetches
         run one at a time, explicit ones as many as the lists name. With
         ``on_current_stream``, for ``FlexShardModule.unshard(async_op=True)``,
-        the all-gather runs asynchronously on the current stream."""
+        the all-gather runs asynchronously on the current stream. A
+        learned-order ``forward`` prefetch doesn't order the unshard stream
+        after the current stream (see ``begin_bucket_unshard``)."""
         if (
             bucket is None
             or bucket.is_unsharded
@@ -322,7 +331,9 @@ class BucketCommContext:
             PendingUnshard(
                 bucket,
                 bucket.begin_unshard(
-                    on_current_stream=on_current_stream, async_op=on_current_stream
+                    on_current_stream=on_current_stream,
+                    async_op=on_current_stream,
+                    wait_current_stream=not forward or explicit,
                 ),
                 explicit,
             )
@@ -395,6 +406,13 @@ class BucketCommContext:
         self.pending_unshards = kept
         return result
 
+    def release_deferred_unshard(self) -> None:
+        """Release the buffers the last forward unshard kept past its copy-out,
+        as FSDP2 releases its ``AllGatherState``."""
+        deferred, self.deferred_unshard_release = self.deferred_unshard_release, None
+        if deferred is not None:
+            deferred.release()
+
     def _release_prefetch(self, pending: PendingUnshard) -> None:
         with _record_function_if_eager(
             "FlexShard::release_unused_prefetch",
@@ -426,6 +444,9 @@ class BucketCommContext:
 
         def _post_backward_callback() -> None:
             with dist._spmd_no_typecheck():
+                # A forward that didn't end at the root module (e.g. a partial
+                # group forward) may still hold an unshard's buffers.
+                self.release_deferred_unshard()
                 finish = self.finish_at_backward_end
                 if finish:
                     self.finish_buckets()
@@ -482,6 +503,7 @@ class BucketCommContext:
         if _in_backward():
             raise RuntimeError("FlexShard: finalize_backward() cannot run in backward.")
         self.check_no_raised_backward()
+        self.release_deferred_unshard()
         # In reverse module order, as FSDP2's finalize_backward, like backward:
         # a block's routed experts reduce before its dense bucket, whose smaller
         # buffers then reuse the memory they freed.
@@ -512,6 +534,7 @@ class BucketCommContext:
         a grad without sync keeps the upcast.
         """
         self.check_no_raised_backward()
+        self.release_deferred_unshard()
         self.take_pending_unshard(None)
         self.wait_and_clear_reduce_grad_states(debug_fqn=None)
         self.pending_finalization = None
@@ -752,6 +775,7 @@ class BucketRuntime:
         *,
         on_current_stream: bool = False,
         async_op: bool = False,
+        wait_current_stream: bool = True,
     ) -> UnshardHandle:
         """Begin this bucket's unshard on the shared stream, or, with
         ``on_current_stream``, for ``FlexShardModule.unshard()``, on the current
@@ -789,6 +813,7 @@ class BucketRuntime:
             self.context.unshard_stream,
             debug_fqn=self.debug_fqn,
             persistent_buffers=persistent_buffers,
+            wait_current_stream=wait_current_stream,
         )
 
     def reduce_grads(
@@ -841,7 +866,11 @@ class BucketRuntime:
     # ------------------------------------------------------------------
 
     def unshard(
-        self, *, finish_other_prefetch: bool = False, on_current_stream: bool = False
+        self,
+        *,
+        finish_other_prefetch: bool = False,
+        on_current_stream: bool = False,
+        defer_release: bool = False,
     ) -> None:
         """Make the unsharded params hold data and swap them into the modules.
 
@@ -850,6 +879,7 @@ class BucketRuntime:
         them, instead of being released. Without a pending unshard to finish,
         it all-gathers on the shared stream, or, with ``on_current_stream``,
         for ``FlexShardModule.unshard()``, synchronously on the current stream.
+        ``defer_release`` is for the pre-forward hooks (see ``finish_unshard``).
         """
         if not self.is_unsharded:
             if finish_other_prefetch:
@@ -857,10 +887,12 @@ class BucketRuntime:
             result = self.context.take_pending_unshard(self)
             if result is None:
                 result = self.begin_unshard(on_current_stream=on_current_stream)
-            self.finish_unshard(result)
+            self.finish_unshard(result, defer_release=defer_release)
         self._swap_in_params(self.unsharded_params)
 
-    def finish_unshard(self, result: UnshardHandle) -> None:
+    def finish_unshard(
+        self, result: UnshardHandle, *, defer_release: bool = False
+    ) -> None:
         """Finish ``result`` into the persistent buffers.
 
         The first unshard creates the unsharded params from the placement's
@@ -870,10 +902,20 @@ class BucketRuntime:
         saved them in forward before a reshard), as FSDP2 does for its
         all-gather outputs. The storage is created outside inference mode, so a
         model first run under ``torch.inference_mode()`` can still train.
+
+        With ``defer_release``, the unshard's buffers stay past its copy-out
+        until the next unshard finishes or the root module's forward ends, so
+        the next bucket's gather (prefetched after this copy-out) need not wait
+        for it. That's FSDP2's forward with implicit prefetching
+        (``FSDPParamGroup.wait_for_unshard``): one more gather buffer in
+        flight, in exchange for back-to-back gathers. Releasing the previous
+        unshard's buffers first orders their reuse after its copy-out.
         """
+        self.context.release_deferred_unshard()
+        deferred = None
         with torch.inference_mode(False), torch.no_grad():
             if self.unsharded_params is None:
-                unshard = result.finish()
+                unshard, deferred = self._finish_result(result, defer_release)
                 self._create_unsharded_params(
                     unshard.full_params, unshard.persistent_buffers
                 )
@@ -883,7 +925,7 @@ class BucketRuntime:
                 with torch.autograd._unsafe_preserve_version_counter(
                     tuple(self.persistent_buffers)
                 ):
-                    refill = result.finish()
+                    refill, deferred = self._finish_result(result, defer_release)
                 if len(refill.persistent_buffers) != len(
                     self.persistent_buffers
                 ) or any(
@@ -895,7 +937,16 @@ class BucketRuntime:
                         "persistent buffers it was given."
                     )
             self._sync_requires_grad()
+        self.context.deferred_unshard_release = deferred
         self.is_unsharded = True
+
+    @staticmethod
+    def _finish_result(
+        result: UnshardHandle, defer_release: bool
+    ) -> tuple[PlacementUnshardResult, DeferredUnshardRelease | None]:
+        if defer_release:
+            return result.finish_deferring_release()
+        return result.finish(), None
 
     def _create_unsharded_params(
         self,
@@ -1053,7 +1104,8 @@ class BucketRuntime:
             self.context.prefetch(
                 self.context.next_forward_bucket(self)
                 if forward
-                else self.context.next_backward_bucket(self)
+                else self.context.next_backward_bucket(self),
+                forward=forward,
             )
             return
         for target in targets:
@@ -1284,7 +1336,7 @@ class BucketRuntime:
             if self.forward_index is None:
                 self.forward_index = len(self.context.forward_order)
                 self.context.forward_order.append(self)
-            self.unshard()
+            self.unshard(defer_release=True)
             self._prefetch(forward=True)
         args, kwargs, has_trigger = self._register_input_grad_hook(args, kwargs)
         self.call_has_trigger.append(has_trigger)
@@ -1316,7 +1368,7 @@ class BucketRuntime:
             if opens_pass and self.forward_index is None:
                 self.forward_index = len(self.context.forward_order)
                 self.context.forward_order.append(self)
-            self.unshard()
+            self.unshard(defer_release=True)
             if not opens_pass:
                 return None
             self._prefetch(forward=True)
@@ -1775,6 +1827,15 @@ def _install_bucket_unshard_hooks(
         bucket_storages[0]._module.register_forward_hook(
             functools.partial(_complete_group_passes, tuple(group_buckets))
         )
+    contexts = {
+        id(bucket.context): bucket.context
+        for bucket_runtimes in owner_buckets.values()
+        for bucket in bucket_runtimes.values()
+    }
+    # Last, after the group passes complete.
+    bucket_storages[0]._module.register_forward_hook(
+        functools.partial(_release_deferred_unshards, tuple(contexts.values()))
+    )
     for module, buckets in owner_buckets.items():
         reshard_hook = functools.partial(_reshard_buckets, tuple(buckets.values()))
         module.register_state_dict_pre_hook(reshard_hook)
@@ -1794,6 +1855,17 @@ def _complete_group_passes(
         for bucket in buckets:
             if bucket.group_pass is not None:
                 bucket.complete_group_pass(output)
+
+
+def _release_deferred_unshards(
+    contexts: tuple[BucketCommContext, ...], module: nn.Module, args: Any, output: Any
+) -> None:
+    """Root post-forward hook: release the buffers the forward's last unshard
+    kept past its copy-out, as FSDP2's root post-forward does."""
+    if torch.compiler.is_compiling() or _in_backward():
+        return
+    for context in contexts:
+        context.release_deferred_unshard()
 
 
 def _unwrap_checkpoint(module: nn.Module) -> nn.Module:
