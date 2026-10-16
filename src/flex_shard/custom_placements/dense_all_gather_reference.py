@@ -75,6 +75,11 @@ class DenseAllGatherReferencePlacement(Fp8BucketedBlockShard):
     compact buffer, which persistent unshards keep.
     """
 
+    @override
+    def _column_block_fqns(self, params) -> frozenset[str]:
+        # Its dense-row payload and copy-out handle row blocks only.
+        return frozenset()
+
     def __repr__(self) -> str:
         return (
             "DenseAllGatherReferencePlacement("
