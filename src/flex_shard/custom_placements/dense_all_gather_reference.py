@@ -158,12 +158,21 @@ class DenseAllGatherReferencePlacement(Fp8BucketedBlockShard):
         with _record_copy_out_if_eager():
             # Rank cuts partition one parameter-ordered block-row stream, so
             # joining the ranks' rows restores the full parameters.
-            dense_flat = torch.cat(
-                [
-                    rank_rows[rank, :numel]
-                    for rank, numel in enumerate(metadata.rank_fp8_numels)
-                ]
-            )
+            dense_flat = rank_rows.new_empty(fp8_nbytes)
+            if not self._copy_out_rank_rows_triton(
+                metadata,
+                rank_rows.view(torch.uint8),
+                dense_flat.view(torch.uint8),
+                data_elem_nbytes=rank_rows.element_size(),
+                with_scales=False,
+            ):
+                torch.cat(
+                    [
+                        rank_rows[rank, :numel]
+                        for rank, numel in enumerate(metadata.rank_fp8_numels)
+                    ],
+                    out=dense_flat,
+                )
             full_params: list[torch.Tensor] = []
             offset = 0
             scale_offset = 0
