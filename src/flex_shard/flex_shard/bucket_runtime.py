@@ -184,6 +184,25 @@ class GradientReductionHandle:
         self._contexts = []
 
 
+class ModuleUnshardHandle:
+    """Returned by ``FlexShardModule.unshard(async_op=True)``, like FSDP2's
+    ``UnshardHandle``.
+
+    ``wait()`` finishes the all-gathers that ``unshard`` started and that are
+    still pending into the unsharded params. A forward that runs first
+    finishes its buckets' all-gathers itself.
+    """
+
+    def __init__(self, buckets: list[tuple[BucketCommContext, BucketRuntime]]) -> None:
+        self._buckets = buckets
+
+    def wait(self) -> None:
+        for context, bucket in self._buckets:
+            if any(pending.bucket is bucket for pending in context.pending_unshards):
+                bucket.unshard()
+        self._buckets = []
+
+
 @dataclass
 class BucketCommContext:
     """Streams and scheduling state shared by buckets on one root module/device."""
