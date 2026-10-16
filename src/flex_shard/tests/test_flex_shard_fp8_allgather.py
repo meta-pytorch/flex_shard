@@ -1295,6 +1295,89 @@ class TestFp8ColumnBlocks(TestCase):
                 self.assertTrue(torch.equal(buffer, compact))
 
 
+class TestFp8TileUnits(TestFp8ColumnBlocks):
+    """Tile units: the planner, and TestFp8ColumnBlocks' agreement checks with
+    weights whose dims are whole blocks taking tiles, runs of them starting and
+    ending inside tile rows, and one with a partial last block row taking
+    column blocks."""
+
+    shapes = [(16, 8), (8, 12), (12, 8), (6, 8)]
+    world_size = 5
+    block = 4
+    test_plans_column_blocks_for_long_rows = None
+
+    def _placement(self, *, columns: bool, factory=_return_fp8_data):
+        del columns
+        return Fp8BucketedBlockShard(
+            world_size=self.world_size,
+            weight_factory=factory,
+            block_size=self.block,
+            tile_units=True,
+        )
+
+    def test_plans_tile_units(self) -> None:
+        placement = self._placement(columns=False)
+        chunks = placement._fp8_metadata_from_infos(self._infos(0, placement)).chunks
+        self.assertEqual(
+            {c.fqn for c in chunks if c.tile_start is not None}, {"w0", "w1", "w2"}
+        )
+        self.assertEqual({c.fqn for c in chunks if c.col_start is not None}, {"w3"})
+        tile_cols = {"w0": 2, "w1": 3, "w2": 2}
+        self.assertTrue(
+            any(
+                c.tile_start % tile_cols[c.fqn] or c.tile_end % tile_cols[c.fqn]
+                for c in chunks
+                if c.tile_start is not None
+            )
+        )
+        # DeepSeek V3's attention and shared-expert linears at 384 ranks: wo's
+        # 2.1 MB block rows pad every rank's 0.6 MB share to them with row
+        # blocks, and tiles bring that to under 1% padding.
+        layer = {
+            "wq_a": (1536, 7168),
+            "wq_b": (24576, 1536),
+            "wkv_a": (576, 7168),
+            "wkv_b": (32768, 512),
+            "wo": (7168, 16384),
+            "w1": (2048, 7168),
+            "w3": (2048, 7168),
+            "w2": (7168, 2048),
+        }
+        named_params = [
+            (fqn, nn.Parameter(torch.empty(shape, device="meta", dtype=torch.bfloat16)))
+            for fqn, shape in layer.items()
+        ]
+        numel = sum(param.numel() for _, param in named_params)
+        for tiles, max_padding in ((False, 2.4), (True, 0.01)):
+            placement = Fp8BucketedBlockShard(
+                world_size=384, weight_factory=_return_fp8_data, tile_units=tiles
+            )
+            infos = _make_fp8_param_infos(named_params, placement, _FakeMesh(384))
+            rank_numels = placement._bucket_layout(infos[0]).rank_numels
+            self.assertEqual(sum(rank_numels), numel)
+            padding = max(rank_numels) * 384 / numel - 1
+            if tiles:
+                self.assertLess(padding, max_padding)
+            else:
+                self.assertGreater(padding, max_padding)
+        # The dense reference keeps row blocks, and the mixed bucket's member
+        # keeps tile units.
+        reference = DenseAllGatherReferencePlacement(
+            world_size=self.world_size,
+            weight_factory=_return_fp8_data,
+            block_size=self.block,
+            tile_units=True,
+        )
+        metadata = reference._fp8_metadata_from_infos(self._infos(0, reference))
+        self.assertTrue(
+            all(c.col_start is None and c.tile_start is None for c in metadata.chunks)
+        )
+        member = MixedBucketPlacement({}).fp8_bucketed_block_shard(
+            self._placement(columns=False)
+        )
+        self.assertTrue(member.tile_units)
+
+
 class TestCopyBoxesTriton(TestCase):
     def test_copies_boxes_through_each_unit(self) -> None:
         if device_type.type != "cuda":

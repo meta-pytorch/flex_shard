@@ -194,6 +194,7 @@ def make_fp8_bucketed_block_placement_fn(
     block_size: int = 128,
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
     column_blocks_for_long_rows: bool | None = None,
+    tile_units: bool | None = None,
 ) -> PlacementFn:
     """Assign one FP8 bucketed block placement using the mesh rank count."""
 
@@ -207,6 +208,7 @@ def make_fp8_bucketed_block_placement_fn(
             block_size=block_size,
             fp8_dtype=fp8_dtype,
             column_blocks_for_long_rows=column_blocks_for_long_rows,
+            tile_units=tile_units,
         )
         return {fqn: (placement,) for fqn, _ in named_params}
 
@@ -239,7 +241,8 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
     class _BlockRowUnit:
         """One indivisible row-block unit, including a possible partial tail,
         or with ``col_start`` set, one column block of a column-block parameter
-        (all its rows)."""
+        (all its rows), or with ``tile`` set too, one tile of a tile-unit
+        parameter: its row-major tile index."""
 
         fqn: str
         row_start: int
@@ -248,6 +251,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         cost_bytes: int
         col_start: int | None = None
         col_end: int | None = None
+        tile: int | None = None
 
     @dataclass(frozen=True)
     class _Fp8Chunk:
@@ -267,6 +271,12 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         # shard and payload are the [rows, cols] rectangle, row-major.
         col_start: int | None = None
         col_end: int | None = None
+        # A tile-unit parameter's chunk: tiles [tile_start, tile_end) in
+        # row-major tile order. Its local shard and payload stack the tiles,
+        # each row-major: a [tiles * block_size, block_size] matrix whose
+        # block rows are the tiles. row_start and row_end bound its rows.
+        tile_start: int | None = None
+        tile_end: int | None = None
 
     @dataclass(frozen=True)
     class _Fp8PackChunk:
@@ -355,6 +365,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         block_size: int = 128,
         fp8_dtype: torch.dtype = torch.float8_e4m3fn,
         column_blocks_for_long_rows: bool | None = None,
+        tile_units: bool | None = None,
     ) -> None:
         """``column_blocks_for_long_rows`` (experimental, default off; None reads
         ``FLEX_SHARD_FP8_COLUMN_BLOCKS=1``): own a 2-D weight by
@@ -362,7 +373,17 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         bucket's and its column blocks then match the bucket's row blocks, e.g.
         a transformer layer's w2 [D, F] next to weights with D-long rows. With
         every unit the same size, the bucket's rank segments need far less
-        padding. Distributed checkpointing isn't tested with it yet."""
+        padding. Distributed checkpointing isn't tested with it yet.
+
+        ``tile_units`` (experimental, default off; None reads
+        ``FLEX_SHARD_FP8_TILE_UNITS=1``): own every 2-D weight whose dims are
+        whole blocks by ``block_size`` x ``block_size`` tiles, and a 2-D weight
+        with a partial last block row by column blocks. Ranks then own
+        contiguous runs of equal tiles, so their segments need at most one tile
+        of padding even when a weight's block row is larger than a rank's
+        share, e.g. DeepSeek V3's attention output projection at 384 ranks. It
+        takes precedence over ``column_blocks_for_long_rows``. Distributed
+        checkpointing isn't tested with it yet."""
         if world_size <= 0:
             raise ValueError(
                 f"Fp8BucketedBlockShard world_size must be positive, got {world_size}."
@@ -383,6 +404,9 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                 os.environ.get("FLEX_SHARD_FP8_COLUMN_BLOCKS") == "1"
             )
         self.column_blocks_for_long_rows = column_blocks_for_long_rows
+        if tile_units is None:
+            tile_units = os.environ.get("FLEX_SHARD_FP8_TILE_UNITS") == "1"
+        self.tile_units = tile_units
         self._metadata_plans: dict[
             int,
             Fp8BucketedBlockShard._Fp8MetadataPlan,
@@ -394,12 +418,12 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         self._column_copy_out_plans: dict[
             int, Fp8BucketedBlockShard._ColumnCopyOutPlan
         ] = {}
-        self._column_boxes_by_metadata: dict[
+        self._box_shards_by_metadata: dict[
             int,
             tuple[
                 Fp8BucketedBlockShard._Fp8BucketMetadata,
                 tuple[str, ...],
-                dict[int, tuple[tuple[int, int, int, int], ...]],
+                dict[int, tuple[tuple[int, int, int, int, int, int], ...]],
             ],
         ] = {}
 
@@ -417,6 +441,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             and self.fp8_dtype == other.fp8_dtype
             and self.weight_factory is other.weight_factory
             and self.column_blocks_for_long_rows == other.column_blocks_for_long_rows
+            and self.tile_units == other.tile_units
         )
 
     def __hash__(self) -> int:
@@ -428,6 +453,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                 self.fp8_dtype,
                 id(self.weight_factory),
                 self.column_blocks_for_long_rows,
+                self.tile_units,
             )
         )
 
@@ -529,7 +555,17 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         """The parameters owned by column blocks: 2-D weights with rows longer
         than the row length most of the bucket's block rows have, as many rows
         as that length, and dims that are whole blocks, so each of their column
-        blocks has as many elements as the bucket's common row block."""
+        blocks has as many elements as the bucket's common row block. With
+        ``tile_units``, the 2-D weights that can't take tiles because their
+        last block row is partial but whose columns are whole blocks."""
+        if self.tile_units:
+            return frozenset(
+                param.fqn
+                for param in params
+                if len(param.global_shape) == 2
+                and param.matrix_shape[0] % self.block_size != 0
+                and param.matrix_shape[1] % self.block_size == 0
+            )
         if not self.column_blocks_for_long_rows or not params:
             return frozenset()
         block_rows_by_row_length: Counter[int] = Counter()
@@ -547,6 +583,26 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             and param.matrix_shape[1] % self.block_size == 0
         )
 
+    def _tile_fqns(self, params: list[_BlockRowParam]) -> frozenset[str]:
+        """With ``tile_units``, the 2-D weights whose dims are whole blocks."""
+        if not self.tile_units:
+            return frozenset()
+        return frozenset(
+            param.fqn
+            for param in params
+            if len(param.global_shape) == 2
+            and param.matrix_shape[0] % self.block_size == 0
+            and param.matrix_shape[1] % self.block_size == 0
+        )
+
+    def _is_tile_param(self, info: ParamInfo) -> bool:
+        return (
+            self.tile_units
+            and len(info.global_shape) == 2
+            and info.global_shape[0] % self.block_size == 0
+            and info.global_shape[1] % self.block_size == 0
+        )
+
     def _build_block_row_units(
         self,
         params: list[_BlockRowParam],
@@ -555,8 +611,29 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         scale_itemsize = torch.float32.itemsize
         units: list[Fp8BucketedBlockShard._BlockRowUnit] = []
         column_fqns = self._column_block_fqns(params)
+        tile_fqns = self._tile_fqns(params)
+        tile_numel = self.block_size * self.block_size
         for param in params:
             out_dim, in_dim = param.matrix_shape
+            if param.fqn in tile_fqns:
+                # Tiles in row-major tile order, each one block and one scale.
+                tile_cols = in_dim // self.block_size
+                for tile in range((out_dim // self.block_size) * tile_cols):
+                    row_start = tile // tile_cols * self.block_size
+                    col_start = tile % tile_cols * self.block_size
+                    units.append(
+                        Fp8BucketedBlockShard._BlockRowUnit(
+                            fqn=param.fqn,
+                            row_start=row_start,
+                            row_end=row_start + self.block_size,
+                            dense_numel=tile_numel,
+                            cost_bytes=tile_numel * fp8_itemsize + scale_itemsize,
+                            col_start=col_start,
+                            col_end=col_start + self.block_size,
+                            tile=tile,
+                        )
+                    )
+                continue
             if param.fqn in column_fqns:
                 # Column blocks left to right, each all rows wide.
                 dense_numel = out_dim * self.block_size
@@ -568,7 +645,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                             row_end=out_dim,
                             dense_numel=dense_numel,
                             cost_bytes=dense_numel * fp8_itemsize
-                            + (out_dim // self.block_size) * scale_itemsize,
+                            + _ceil_div(out_dim, self.block_size) * scale_itemsize,
                             col_start=col_start,
                             col_end=col_start + self.block_size,
                         )
@@ -675,7 +752,21 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                 row_end = last.row_end
                 scale_row_start = row_start // self.block_size
                 scale_row_end = _ceil_div(row_end, self.block_size)
-                if first.col_start is None:
+                tile_start = tile_end = None
+                if first.tile is not None:
+                    assert last.tile is not None
+                    tile_start, tile_end = first.tile, last.tile + 1
+                    col_start = col_end = None
+                    num_tiles = tile_end - tile_start
+                    global_dense_offset = (
+                        param.param_offset + tile_start * self.block_size**2
+                    )
+                    chunk_dense_numel = num_tiles * self.block_size**2
+                    scale_numel = num_tiles
+                    local_shape = torch.Size(
+                        (num_tiles * self.block_size, self.block_size)
+                    )
+                elif first.col_start is None:
                     col_start = col_end = None
                     chunk_cols = in_dim
                     # Row ranges keep the matrix's row-major order.
@@ -687,11 +778,13 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                     # Each column block holds out_dim * block_size elements of
                     # the bucket's dense order.
                     global_dense_offset = param.param_offset + col_start * out_dim
-                chunk_dense_numel = (row_end - row_start) * chunk_cols
-                scale_numel = (scale_row_end - scale_row_start) * _ceil_div(
-                    chunk_cols,
-                    self.block_size,
-                )
+                if first.tile is None:
+                    chunk_dense_numel = (row_end - row_start) * chunk_cols
+                    scale_numel = (scale_row_end - scale_row_start) * _ceil_div(
+                        chunk_cols,
+                        self.block_size,
+                    )
+                    local_shape = torch.Size((row_end - row_start, chunk_cols))
                 chunks.append(
                     Fp8BucketedBlockShard._Fp8Chunk(
                         rank=rank,
@@ -706,13 +799,15 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                         scale_offset=scale_offset,
                         col_start=col_start,
                         col_end=col_end,
+                        tile_start=tile_start,
+                        tile_end=tile_end,
                     )
                 )
                 rank_pack_chunks.append(
                     Fp8BucketedBlockShard._Fp8PackChunk(
                         param_index=param_indices_by_fqn[param.fqn],
                         fqn=param.fqn,
-                        local_shape=torch.Size((row_end - row_start, chunk_cols)),
+                        local_shape=local_shape,
                         fp8_numel=chunk_dense_numel,
                         scale_numel=scale_numel,
                     )
@@ -811,6 +906,9 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         chunk: _Fp8Chunk,
         in_dim: int,
     ) -> int:
+        if chunk.tile_start is not None:
+            assert chunk.tile_end is not None
+            return (chunk.tile_end - chunk.tile_start) * self.block_size**2
         if chunk.col_start is not None:
             assert chunk.col_end is not None
             in_dim = chunk.col_end - chunk.col_start
@@ -985,6 +1083,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             chunk.fqn: chunk for chunk in metadata.chunks if chunk.rank == rank
         }
         column_fqns = self._column_block_fqns(params)
+        tile_fqns = self._tile_fqns(params)
 
         bucket_param_layouts = {}
         storage_layouts: dict[str, BucketParamStorageLayout] = {}
@@ -994,7 +1093,21 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             # dims so the shard keeps the parameter's rank.
             stack_ones = (1,) * (len(param.global_shape) - 2)
             in_dim = param.global_shape[-1]
-            if param.fqn in column_fqns:
+            if param.fqn in tile_fqns:
+                # A tile-unit parameter's shard stacks its tiles.
+                if chunk is None:
+                    local_shape = torch.Size([0, self.block_size])
+                    local_numel = 0
+                    byte_offset = 0
+                    local_global_offset = param.param_offset
+                else:
+                    local_numel = self._chunk_numel(chunk, in_dim)
+                    local_shape = torch.Size(
+                        [local_numel // self.block_size, self.block_size]
+                    )
+                    byte_offset = chunk.rank_dense_offset * dtype.itemsize
+                    local_global_offset = chunk.global_dense_offset
+            elif param.fqn in column_fqns:
                 # A column-block parameter's shard is a [rows, cols] rectangle.
                 out_dim = param.global_shape[0]
                 if chunk is None:
@@ -1057,29 +1170,49 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         )
 
     @override
-    def _column_boxes(
+    def _box_shards(
         self, infos: list[ParamInfo]
-    ) -> dict[int, tuple[tuple[int, int, int, int], ...]]:
+    ) -> dict[int, tuple[tuple[int, int, int, int, int, int], ...]]:
+        """A column-block chunk is one box of all rows; a tile-unit chunk is a
+        box per tile."""
         metadata = self._fp8_metadata_from_infos(infos)
         fqns = tuple(info.fqn for info in infos)
-        cached = self._column_boxes_by_metadata.get(id(metadata))
+        cached = self._box_shards_by_metadata.get(id(metadata))
         if cached is not None and cached[0] is metadata and cached[1] == fqns:
             return cached[2]
         index_by_fqn = {fqn: index for index, fqn in enumerate(fqns)}
-        boxes: dict[int, list[tuple[int, int, int, int]]] = {}
+        boxes: dict[int, list[tuple[int, int, int, int, int, int]]] = {}
+        tile_numel = self.block_size**2
         for chunk in metadata.chunks:
-            if chunk.col_start is not None:
+            index = index_by_fqn[chunk.fqn]
+            if chunk.tile_start is not None:
+                assert chunk.tile_end is not None
+                tile_cols = infos[index].global_shape[-1] // self.block_size
+                boxes.setdefault(index, []).extend(
+                    (
+                        chunk.rank,
+                        chunk.global_dense_offset + i * tile_numel,
+                        tile // tile_cols * self.block_size,
+                        self.block_size,
+                        tile % tile_cols * self.block_size,
+                        self.block_size,
+                    )
+                    for i, tile in enumerate(range(chunk.tile_start, chunk.tile_end))
+                )
+            elif chunk.col_start is not None:
                 assert chunk.col_end is not None
-                boxes.setdefault(index_by_fqn[chunk.fqn], []).append(
+                boxes.setdefault(index, []).append(
                     (
                         chunk.rank,
                         chunk.global_dense_offset,
+                        0,
+                        chunk.row_end - chunk.row_start,
                         chunk.col_start,
                         chunk.col_end - chunk.col_start,
                     )
                 )
         result = {index: tuple(entries) for index, entries in boxes.items()}
-        self._column_boxes_by_metadata[id(metadata)] = (metadata, fqns, result)
+        self._box_shards_by_metadata[id(metadata)] = (metadata, fqns, result)
         return result
 
     def _column_shard_start(self, info: ParamInfo) -> int | None:
@@ -1090,12 +1223,37 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             info.local_numel == 0
             or len(info.global_shape) != 2
             or info.local_shape[-1] == info.global_shape[-1]
+            or self._is_tile_param(info)
         ):
             return None
         param_layout = self._param_layout(info)
         return (
             param_layout.local_global_offset - param_layout.param_offset
         ) // info.global_shape[0]
+
+    def _tile_shard_start(self, info: ParamInfo) -> int | None:
+        """The first tile of a tile-unit parameter's nonempty local shard,
+        else None."""
+        if info.local_numel == 0 or not self._is_tile_param(info):
+            return None
+        param_layout = self._param_layout(info)
+        return (
+            param_layout.local_global_offset - param_layout.param_offset
+        ) // self.block_size**2
+
+    def _tiles(self, matrix: torch.Tensor) -> torch.Tensor:
+        """A [rows, cols] matrix's tiles, row-major: [tiles, block, block]."""
+        rows, cols = matrix.shape
+        return (
+            matrix.reshape(
+                rows // self.block_size,
+                self.block_size,
+                cols // self.block_size,
+                self.block_size,
+            )
+            .transpose(1, 2)
+            .reshape(-1, self.block_size, self.block_size)
+        )
 
     @override
     def copy_param_to_storage(
@@ -1106,16 +1264,23 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         rank: int,
         world_size: int,
     ) -> None:
+        tile_start = self._tile_shard_start(info)
         col_start = self._column_shard_start(info)
-        if col_start is None:
+        if tile_start is None and col_start is None:
             super().copy_param_to_storage(byte_storage, info, param, rank, world_size)
             return
         param_data = param.detach()
         if param_data.device.type == "meta":
             return
-        shard = param_data.reshape(info.global_shape)[
-            :, col_start : col_start + info.local_shape[-1]
-        ].contiguous()
+        if tile_start is not None:
+            num_tiles = info.local_numel // self.block_size**2
+            shard = self._tiles(param_data.reshape(info.global_shape))[
+                tile_start : tile_start + num_tiles
+            ].contiguous()
+        else:
+            shard = param_data.reshape(info.global_shape)[
+                :, col_start : col_start + info.local_shape[-1]
+            ].contiguous()
         nbytes = shard.numel() * shard.element_size()
         byte_storage[info.byte_offset : info.byte_offset + nbytes].copy_(
             shard.view(-1).view(torch.uint8)
@@ -1126,10 +1291,31 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         self, info: ParamInfo, rank: int, world_size: int
     ) -> GlobalLayout:
         """Split this rank's matrix row range into one box per stacked matrix;
-        a column-block shard is one box of its columns."""
+        a column-block shard is one box of its columns, and a tile-unit shard
+        one box per tile."""
         global_shape = tuple(info.global_shape)
         if info.local_numel == 0:
             return GlobalLayout(global_shape, (), (), ())
+        tile_start = self._tile_shard_start(info)
+        if tile_start is not None:
+            tile_cols = global_shape[1] // self.block_size
+            tiles = range(
+                tile_start, tile_start + info.local_shape[0] // self.block_size
+            )
+            return GlobalLayout(
+                global_shape=global_shape,
+                global_offsets=tuple(
+                    (
+                        tile // tile_cols * self.block_size,
+                        tile % tile_cols * self.block_size,
+                    )
+                    for tile in tiles
+                ),
+                local_offsets=tuple(
+                    (i * self.block_size, 0) for i in range(len(tiles))
+                ),
+                local_sizes=((self.block_size, self.block_size),) * len(tiles),
+            )
         col_start = self._column_shard_start(info)
         if col_start is not None:
             return GlobalLayout(
@@ -1341,7 +1527,10 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             # Rank cuts partition one globally ordered block-row stream. Joining
             # each rank's valid regions therefore restores parameter order without
             # scattering every chunk separately.
-            if any(chunk.col_start is not None for chunk in metadata.chunks):
+            if any(
+                chunk.col_start is not None or chunk.tile_start is not None
+                for chunk in metadata.chunks
+            ):
                 self._copy_out_with_column_chunks(
                     metadata,
                     state.infos,
@@ -1435,7 +1624,43 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                 metadata.rank_scale_byte_offsets[chunk.rank]
                 + chunk.scale_offset * scale_nbytes
             )
-            if chunk.col_start is None:
+            if chunk.tile_start is not None:
+                assert chunk.tile_end is not None
+                # Each tile is a row-major block; consecutive tiles of one
+                # tile row have consecutive scales.
+                tile_cols = in_dim // self.block_size
+                for i, tile in enumerate(range(chunk.tile_start, chunk.tile_end)):
+                    tile_row, tile_col = divmod(tile, tile_cols)
+                    boxes.append(
+                        (
+                            chunk.rank,
+                            fp8_src + i * self.block_size**2,
+                            self.block_size,
+                            self.block_size,
+                            fp8_base
+                            + tile_row * self.block_size * in_dim
+                            + tile_col * self.block_size,
+                            in_dim,
+                        )
+                    )
+                tile = chunk.tile_start
+                while tile < chunk.tile_end:
+                    tile_row, tile_col = divmod(tile, tile_cols)
+                    run = min(chunk.tile_end, (tile_row + 1) * tile_cols) - tile
+                    boxes.append(
+                        (
+                            chunk.rank,
+                            scale_src + (tile - chunk.tile_start) * scale_nbytes,
+                            1,
+                            run * scale_nbytes,
+                            scale_byte_offset
+                            + (scale_base + tile_row * scale_cols + tile_col)
+                            * scale_nbytes,
+                            scale_cols * scale_nbytes,
+                        )
+                    )
+                    tile += run
+            elif chunk.col_start is None:
                 regions.append(
                     (
                         chunk.rank,

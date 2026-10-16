@@ -603,10 +603,10 @@ class BucketedBlockShard(Placement):
         # The gcd of every offset and length above.
         alignment: int
         descriptors: dict[tuple[torch.device, int], Any]
-        # Column-rectangle shards (see _column_boxes) as (param index,
-        # destination offset, first column, columns): the grad's columns,
-        # row-major, at the destination.
-        box_copies: tuple[tuple[int, int, int, int], ...] = ()
+        # Rectangle shards (see _box_shards) as (param index, destination
+        # offset, first row, rows, first column, columns): the grad's
+        # rectangle, row-major, at the destination.
+        box_copies: tuple[tuple[int, int, int, int, int, int], ...] = ()
 
     def __init__(
         self,
@@ -1107,13 +1107,13 @@ class BucketedBlockShard(Placement):
                 return None
         return bucket
 
-    def _column_boxes(
+    def _box_shards(
         self, infos: list[ParamInfo]
-    ) -> dict[int, tuple[tuple[int, int, int, int], ...]]:
-        """By parameter index, the rank shards that are column rectangles of a
-        2-D parameter rather than ranges of its row-major elements, as (rank,
-        bucket offset, first column, columns); each is row-major in the
-        bucket's order. BucketedBlockShard has none."""
+    ) -> dict[int, tuple[tuple[int, int, int, int, int, int], ...]]:
+        """By parameter index, the rank shards that are rectangles of a 2-D
+        parameter rather than ranges of its row-major elements, as (rank,
+        bucket offset, first row, rows, first column, columns); each is
+        row-major in the bucket's order. BucketedBlockShard has none."""
         return {}
 
     def _reduce_copy_in_plan(
@@ -1133,8 +1133,8 @@ class BucketedBlockShard(Placement):
         ]
         param_segments: list[list[tuple[int, int, int]]] = [[] for _ in infos]
         zero_segments: list[tuple[int, int]] = []
-        column_boxes = self._column_boxes(infos)
-        box_copies: list[tuple[int, int, int, int]] = []
+        box_shards = self._box_shards(infos)
+        box_copies: list[tuple[int, int, int, int, int, int]] = []
         for rank, (rank_offset, rank_numel) in enumerate(
             zip(bucket_layout.rank_offsets, bucket_layout.rank_numels, strict=True)
         ):
@@ -1143,13 +1143,20 @@ class BucketedBlockShard(Placement):
             for index, (segments, (param_offset, param_numel)) in enumerate(
                 zip(param_segments, param_ranges, strict=True)
             ):
-                if index in column_boxes:
-                    rows = infos[index].global_shape[0]
-                    for box_rank, bucket_offset, col_start, cols in column_boxes[index]:
+                if index in box_shards:
+                    for box in box_shards[index]:
+                        box_rank, bucket_offset, first_row, rows, col_start, cols = box
                         if box_rank == rank:
                             start = bucket_offset - rank_offset
                             box_copies.append(
-                                (index, row_start + start, col_start, cols)
+                                (
+                                    index,
+                                    row_start + start,
+                                    first_row,
+                                    rows,
+                                    col_start,
+                                    cols,
+                                )
                             )
                             covered.append((start, start + rows * cols))
                     continue
@@ -1241,13 +1248,8 @@ class BucketedBlockShard(Placement):
         out = send_rows.as_strided(
             ((send_rows.size(0) - 1) * row_stride + send_rows.size(1),), (1,)
         )
-        # Column rectangles: one strided copy each.
-        for index, offset, col_start, cols in plan.box_copies:
-            rows = tensors[index].shape[0]
-            _copy_box_(
-                out[offset : offset + rows * cols].view(rows, cols),
-                tensors[index][:, col_start : col_start + cols],
-            )
+        if plan.box_copies:
+            self._pack_box_copies(tensors, infos, out, plan)
         sources = [tensor.view(-1) for tensor in tensors]
         itemsize = out.element_size()
         unit_nbytes = next(
@@ -1301,6 +1303,71 @@ class BucketedBlockShard(Placement):
             copy_segments_triton(source, out, descriptor)
         zero_segments_triton(out, zero_descriptor)
 
+    def _pack_box_copies(
+        self,
+        tensors: list[torch.Tensor],
+        infos: list[ParamInfo],
+        out: torch.Tensor,
+        plan: BucketedBlockShard._ReduceCopyInPlan,
+    ) -> None:
+        """Copy the rectangle shards into ``out``: one box-copy kernel per grad,
+        from device plans built once per bucket layout and row stride."""
+        from ._copy_kernels import BoxCopyDescriptor, copy_boxes_triton
+
+        itemsize = out.element_size()
+        out_bytes = out.view(torch.uint8)
+        indices = sorted({copy[0] for copy in plan.box_copies})
+        # The copy unit divides every base address, so plans are kept per
+        # alignment.
+        alignment = math.gcd(
+            8, out.data_ptr(), *(tensors[index].data_ptr() for index in indices)
+        )
+        key = ("boxes", out.device, alignment)
+        descriptors = plan.descriptors.get(key)
+        if descriptors is None:
+            boxes_by_index: dict[int, list[tuple[int, int, int, int, int, int]]] = {}
+            for index, offset, first_row, rows, col_start, cols in plan.box_copies:
+                cols_total = infos[index].global_shape[-1]
+                boxes_by_index.setdefault(index, []).append(
+                    (
+                        (first_row * cols_total + col_start) * itemsize,
+                        rows,
+                        cols * itemsize,
+                        cols_total * itemsize,
+                        offset * itemsize,
+                        cols * itemsize,
+                    )
+                )
+            descriptors = {}
+            for index, boxes in boxes_by_index.items():
+                unit = next(
+                    unit
+                    for unit in (8, 4, 2, 1)
+                    if all(value % unit == 0 for box in boxes for value in box[2:])
+                    and all(box[0] % unit == 0 for box in boxes)
+                    and alignment % unit == 0
+                )
+                descriptors[index] = BoxCopyDescriptor.create(
+                    [
+                        (
+                            src // unit,
+                            rows,
+                            row // unit,
+                            stride // unit,
+                            dst // unit,
+                            dst_stride // unit,
+                        )
+                        for src, rows, row, stride, dst, dst_stride in boxes
+                    ],
+                    unit_nbytes=unit,
+                    device=out.device,
+                )
+            plan.descriptors[key] = descriptors
+        for index, descriptor in descriptors.items():
+            copy_boxes_triton(
+                tensors[index].reshape(-1).view(torch.uint8), out_bytes, descriptor
+            )
+
     @override
     def prepare_reduce_grad(
         self,
@@ -1321,10 +1388,10 @@ class BucketedBlockShard(Placement):
             debug_fqn=debug_fqn,
             padded_segment_numel=padded_segment_numel,
         )
-        column_boxes = self._column_boxes(infos)
+        box_shards = self._box_shards(infos)
         if (
             world_size * padded_segment_numel == bucket_layout.global_numel
-            and not column_boxes
+            and not box_shards
         ):
             grad_bucket = self._gradient_bucket_of(
                 tensors, infos, bucket_layout.global_numel, dtype
@@ -1368,16 +1435,19 @@ class BucketedBlockShard(Placement):
             copy_dsts: list[torch.Tensor] = []
             copy_srcs: list[torch.Tensor] = []
             for index, (tensor, info) in enumerate(zip(tensors, infos, strict=True)):
-                if index in column_boxes:
-                    # Each rank's columns, row-major, in the bucket's order.
-                    rows = info.global_shape[0]
+                if index in box_shards:
+                    # Each rank's rectangles, row-major, in the bucket's order.
                     grad = tensor.reshape(info.global_shape)
-                    for _, bucket_offset, col_start, cols in column_boxes[index]:
+                    for box in box_shards[index]:
+                        _, bucket_offset, first_row, rows, col_start, cols = box
                         _copy_box_(
                             global_grad_bucket[
                                 bucket_offset : bucket_offset + rows * cols
                             ].view(rows, cols),
-                            grad[:, col_start : col_start + cols],
+                            grad[
+                                first_row : first_row + rows,
+                                col_start : col_start + cols,
+                            ],
                         )
                     continue
                 param_layout = self._param_layout(info)
