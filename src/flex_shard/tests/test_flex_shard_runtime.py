@@ -556,11 +556,11 @@ class TestFlexShardEagerRuntime(TestCase):
             others_unsharded = []
             finish_unshard = bucket_runtime.BucketRuntime.finish_unshard
 
-            def counting_finish_unshard(bucket, result):
+            def counting_finish_unshard(bucket, result, **kwargs):
                 others_unsharded.append(
                     sum(b.is_unsharded for b in buckets if b is not bucket)
                 )
-                return finish_unshard(bucket, result)
+                return finish_unshard(bucket, result, **kwargs)
 
             with patch.object(
                 bucket_runtime.BucketRuntime, "finish_unshard", counting_finish_unshard
@@ -614,6 +614,55 @@ class TestFlexShardEagerRuntime(TestCase):
             # All but the first unshard of forward and of backward were prefetched.
             self.assertEqual(sum(hits), 4)
 
+    def test_forward_gathers_overlap_previous_copy_out(self):
+        # As FSDP2's forward with implicit prefetching: a forward unshard keeps
+        # its buffers past its copy-out until the next unshard finishes or the
+        # root module's forward ends, and the next bucket's prefetch doesn't
+        # order the unshard stream after the current stream (which holds that
+        # copy-out). The forward's first unshard and backward's unshards still
+        # wait on it.
+        with single_rank_cuda_mesh() as mesh:
+            model = nn.Sequential(*(nn.Linear(8, 8) for _ in range(3)))
+            flex_shard(
+                model,
+                buckets=[
+                    _bucket([f"{idx}.*"], mesh, reshard_after_forward=True)
+                    for idx in range(3)
+                ],
+            )
+            (context,) = model._flex_shard_eager_comm_contexts.values()
+            x = torch.randn(4, 8, device="cuda")
+            model(x).sum().backward()
+            begin = bucket_runtime.begin_bucket_unshard
+            finish_unshard = bucket_runtime.BucketRuntime.finish_unshard
+            waits = []
+            deferred = []
+
+            def recording_begin(*args, wait_current_stream=True, **kwargs):
+                waits.append(wait_current_stream)
+                return begin(*args, wait_current_stream=wait_current_stream, **kwargs)
+
+            def recording_finish(bucket, result, **kwargs):
+                finish_unshard(bucket, result, **kwargs)
+                deferred.append(context.deferred_unshard_release is not None)
+
+            with (
+                patch.object(bucket_runtime, "begin_bucket_unshard", recording_begin),
+                patch.object(
+                    bucket_runtime.BucketRuntime, "finish_unshard", recording_finish
+                ),
+            ):
+                loss = model(x).sum()
+                self.assertIsNone(context.deferred_unshard_release)
+                self.assertEqual(waits, [True, False, False])
+                self.assertEqual(deferred, [True, True, True])
+                loss.backward()
+            self.assertEqual(waits, [True, False, False, True, True, True])
+            self.assertEqual(deferred, [True, True, True, False, False, False])
+            self.assertIsNone(context.deferred_unshard_release)
+            for param in model.parameters():
+                self.assertIsNotNone(param.grad)
+
     def test_explicit_prefetch_replaces_learned_order(self):
         # As torchtitan sets FSDP2's explicit prefetch: in forward, the first
         # bucket prefetches the next two; in backward, the last bucket the
@@ -653,9 +702,9 @@ class TestFlexShardEagerRuntime(TestCase):
                 hits.append(result is not None)
                 return result
 
-            def counting_finish_unshard(bucket, result):
+            def counting_finish_unshard(bucket, result, **kwargs):
                 in_flight.append(len(bucket.context.pending_unshards))
-                return finish_unshard(bucket, result)
+                return finish_unshard(bucket, result, **kwargs)
 
             for _ in range(2):
                 optim.zero_grad()

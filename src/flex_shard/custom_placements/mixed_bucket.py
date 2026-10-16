@@ -598,6 +598,10 @@ class MixedBucketPlacement(Placement):
         return PlacementPreparedUnshard(
             placement=self,
             buffers=[send, gathered, *group_buffers],
+            # Run gathers into ``gathered``; finish copies each group into a
+            # refill's persistent buffers. Owner rows (above) gather straight
+            # into them.
+            run_writes_persistent_buffers=False,
             placement_state=_MixedUnshardState(
                 groups=group_states,
                 world_size=world_size,

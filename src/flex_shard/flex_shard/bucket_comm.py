@@ -30,6 +30,13 @@ class UnshardHandle:
         """Wait for the unshard and return its full params (once)."""
         raise NotImplementedError
 
+    def finish_deferring_release(
+        self,
+    ) -> tuple[PlacementUnshardResult, DeferredUnshardRelease | None]:
+        """Finish, but keep the buffers past the copy-out and return them to
+        release later, or None if there are none to keep."""
+        return self.finish(), None
+
     def wait(self) -> None:
         """Wait until the unshard result is usable on the current stream."""
         raise NotImplementedError
@@ -98,6 +105,7 @@ def begin_bucket_unshard(
     unshard_stream: torch.Stream,
     debug_fqn: str | None = None,
     persistent_buffers: list[torch.Tensor] | None = None,
+    wait_current_stream: bool = True,
 ) -> UnshardHandle:
     """Begin a bucket unshard and return a handle for full params.
 
@@ -107,6 +115,16 @@ def begin_bucket_unshard(
     run or in finish as the placement chooses. Their storage is re-allocated on
     the current stream already, or, if the placement refills them in finish,
     is re-allocated before finish.
+
+    The unshard stream waits on the current stream before the copy-in, unless
+    ``wait_current_stream`` is False, for a forward prefetch: FSDP2's implicit
+    forward prefetches don't order their all-gather streams after the current
+    stream either, so the gather need not wait for the copy-out of the bucket
+    before it. The forward's first unshard already ordered the unshard stream
+    after the optimizer step, and releasing the previous unshard's buffers
+    (``DeferredUnshardRelease``) orders the reuse of their memory. Run still
+    waits on the current stream if it writes persistent buffers whose storage
+    the current stream re-allocated.
     """
     placement = _get_bucket_placement(infos, "unshard")
 
@@ -120,10 +138,17 @@ def begin_bucket_unshard(
     copy_in_done = device_handle.Event()
     copy_in_done.record(device_handle.current_stream(device))
     with device_handle.stream(unshard_stream):
-        unshard_stream.wait_event(copy_in_done)
+        if wait_current_stream:
+            unshard_stream.wait_event(copy_in_done)
         prepared = placement.prepare_unshard_bucket(tensors, infos, mesh, debug_fqn)
         prepared.persistent = True
         prepared.persistent_buffers = persistent_buffers
+        if (
+            not wait_current_stream
+            and persistent_buffers is not None
+            and prepared.run_writes_persistent_buffers
+        ):
+            unshard_stream.wait_event(copy_in_done)
         if persistent_buffers is None:
             prepared.placement.run_prepared_unshard(prepared)
         else:
@@ -248,6 +273,16 @@ class AsyncUnshardResult(UnshardHandle):
         self._device = _first_tensor_device(self.prepared.buffers)
 
     def finish(self) -> PlacementUnshardResult:
+        return self._finish(defer_release=False)[0]
+
+    def finish_deferring_release(
+        self,
+    ) -> tuple[PlacementUnshardResult, DeferredUnshardRelease | None]:
+        return self._finish(defer_release=True)
+
+    def _finish(
+        self, *, defer_release: bool
+    ) -> tuple[PlacementUnshardResult, DeferredUnshardRelease | None]:
         if self._finished:
             raise RuntimeError("An unshard may only be finished once.")
         self._finished = True
@@ -255,10 +290,19 @@ class AsyncUnshardResult(UnshardHandle):
         result = self.prepared.placement.finish_prepared_unshard(self.prepared)
         # Only work queued so far on the current stream (the copy-out) reads
         # the prepare and finish buffers.
-        self._release([*self.prepared.buffers, *result.buffers])
+        buffers = [*self.prepared.buffers, *result.buffers]
         self.prepared.buffers.clear()
         result.buffers.clear()
-        return result
+        if not defer_release or not buffers:
+            self._release(buffers)
+            return result, None
+        current_stream = self.device_handle.current_stream(buffers[0].device)
+        copy_out_done = self.device_handle.Event()
+        copy_out_done.record(current_stream)
+        handoff = StreamHandoff(
+            buffers, (self.unshard_stream, current_stream), self.device_handle
+        )
+        return result, DeferredUnshardRelease(handoff, copy_out_done)
 
     def wait(self) -> None:
         if self._device is not None:
@@ -450,3 +494,18 @@ class StreamHandoff:
         event = self._device_handle.Event()
         event.record(self._device_handle.current_stream(device))
         self.release_after(event)
+
+
+@dataclass
+class DeferredUnshardRelease:
+    """A finished unshard's buffers, kept past its copy-out so that the next
+    unshard's gather can overlap it, as FSDP2 keeps a forward all-gather result
+    in ``AllGatherState`` until the next copy-out."""
+
+    handoff: StreamHandoff
+    copy_out_done: torch.Event
+
+    def release(self) -> None:
+        """Order the buffers' allocation streams after the copy-out, then drop
+        them."""
+        self.handoff.release_after(self.copy_out_done)

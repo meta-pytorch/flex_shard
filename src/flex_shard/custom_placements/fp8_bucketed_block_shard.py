@@ -1382,6 +1382,9 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                 debug_fqn=debug_fqn,
                 metadata=metadata,
             ),
+            # Run gathers into its own buffer; finish copies into a refill's
+            # persistent buffer.
+            run_writes_persistent_buffers=False,
         )
 
     @override

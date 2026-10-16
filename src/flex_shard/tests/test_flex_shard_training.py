@@ -508,11 +508,17 @@ class TestFlexShardTraining(FSDPTest):
                     output = model[0](x)
         before_forward_hook.remove()
 
-        # The unshard copied the gathered bucket into the persistent buffers, so
-        # the all-gather output is reusable before module compute and backward.
-        self.assertTrue(reused_before_forward)
+        # The unshard copied the gathered bucket into the persistent buffers. In
+        # forward it keeps the all-gather output past that copy-out, as FSDP2
+        # does with implicit prefetching, so the next bucket's gather can
+        # overlap it: the output isn't reusable before module compute.
+        self.assertFalse(reused_before_forward)
         if not run_backward:
             self.assertEqual(output, x)
+            # A reshard releases it, as the next unshard or the end of the
+            # root module's forward would.
+            model.reshard()
+            self.assertTrue(try_reuse_gathered_buffer())
             return
 
         torch.cuda._sleep(500_000_000)
@@ -521,6 +527,8 @@ class TestFlexShardTraining(FSDPTest):
         output.sum().backward()
         self.assertTrue(backward_delay_done.query())
         self.assertEqual(x.grad, torch.ones_like(x))
+        # The end of backward releases it.
+        self.assertTrue(try_reuse_gathered_buffer())
 
     @skip_if_lt_x_gpu(2)
     def test_unshard_buffer_lifetime(self):
