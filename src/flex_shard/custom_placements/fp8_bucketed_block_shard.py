@@ -1515,6 +1515,10 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                     scale_byte_offset=scale_byte_offset,
                 )
 
+        if prepared.persistent_buffers is not None:
+            # A refill: the caller keeps the full params of the first unshard,
+            # which view the persistent buffer (see PlacementUnshardResult).
+            return PlacementUnshardResult(full_params=[], persistent_buffers=[compact])
         fp8_flat = fp8_bytes.view(self.fp8_dtype)
         scale_flat = scale_bytes.view(torch.float32)
         fp8_offset = 0
@@ -1658,8 +1662,10 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         *,
         scale_byte_offset: int,
     ) -> None:
-        """Copy row chunks with one segment kernel (on CUDA, in eager mode) and
-        each column-block rectangle with one strided copy (``_copy_box_``)."""
+        """Copy row chunks with one segment kernel and column-block rectangles
+        with one box kernel per copy unit (on CUDA, in eager mode); otherwise
+        with one copy per chunk and one strided copy per rectangle
+        (``_copy_box_``)."""
         plan = self._column_copy_out_plan(metadata, infos, scale_byte_offset)
         row_stride = rank_rows.stride(0)
         if (
@@ -1704,6 +1710,30 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                 compact[out_offset : out_offset + nbytes].copy_(
                     rank_rows[rank, offset : offset + nbytes]
                 )
+        if (
+            plan.boxes
+            and rank_rows.device.type == "cuda"
+            and not torch.compiler.is_compiling()
+        ):
+            # A Python copy per rectangle costs more CPU than the copy itself
+            # takes on the GPU (a 405B layer has about 140 rectangles per gather).
+            base_unit = next(
+                unit
+                for unit in (8, 4, 2, 1)
+                if rank_rows.data_ptr() % unit == 0 and compact.data_ptr() % unit == 0
+            )
+            key = ("boxes", rank_rows.device, row_stride, base_unit)
+            box_descriptors = plan.descriptors.get(key)
+            if box_descriptors is None:
+                box_descriptors = self._box_copy_descriptors(
+                    plan.boxes, row_stride, base_unit, rank_rows.device
+                )
+                plan.descriptors[key] = box_descriptors
+            from ._copy_kernels import copy_boxes_triton
+
+            for descriptor in box_descriptors:
+                copy_boxes_triton(rank_rows, compact, descriptor)
+            return
         for rank, offset, rows, row_nbytes, out_offset, out_stride in plan.boxes:
             box = rank_rows[rank, offset : offset + rows * row_nbytes].view(
                 rows, row_nbytes
@@ -1714,6 +1744,46 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                 ].as_strided((rows, row_nbytes), (out_stride, 1)),
                 box,
             )
+
+    @staticmethod
+    def _box_copy_descriptors(
+        boxes: tuple[tuple[int, int, int, int, int, int], ...],
+        row_stride: int,
+        base_unit: int,
+        device: torch.device,
+    ):
+        """One box-copy descriptor per copy unit: each rectangle copies through
+        the widest unit (at most ``base_unit``) dividing its offsets, row bytes
+        and row strides."""
+        from ._copy_kernels import BoxCopyDescriptor
+
+        by_unit: dict[int, list[tuple[int, int, int, int, int, int]]] = {}
+        for rank, offset, rows, row_nbytes, out_offset, out_stride in boxes:
+            src_offset = rank * row_stride + offset
+            unit = next(
+                unit
+                for unit in (8, 4, 2, 1)
+                if unit <= base_unit
+                and src_offset % unit == 0
+                and row_nbytes % unit == 0
+                and out_offset % unit == 0
+                and out_stride % unit == 0
+            )
+            # A rectangle's rows are contiguous in the rank's row.
+            by_unit.setdefault(unit, []).append(
+                (
+                    src_offset // unit,
+                    rows,
+                    row_nbytes // unit,
+                    row_nbytes // unit,
+                    out_offset // unit,
+                    out_stride // unit,
+                )
+            )
+        return tuple(
+            BoxCopyDescriptor.create(unit_boxes, unit_nbytes=unit, device=device)
+            for unit, unit_boxes in sorted(by_unit.items(), reverse=True)
+        )
 
     def _copy_out_plan(
         self,
