@@ -5,18 +5,29 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+import os
+from typing import Any
 
 import torch
 import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.func import functional_call
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import FSDPTest, get_devtype
 from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.distributed.checkpoint_utils import with_temp_dir
 from torchao.utils import is_sm_at_least_90
 
-from .. import BucketSpec, flex_shard
+from .. import (
+    BucketSpec,
+    flex_shard,
+    get_global_layout,
+    GlobalLayout,
+    register_optimizer_checkpoint_hook,
+    set_state_dict_global_layouts,
+)
 from ..blockwise_fp8 import (
     BlockwiseFp8Weight,
     convert_to_flex_shard_float8_blockwise_linear,
@@ -664,6 +675,250 @@ class TestBlockwiseFp8FlexShardTraining(FSDPTest):
                 f"logits diverged at step {step}",
             )
             self.assertTrue(torch.equal(row_loss, layout_loss))
+
+
+def _local_from_full(
+    full: torch.Tensor, layout: GlobalLayout, local_shape: torch.Size
+) -> torch.Tensor:
+    """The local shard that ``layout`` describes, cut out of the full tensor."""
+    local = torch.zeros(local_shape, dtype=full.dtype, device=full.device)
+    for global_offset, local_offset, size in zip(
+        layout.global_offsets, layout.local_offsets, layout.local_sizes, strict=True
+    ):
+        dst = local[tuple(slice(o, o + n) for o, n in zip(local_offset, size))]
+        dst.copy_(full[tuple(slice(o, o + n) for o, n in zip(global_offset, size))])
+    return local
+
+
+# A model and its optimizer.
+_Trained = tuple[nn.Module, torch.optim.Optimizer]
+
+
+class _BlockwiseFp8CheckpointRoundTrip(FSDPTest):
+    """Saves a FlexShard model with FP8 linears and AdamW state under one FP8
+    layout and split, and loads it under another, checking both against an
+    unsharded reference bit for bit.
+
+    Layouts: "rows" owns every linear by 128-row blocks; "columns" owns the
+    long-row w2 by 128-column blocks (``column_blocks_for_long_rows``), each
+    rank's share one rectangle of columns. A split over ``num_shards`` ranks
+    shards over them and replicates over the other ranks.
+    """
+
+    def _mesh(self, num_shards: int):
+        return init_device_mesh(
+            device_type.type,
+            (self.world_size // num_shards, num_shards),
+            mesh_dim_names=("replicate", "shard"),
+        )["shard"]
+
+    def _model(self) -> nn.Module:
+        # The output projection's 2,048 rows put the ranks' boundaries inside w2
+        # ([256, 1024], 8 column blocks), so its column blocks split across ranks.
+        torch.manual_seed(0)
+        _, model = make_transformer_model(
+            device=device_type,
+            n_layers=1,
+            vocab_size=2048,
+            max_seq_len=8,
+            dim=256,
+            n_heads=4,
+        )
+        model.to(dtype=torch.bfloat16)
+        convert_to_flex_shard_float8_blockwise_linear(model, use_triton=False)
+        return model
+
+    def _adamw(self, model: nn.Module) -> torch.optim.Optimizer:
+        # Single-tensor AdamW, so local shards match the reference bit for bit.
+        return torch.optim.AdamW(
+            model.parameters(), lr=0.1, weight_decay=0.1, foreach=False
+        )
+
+    def _shard(self, layout: str, model: nn.Module, mesh) -> torch.optim.Optimizer:
+        linear_weight_fqns = [
+            f"{fqn}.weight"
+            for fqn, module in model.named_modules()
+            if isinstance(module, nn.Linear)
+        ]
+        other_param_fqns = [
+            fqn
+            for fqn, _ in model.named_parameters()
+            if fqn not in set(linear_weight_fqns)
+        ]
+        flex_shard(
+            model,
+            buckets=[
+                BucketSpec(
+                    linear_weight_fqns,
+                    placement_fn=make_fp8_bucketed_block_placement_fn(
+                        weight_factory=BlockwiseFp8Weight,
+                        block_size=128,
+                        column_blocks_for_long_rows=layout == "columns",
+                    ),
+                    mesh=mesh,
+                    reshard_after_forward=True,
+                ),
+                BucketSpec(
+                    other_param_fqns,
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    reshard_after_forward=True,
+                ),
+            ],
+        )
+        if layout == "columns" and mesh.size() > 1:
+            infos = list(model.sharded_bucket_storages[0].param_infos.values())
+            chunks = infos[0].placement._fp8_metadata_from_infos(infos).chunks
+            self.assertEqual(
+                {chunk.fqn for chunk in chunks if chunk.col_start is not None},
+                {"layers.0.feed_forward.w2.weight"},
+            )
+            # Two ranks each own a rectangle of w2's columns.
+            self.assertGreater(
+                len(
+                    {
+                        chunk.rank
+                        for chunk in chunks
+                        if chunk.fqn == "layers.0.feed_forward.w2.weight"
+                    }
+                ),
+                1,
+            )
+        optimizer = self._adamw(model)
+        register_optimizer_checkpoint_hook(optimizer, model)
+        return optimizer
+
+    def _layouts(self, model: nn.Module) -> dict[str, GlobalLayout]:
+        state_dict = model.state_dict()
+        set_state_dict_global_layouts(model, state_dict)
+        return {fqn: get_global_layout(tensor) for fqn, tensor in state_dict.items()}
+
+    def _step(self, reference: _Trained, sharded: _Trained, seed: int) -> None:
+        """Step both with the same random gradients."""
+        generator = torch.Generator().manual_seed(seed)
+        grads = {
+            fqn: torch.randn(param.shape, generator=generator)
+            .to(device_type)
+            .to(param.dtype)
+            for fqn, param in reference[0].named_parameters()
+        }
+        for fqn, param in reference[0].named_parameters():
+            param.grad = grads[fqn]
+        reference[1].step()
+        layouts = self._layouts(sharded[0])
+        for fqn, param in sharded[0].named_parameters():
+            param.grad = _local_from_full(grads[fqn], layouts[fqn], param.shape)
+        sharded[1].step()
+
+    def _check(self, reference: _Trained, sharded: _Trained) -> None:
+        """Check the local parameters and states against the reference's, bit for bit."""
+        layouts = self._layouts(sharded[0])
+        params = dict(sharded[0].named_parameters())
+        for fqn, reference_param in reference[0].named_parameters():
+            param = params[fqn]
+            reference_state = reference[1].state[reference_param]
+            state = sharded[1].state[param]
+            self.assertEqual(state.keys(), reference_state.keys())
+            self.assertEqual(state["step"], reference_state["step"])
+            for full, local in (
+                (reference_param.detach(), param.detach()),
+                *(
+                    (reference_state[name], state[name])
+                    for name in state
+                    if name != "step"
+                ),
+            ):
+                self.assertEqual(
+                    local,
+                    _local_from_full(full, layouts[fqn], local.shape),
+                    atol=0,
+                    rtol=0,
+                    msg=fqn,
+                )
+
+    def _checkpoint(self, trained: _Trained) -> dict[str, Any]:
+        model, optimizer = trained
+        model_state_dict = model.state_dict()
+        set_state_dict_global_layouts(model, model_state_dict)
+        return {"model": model_state_dict, "optim": optimizer.state_dict()}
+
+    def _round_trip(
+        self,
+        save: tuple[str, int],
+        load: tuple[str, int],
+        meshes: dict[int, Any],
+        checkpoint_dir: str,
+    ) -> None:
+        (save_layout, save_shards), (load_layout, load_shards) = save, load
+        reference_model = self._model()
+        model = copy.deepcopy(reference_model)
+        reference = (reference_model, self._adamw(reference_model))
+        saved = (model, self._shard(save_layout, model, meshes[save_shards]))
+        for seed in (1, 2):
+            self._step(reference, saved, seed)
+        self._check(reference, saved)
+        dcp.save(self._checkpoint(saved), checkpoint_id=checkpoint_dir)
+
+        torch.manual_seed(1)
+        model = self._model()
+        for param in model.parameters():
+            param.detach().fill_(-1)
+        loaded = (model, self._shard(load_layout, model, meshes[load_shards]))
+        # Create the states that DCP loads into.
+        for param in model.parameters():
+            param.grad = torch.zeros_like(param)
+        loaded[1].step()
+        state_dict = self._checkpoint(loaded)
+        dcp.load(state_dict, checkpoint_id=checkpoint_dir)
+        model.load_state_dict(state_dict["model"])
+        loaded[1].load_state_dict(state_dict["optim"])
+        self._check(reference, loaded)
+        # Training continues as it would have without the round trip.
+        self._step(reference, loaded, seed=3)
+        self._check(reference, loaded)
+
+    def _run_round_trips(self) -> None:
+        if not is_sm_at_least_90():
+            self.skipTest("Float8BlockwiseLinear requires CUDA SM90+")
+        all_shards, half_shards = self.world_size, self.world_size // 2
+        meshes = {
+            num_shards: self._mesh(num_shards)
+            for num_shards in (all_shards, half_shards)
+        }
+        for save, load in (
+            (("columns", all_shards), ("columns", all_shards)),
+            (("columns", all_shards), ("rows", all_shards)),
+            (("rows", all_shards), ("columns", all_shards)),
+            (("columns", all_shards), ("columns", half_shards)),
+            (("columns", half_shards), ("columns", all_shards)),
+        ):
+            with self.subTest(save=save, load=load):
+                checkpoint_dir = os.path.join(
+                    self.temp_dir, f"{save[0]}_{save[1]}_to_{load[0]}_{load[1]}"
+                )
+                self._round_trip(save, load, meshes, checkpoint_dir)
+
+
+class TestBlockwiseFp8CheckpointTwoRanks(_BlockwiseFp8CheckpointRoundTrip):
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    @skip_if_lt_x_gpu(2)
+    @with_temp_dir
+    def test_dcp_round_trip(self) -> None:
+        self._run_round_trips()
+
+
+class TestBlockwiseFp8CheckpointFourRanks(_BlockwiseFp8CheckpointRoundTrip):
+    @property
+    def world_size(self) -> int:
+        return 4
+
+    @skip_if_lt_x_gpu(4)
+    @with_temp_dir
+    def test_dcp_round_trip(self) -> None:
+        self._run_round_trips()
 
 
 class TestBlockwiseFp8GroupedMM(TestCase):
