@@ -815,7 +815,7 @@ class BucketRuntime:
             result = begin_reduce_grad(
                 grads,
                 infos,
-                self.bucket_storage._mesh,
+                self.bucket_storage.reduce_mesh,
                 self.bucket_storage.gradient_reduction,
                 reduce_grad_stream,
                 debug_fqn=self.debug_fqn,
@@ -1630,7 +1630,7 @@ class _BucketUnshard(torch.autograd.Function):
             sharded_grads = begin_reduce_grad(
                 grads,
                 infos,
-                bucket.bucket_storage._mesh,
+                bucket.bucket_storage.reduce_mesh,
                 bucket.bucket_storage.gradient_reduction,
                 bucket.context.reduce_grad_stream,
                 debug_fqn=bucket.debug_fqn,
