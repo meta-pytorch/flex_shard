@@ -317,6 +317,7 @@ class _MixedFp8BucketedBlockShard(
             fp8_dtype=placement.fp8_dtype,
             column_blocks_for_long_rows=placement.column_blocks_for_long_rows,
             tile_units=placement.tile_units,
+            cache_forward_payload=placement.cache_forward_payload,
         )
         self._mixed_bucket = mixed_bucket
         self._collective_placement = placement
