@@ -1413,6 +1413,8 @@ class TestFp8ColumnBlocks(TestCase):
         # The eager CUDA copy-out copies every column rectangle in one box
         # kernel per copy unit; while compiling, one strided copy each. A refill
         # writes the persistent buffer and makes no full params.
+        if device_type.type != "cuda":
+            self.skipTest("The FP8 quantization kernels run on CUDA.")
         torch.manual_seed(0)
         fulls = [
             torch.randn(shape, dtype=torch.bfloat16, device=device_type)
@@ -1483,6 +1485,8 @@ class TestFp8TileUnits(TestFp8ColumnBlocks):
     def test_unshard_aligns_each_weights_scales_to_16_bytes(self) -> None:
         """cuBLAS's blockwise FP8 GEMM needs 16-byte aligned scale tensors; w1 and
         w2 have 6 scales each, so the next weight's scales start after a gap."""
+        if device_type.type != "cuda":
+            self.skipTest("The FP8 quantization kernels run on CUDA.")
         torch.manual_seed(0)
         fulls = [
             torch.randn(shape, dtype=torch.bfloat16, device=device_type)
