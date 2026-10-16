@@ -873,11 +873,11 @@ class TestFlexShardEagerRuntime(TestCase):
             self.assertEqual(allocated[1], allocated[2])
 
     def test_shard_unshard_buffers(self):
-        # Shard all-gathers in place: with a narrower unsharded dtype, the
-        # local shard is cast straight into its chunk of the gather buffer. A
-        # refill allocates the persistent storage only at copy-out, as FSDP2
-        # allocates its unsharded parameters, so a prefetched bucket holds only
-        # its gather buffer.
+        # On a 1-rank mesh Shard skips the all-gather, as FSDP2 does: the only
+        # buffer is the bucket's local storage, which finish casts into the
+        # unsharded params. A refill allocates the persistent storage only at
+        # copy-out, as FSDP2 allocates its unsharded parameters. The in-place
+        # all-gather on more ranks is checked in test_flex_shard_training.
         with single_rank_cuda_mesh() as mesh:
             torch.manual_seed(0)
             model = nn.Sequential(nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8))
@@ -900,11 +900,8 @@ class TestFlexShardEagerRuntime(TestCase):
             x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
             model(x).sum().backward()
             handle = bucket.begin_unshard()
-            send_buf, gather_buf = handle.prepared.buffers
-            self.assertEqual(
-                send_buf.untyped_storage().data_ptr(),
-                gather_buf.untyped_storage().data_ptr(),
-            )
+            self.assertEqual(len(handle.prepared.buffers), 1)
+            self.assertTrue(handle.prepared.placement_state.local_copy_out)
             self.assertTrue(
                 all(b.untyped_storage().size() == 0 for b in bucket.persistent_buffers)
             )
@@ -1081,7 +1078,8 @@ class TestFlexShardEagerRuntime(TestCase):
             with self.assertRaisesRegex(Exception, "eager-only"):
                 compiled_model(transformer_inputs(args, device="cuda"))
 
-    def test_torch_compile_traces_per_bucket_collectives(self):
+    def test_torch_compile_traces_per_bucket_unshards(self):
+        # The multi-rank collectives are checked in test_flex_shard_training.
         with single_rank_cuda_mesh() as mesh:
             args, model = flex_shard_transformer_model(mesh)
 
@@ -1112,19 +1110,17 @@ class TestFlexShardEagerRuntime(TestCase):
             unshards = [t for t in top_targets if t == "autograd_function_apply"]
             self.assertEqual(len(model.sharded_bucket_storages), len(unshards))
 
-            # Collectives live in the fwd_body_*/bwd_body_* subgraphs that
-            # autograd_function_apply dispatches to, not at the top level.
+            # On a 1-rank mesh Shard runs no collectives, as FSDP2 does.
             subgraph_targets = set()
             for _, submodule in root.named_modules():
                 if isinstance(submodule, torch.fx.GraphModule):
                     subgraph_targets.update(
                         str(node.target) for node in submodule.graph.nodes
                     )
-
-            # Functional collectives keep the comm reorderable by graph passes.
-            self.assertIn("_c10d_functional.all_gather_into_tensor", subgraph_targets)
-            self.assertIn("_c10d_functional.reduce_scatter_tensor", subgraph_targets)
-            self.assertIn("_c10d_functional.wait_tensor", subgraph_targets)
+            self.assertNotIn(
+                "_c10d_functional.all_gather_into_tensor", subgraph_targets
+            )
+            self.assertNotIn("_c10d_functional.reduce_scatter_tensor", subgraph_targets)
 
     def test_torch_compile_frozen_params_do_not_widen_reduce_dtype(self):
         with single_rank_cuda_mesh() as mesh:
