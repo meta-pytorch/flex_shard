@@ -80,6 +80,14 @@ class DenseAllGatherReferencePlacement(Fp8BucketedBlockShard):
         # Its dense-row payload and copy-out handle row blocks only.
         return frozenset()
 
+    @override
+    def _tile_fqns(self, params) -> frozenset[str]:
+        return frozenset()
+
+    @override
+    def _is_tile_param(self, info) -> bool:
+        return False
+
     def __repr__(self) -> str:
         return (
             "DenseAllGatherReferencePlacement("
