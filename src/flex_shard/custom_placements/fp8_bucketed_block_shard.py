@@ -72,6 +72,9 @@ _VEC_COPY_NBYTES = _VEC_COPY_DTYPE.itemsize
 # segments and scale starts satisfies the pointer requirement and lets common
 # model shapes with naturally aligned payload lengths use the vectorized path.
 _VEC_ALIGN_BYTES = 16
+# Scales per 16 bytes: each parameter's scales start 16-byte aligned in a
+# compact buffer (_compact_scale_offsets).
+_SCALE_ALIGN_NUMEL = 4
 
 
 class BlockwiseFp8WeightFactory(Protocol):
@@ -1692,27 +1695,35 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
     ) -> PlacementUnshardResult:
         metadata = state.metadata
         fp8_nbytes = sum(metadata.rank_fp8_numels)
-        scale_nbytes = sum(metadata.rank_scale_numels) * torch.float32.itemsize
+        scale_offsets, scale_numel = _compact_scale_offsets(
+            state.infos, self.block_size
+        )
+        scale_nbytes = scale_numel * torch.float32.itemsize
         scale_byte_offset = _align_up(fp8_nbytes, _VEC_ALIGN_BYTES)
         # Persistent unshards keep ``compact`` (fp8 data + scales) as the
-        # storage backing the returned BlockwiseFp8Weights.
-        compact = (
-            prepared.persistent_buffers[0]
-            if prepared.persistent_buffers is not None
-            else torch.empty(
+        # storage backing the returned BlockwiseFp8Weights. Scale alignment
+        # gaps are never written, so a new buffer with gaps starts zeroed.
+        if prepared.persistent_buffers is not None:
+            compact = prepared.persistent_buffers[0]
+        else:
+            compact = (
+                torch.zeros
+                if scale_numel != sum(metadata.rank_scale_numels)
+                else torch.empty
+            )(
                 scale_byte_offset + scale_nbytes,
                 dtype=torch.uint8,
                 device=rank_rows.device,
             )
-        )
         fp8_bytes = compact[:fp8_nbytes]
         scale_bytes = compact[scale_byte_offset:]
 
         with _record_copy_out_if_eager():
             # Rank cuts partition one globally ordered block-row stream. Joining
             # each rank's valid regions therefore restores parameter order without
-            # scattering every chunk separately.
-            if any(
+            # scattering every chunk separately, unless the scales have alignment
+            # gaps, or column-block or tile chunks, which go where the plan says.
+            if scale_numel != sum(metadata.rank_scale_numels) or any(
                 chunk.col_start is not None or chunk.tile_start is not None
                 for chunk in metadata.chunks
             ):
@@ -1739,21 +1750,19 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         fp8_flat = fp8_bytes.view(self.fp8_dtype)
         scale_flat = scale_bytes.view(torch.float32)
         fp8_offset = 0
-        scale_offset = 0
         full_params: list[torch.Tensor] = []
-        for info in state.infos:
+        for info, scale_offset in zip(state.infos, scale_offsets, strict=True):
             fp8_numel = info.global_numel
             scale_shape = _scale_shape(
                 _matrix_shape(info.global_shape),
                 self.block_size,
             )
-            scale_numel = scale_shape[0] * scale_shape[1]
             fp8_data = fp8_flat[fp8_offset : fp8_offset + fp8_numel].view(
                 info.global_shape
             )
-            recip_scale = scale_flat[scale_offset : scale_offset + scale_numel].view(
-                scale_shape
-            )
+            recip_scale = scale_flat[
+                scale_offset : scale_offset + scale_shape[0] * scale_shape[1]
+            ].view(scale_shape)
             full_params.append(
                 self._make_blockwise_fp8_weight(
                     fp8_data,
@@ -1763,8 +1772,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                 )
             )
             fp8_offset += fp8_numel
-            scale_offset += scale_numel
-        if fp8_offset != fp8_flat.numel() or scale_offset != scale_flat.numel():
+        if fp8_offset != fp8_flat.numel() or scale_numel != scale_flat.numel():
             raise AssertionError("Compacted FP8 bucket metadata is inconsistent.")
         return PlacementUnshardResult(
             full_params=full_params,
@@ -1784,8 +1792,8 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         # parameter order, in the compact buffer.
         layouts: dict[str, tuple[int, int, int, int, int]] = {}
         fp8_offset = 0
-        scale_offset = 0
-        for info in infos:
+        scale_offsets, _ = _compact_scale_offsets(infos, self.block_size)
+        for info, scale_offset in zip(infos, scale_offsets, strict=True):
             out_dim, in_dim = _matrix_shape(info.global_shape)
             scale_rows, scale_cols = _scale_shape(
                 _matrix_shape(info.global_shape), self.block_size
@@ -1798,7 +1806,6 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                 scale_cols,
             )
             fp8_offset += info.global_numel
-            scale_offset += scale_rows * scale_cols
         scale_nbytes = torch.float32.itemsize
         regions: list[tuple[int, int, int, int]] = []
         boxes: list[tuple[int, int, int, int, int, int]] = []
@@ -2268,6 +2275,25 @@ def _cat_byte_regions_from_rank_rows(
         ],
         out=out,
     )
+
+
+def _compact_scale_offsets(
+    infos: list[ParamInfo], block_size: int
+) -> tuple[list[int], int]:
+    """Where each parameter's scales start among a compact buffer's scales, in
+    parameter order, and how many scale slots the buffer holds. Each start is
+    16-byte aligned, as cuBLAS's blockwise FP8 GEMM requires of its scale
+    tensors: a parameter whose scales aren't a multiple of 4 leaves a gap."""
+    offsets: list[int] = []
+    offset = 0
+    for info in infos:
+        offset = _align_up(offset, _SCALE_ALIGN_NUMEL)
+        offsets.append(offset)
+        scale_rows, scale_cols = _scale_shape(
+            _matrix_shape(info.global_shape), block_size
+        )
+        offset += scale_rows * scale_cols
+    return offsets, offset
 
 
 def _align_up(value: int, alignment: int) -> int:
