@@ -1482,6 +1482,43 @@ class TestFp8TileUnits(TestFp8ColumnBlocks):
             tile_units=True,
         )
 
+    def test_unshard_aligns_each_weights_scales_to_16_bytes(self) -> None:
+        """cuBLAS's blockwise FP8 GEMM needs 16-byte aligned scale tensors; w1 and
+        w2 have 6 scales each, so the next weight's scales start after a gap."""
+        if device_type.type != "cuda":
+            self.skipTest("The FP8 quantization kernels run on CUDA.")
+        torch.manual_seed(0)
+        fulls = [
+            torch.randn(shape, dtype=torch.bfloat16, device=device_type)
+            for shape in self.shapes
+        ]
+        factory = _RecordingWeightFactory()
+        placement = self._placement(columns=False, factory=factory)
+        rank_infos = [self._infos(r, placement) for r in range(self.world_size)]
+        payloads = []
+        for rank, infos in enumerate(rank_infos):
+            metadata = placement._fp8_metadata_from_infos(infos)
+            tensors = [
+                self._local(placement, info, rank, full)
+                for info, full in zip(infos, fulls, strict=True)
+            ]
+            payloads.append(
+                placement._pack_local_quantized_chunks(tensors, infos, rank, metadata)
+            )
+        metadata = placement._fp8_metadata_from_infos(rank_infos[0])
+        placement.finish_prepared_unshard(
+            PlacementPreparedUnshard(
+                placement=placement,
+                buffers=[payloads[0], torch.stack(payloads).view(-1)],
+                placement_state=Fp8BucketedBlockShard._Fp8UnshardState(
+                    infos=rank_infos[0], pg=None, debug_fqn=None, metadata=metadata
+                ),
+            )
+        )
+        self.assertEqual(len(factory.calls), len(self.shapes))
+        for call in factory.calls:
+            self.assertEqual(call.recip_scale.data_ptr() % 16, 0)
+
     def test_plans_tile_units(self) -> None:
         placement = self._placement(columns=False)
         chunks = placement._fp8_metadata_from_infos(self._infos(0, placement)).chunks
