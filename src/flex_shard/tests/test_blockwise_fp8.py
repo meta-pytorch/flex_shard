@@ -450,6 +450,99 @@ class TestBlockwiseFp8FlexShardTraining(FSDPTest):
             bf16_optim.step()
             self._assert_named_parameter_data_equal(fp8_model, bf16_model)
 
+    @skip_if_lt_x_gpu(2)
+    def test_column_blocks_train_like_row_blocks(self) -> None:
+        """With column blocks for the long-row w2, five training steps give
+        bitwise the logits and losses of row blocks only: the layouts differ,
+        the math doesn't (2 ranks sum their gradients in one order)."""
+        self._skip_unless_blockwise_linear_supported()
+        mesh = self._mesh()
+        torch.manual_seed(0)
+        model_args, row_model = make_transformer_model(
+            device=device_type,
+            n_layers=1,
+            vocab_size=256,
+            max_seq_len=8,
+            dim=256,
+            n_heads=4,
+        )
+        row_model.to(dtype=torch.bfloat16)
+        column_model = copy.deepcopy(row_model)
+        linear_weight_fqns = [
+            f"{fqn}.weight"
+            for fqn, module in row_model.named_modules()
+            if isinstance(module, nn.Linear)
+        ]
+        other_param_fqns = [
+            fqn
+            for fqn, _ in row_model.named_parameters()
+            if fqn not in set(linear_weight_fqns)
+        ]
+        for model, columns in ((row_model, False), (column_model, True)):
+            convert_to_flex_shard_float8_blockwise_linear(model, use_triton=False)
+            flex_shard(
+                model,
+                buckets=[
+                    BucketSpec(
+                        linear_weight_fqns,
+                        placement_fn=make_fp8_bucketed_block_placement_fn(
+                            weight_factory=BlockwiseFp8Weight,
+                            block_size=128,
+                            column_blocks_for_long_rows=columns,
+                        ),
+                        mesh=mesh,
+                        reshard_after_forward=True,
+                    ),
+                    BucketSpec(
+                        other_param_fqns,
+                        placement_fn=per_param_placements,
+                        mesh=mesh,
+                        reshard_after_forward=True,
+                    ),
+                ],
+            )
+        infos = list(column_model.sharded_bucket_storages[0].param_infos.values())
+        metadata = infos[0].placement._fp8_metadata_from_infos(infos)
+        self.assertEqual(
+            {chunk.fqn for chunk in metadata.chunks if chunk.col_start is not None},
+            {"layers.0.feed_forward.w2.weight"},
+        )
+
+        row_optim = make_test_sgd(row_model.parameters(), lr=0.01)
+        column_optim = make_test_sgd(column_model.parameters(), lr=0.01)
+        for step in range(5):
+            torch.manual_seed(3 + step)
+            tokens = torch.randint(
+                0,
+                model_args.vocab_size,
+                (2, model_args.max_seq_len),
+                device=device_type,
+            )
+            targets = torch.randint(
+                0,
+                model_args.vocab_size,
+                (2, model_args.max_seq_len),
+                device=device_type,
+            )
+            dist.broadcast(tokens, src=0)
+            dist.broadcast(targets, src=0)
+            results = []
+            for model, optim in ((row_model, row_optim), (column_model, column_optim)):
+                optim.zero_grad(set_to_none=True)
+                logits = model(tokens)
+                loss = nn.functional.cross_entropy(
+                    logits.flatten(0, 1), targets.flatten()
+                )
+                loss.backward()
+                optim.step()
+                results.append((logits.detach(), loss.detach()))
+            (row_logits, row_loss), (column_logits, column_loss) = results
+            self.assertTrue(
+                torch.equal(row_logits, column_logits),
+                f"logits diverged at step {step}",
+            )
+            self.assertTrue(torch.equal(row_loss, column_loss))
+
 
 if __name__ == "__main__":
     run_tests()
