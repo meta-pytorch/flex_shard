@@ -17,7 +17,12 @@ from .placement_contract import (
     Placement,
     set_global_layout,
 )
-from .sharded_param import get_global_shape, get_placements, is_flex_shard_param
+from .sharded_param import (
+    get_global_shape,
+    get_mesh,
+    get_placements,
+    is_flex_shard_param,
+)
 
 __all__ = [
     "BucketParamStorageLayout",
@@ -29,6 +34,7 @@ __all__ = [
     "get_flex_shard_global_layouts",
     "get_global_layout",
     "get_global_shape",
+    "get_mesh",
     "get_placements",
     "is_flex_shard_param",
     "LocalStorageLayout",
