@@ -26,6 +26,9 @@ from .. import (
 from ..custom_placements import (
     fp8_bucketed_block_shard as fp8_bucketed_block_shard_module,
 )
+from ..custom_placements.dense_all_gather_reference import (
+    DenseAllGatherReferencePlacement,
+)
 from ..custom_placements.fp8_bucketed_block_shard import (
     _VEC_ALIGN_BYTES,
     Fp8BucketedBlockShard,
@@ -860,6 +863,224 @@ class TestFp8AllGatherLayout(TestCase):
             )
         )
         self.assertTrue(torch.equal(factory_call.recip_scale, reference_scale))
+
+
+class TestFp8FusedCopyOut(TestCase):
+    """The one-kernel rank-row copy-out matches the cat fallback bitwise."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        if device_type.type != "cuda":
+            self.skipTest("The fused copy-out runs on CUDA.")
+
+    def _metadata(
+        self,
+        shapes: list[tuple[int, int]],
+        placement_cls: type[Fp8BucketedBlockShard] = Fp8BucketedBlockShard,
+        world_size: int = 8,
+    ) -> tuple[Fp8BucketedBlockShard, Fp8BucketedBlockShard._Fp8BucketMetadata]:
+        placement = placement_cls(
+            world_size=world_size,
+            weight_factory=_return_fp8_data,
+            block_size=4,
+        )
+        named_params = [
+            (f"w{index}", nn.Parameter(torch.empty(shape, device="meta")))
+            for index, shape in enumerate(shapes)
+        ]
+        infos = _make_fp8_param_infos(
+            named_params,
+            placement,
+            _FakeMesh(world_size),
+        )
+        return placement, placement._fp8_metadata_from_infos(infos)
+
+    def test_copy_out_matches_cat_fallback(self) -> None:
+        # Shapes, and the copy unit for 4-byte aligned rows: whole 4-byte units
+        # when every region is aligned, bytes for odd FP8 byte counts.
+        cases = {
+            "aligned regions": ([(16, 8), (8, 8), (2, 4)], 4),
+            "odd regions": ([(16, 8), (8, 8), (1, 3)], 1),
+        }
+        # Row start offset and padding between rows: contiguous rows, rows
+        # spaced apart as in a mixed bucket, and rows at an odd byte offset.
+        row_layouts = {
+            "contiguous": (0, 0),
+            "spaced": (0, 16),
+            "odd offset": (1, 3),
+        }
+        for case, (shapes, aligned_unit) in cases.items():
+            placement, metadata = self._metadata(shapes)
+            self.assertIn(0, metadata.rank_fp8_numels)
+            world_size = len(metadata.rank_fp8_numels)
+            row_nbytes = metadata.packed_send_nbytes_per_rank
+            fp8_nbytes = sum(metadata.rank_fp8_numels)
+            scale_byte_offset = (
+                (fp8_nbytes + _VEC_ALIGN_BYTES - 1)
+                // _VEC_ALIGN_BYTES
+                * _VEC_ALIGN_BYTES
+            )
+            compact_nbytes = (
+                scale_byte_offset
+                + sum(metadata.rank_scale_numels) * torch.float32.itemsize
+            )
+            for layout, (offset, padding) in row_layouts.items():
+                with self.subTest(case=case, layout=layout):
+                    parent = torch.randint(
+                        0,
+                        256,
+                        (world_size, offset + row_nbytes + padding),
+                        dtype=torch.uint8,
+                        device=device_type,
+                    )
+                    rank_rows = parent[:, offset : offset + row_nbytes]
+                    fused = torch.full(
+                        (compact_nbytes,),
+                        0xAB,
+                        dtype=torch.uint8,
+                        device=device_type,
+                    )
+                    expected = fused.clone()
+                    self.assertTrue(
+                        placement._copy_out_rank_rows_triton(
+                            metadata,
+                            rank_rows,
+                            fused,
+                        )
+                    )
+                    placement._copy_out_rank_rows_cat(
+                        metadata,
+                        rank_rows,
+                        expected,
+                        fp8_nbytes=fp8_nbytes,
+                        scale_byte_offset=scale_byte_offset,
+                    )
+                    self.assertTrue(torch.equal(fused, expected))
+                    plan = placement._copy_out_plan(
+                        metadata,
+                        data_elem_nbytes=1,
+                        with_scales=True,
+                    )
+                    unit_nbytes = aligned_unit if offset == 0 else 1
+                    self.assertIn(
+                        (rank_rows.device, rank_rows.stride(0), unit_nbytes),
+                        plan.descriptors,
+                    )
+
+    def test_copy_plan_is_built_once_per_row_stride(self) -> None:
+        placement, metadata = self._metadata([(16, 8), (8, 8), (6, 4)])
+        world_size = len(metadata.rank_fp8_numels)
+        row_nbytes = metadata.packed_send_nbytes_per_rank
+        compact = torch.empty(
+            row_nbytes * world_size,
+            dtype=torch.uint8,
+            device=device_type,
+        )
+        rank_rows = torch.zeros(
+            (world_size, row_nbytes),
+            dtype=torch.uint8,
+            device=device_type,
+        )
+        placement._copy_out_rank_rows_triton(metadata, rank_rows, compact)
+        plan = placement._copy_out_plan(metadata, data_elem_nbytes=1, with_scales=True)
+        (descriptor,) = plan.descriptors.values()
+        placement._copy_out_rank_rows_triton(metadata, rank_rows, compact)
+        self.assertIs(
+            placement._copy_out_plan(metadata, data_elem_nbytes=1, with_scales=True),
+            plan,
+        )
+        self.assertEqual(list(plan.descriptors.values()), [descriptor])
+
+        spaced_rows = torch.zeros(
+            (world_size, row_nbytes + 16),
+            dtype=torch.uint8,
+            device=device_type,
+        )[:, :row_nbytes]
+        placement._copy_out_rank_rows_triton(metadata, spaced_rows, compact)
+        self.assertEqual(len(plan.descriptors), 2)
+
+    def test_copy_out_falls_back_while_compiling(self) -> None:
+        placement, metadata = self._metadata([(16, 8)])
+        rank_rows = torch.zeros(
+            (len(metadata.rank_fp8_numels), metadata.packed_send_nbytes_per_rank),
+            dtype=torch.uint8,
+            device=device_type,
+        )
+        compact = torch.empty(rank_rows.numel(), dtype=torch.uint8, device=device_type)
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            self.assertFalse(
+                placement._copy_out_rank_rows_triton(metadata, rank_rows, compact)
+            )
+        self.assertFalse(
+            placement._copy_out_rank_rows_triton(metadata, rank_rows.cpu(), compact)
+        )
+
+    def test_dense_reference_joins_rank_rows(self) -> None:
+        placement, metadata = self._metadata(
+            [(16, 8), (8, 8), (1, 3)],
+            placement_cls=DenseAllGatherReferencePlacement,
+        )
+        world_size = len(metadata.rank_fp8_numels)
+        for row_numel in (max(metadata.rank_fp8_numels) + 5, 64):
+            with self.subTest(row_numel=row_numel):
+                rank_rows = torch.randn(
+                    (world_size, row_numel),
+                    dtype=torch.bfloat16,
+                    device=device_type,
+                )
+                joined = rank_rows.new_empty(sum(metadata.rank_fp8_numels))
+                self.assertTrue(
+                    placement._copy_out_rank_rows_triton(
+                        metadata,
+                        rank_rows.view(torch.uint8),
+                        joined.view(torch.uint8),
+                        data_elem_nbytes=rank_rows.element_size(),
+                        with_scales=False,
+                    )
+                )
+                expected = torch.cat(
+                    [
+                        rank_rows[rank, :numel]
+                        for rank, numel in enumerate(metadata.rank_fp8_numels)
+                    ]
+                )
+                self.assertTrue(
+                    torch.equal(joined.view(torch.int16), expected.view(torch.int16))
+                )
+
+    def test_segment_copy_splits_long_segments(self) -> None:
+        from ..custom_placements._copy_kernels import (
+            copy_segments_triton,
+            SegmentCopyDescriptor,
+        )
+
+        source = torch.randint(
+            -(2**31),
+            2**31 - 1,
+            (4096,),
+            dtype=torch.int32,
+            device=device_type,
+        )
+        # Lengths from empty to 30 blocks, so long segments split into
+        # several grid rows next to short ones.
+        segments = [(5, 0, 0), (100, 1, 0), (300, 240, 1), (1000, 37, 241)]
+        segments.append((2000, 960, 278))
+        descriptor = SegmentCopyDescriptor.create(
+            src_offsets=[src for src, _, _ in segments],
+            numels=[numel for _, numel, _ in segments],
+            dst_offsets=[dst for _, _, dst in segments],
+            device=device_type,
+            block_size=32,
+            max_chunks_per_segment=2,
+        )
+        self.assertGreater(descriptor.nsegments, len(segments))
+        self.assertEqual(descriptor.max_segment_numel, 64)
+        output = torch.zeros(1238, dtype=torch.int32, device=device_type)
+        copy_segments_triton(source, output, descriptor)
+        expected = torch.zeros_like(output)
+        for src, numel, dst in segments:
+            expected[dst : dst + numel] = source[src : src + numel]
+        self.assertTrue(torch.equal(output, expected))
 
 
 class TestFp8BlockwiseWeightQuantization(TestCase):
