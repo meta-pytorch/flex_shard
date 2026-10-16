@@ -5,7 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 from .bucket_storage import BucketSpec, MixedPrecisionPolicy, OffloadPolicy, PlacementFn
-from .checkpoint import get_flex_shard_global_layouts, set_state_dict_global_layouts
+from .checkpoint import (
+    get_flex_shard_global_layouts,
+    register_optimizer_checkpoint_hook,
+    set_state_dict_global_layouts,
+)
 from .flex_shard import flex_shard
 from .placement_contract import (
     BucketParamStorageLayout,
@@ -42,6 +46,7 @@ __all__ = [
     "OffloadPolicy",
     "Placement",
     "PlacementFn",
+    "register_optimizer_checkpoint_hook",
     "set_global_layout",
     "set_state_dict_global_layouts",
 ]
