@@ -323,11 +323,16 @@ class FlexShardModule:
 
     def set_max_pending_reduce_grads(
         self,
-        max_pending_reduce_grads: int = 2,
+        max_pending_reduce_grads: int = 1,
         *,
         recurse: bool = True,
     ) -> None:
-        """Set retained reduce-grad results; 0 keeps all until post-backward."""
+        """Set retained reduce-grad results; 0 keeps all until post-backward.
+
+        The default of 1 matches FSDP2, which waits for the previous
+        reduce-scatter before packing the next bucket's gradients, so at most
+        one packed reduce-scatter input is alive.
+        """
         if not isinstance(max_pending_reduce_grads, int) or isinstance(
             max_pending_reduce_grads, bool
         ):
