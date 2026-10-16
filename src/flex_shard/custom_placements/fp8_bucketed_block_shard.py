@@ -53,7 +53,7 @@ from ..flex_shard.utils import (
     _record_copy_in_if_eager,
     _record_copy_out_if_eager,
 )
-from .block_shard import BucketedBlockShard
+from .block_shard import _copy_box_, BucketedBlockShard
 from .utils import foreach_copy_
 
 
@@ -1656,7 +1656,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         scale_byte_offset: int,
     ) -> None:
         """Copy row chunks with one segment kernel (on CUDA, in eager mode) and
-        each column-block rectangle with one strided copy."""
+        each column-block rectangle with one strided copy (``_copy_box_``)."""
         plan = self._column_copy_out_plan(metadata, infos, scale_byte_offset)
         row_stride = rank_rows.stride(0)
         if (
@@ -1705,9 +1705,12 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             box = rank_rows[rank, offset : offset + rows * row_nbytes].view(
                 rows, row_nbytes
             )
-            compact[
-                out_offset : out_offset + (rows - 1) * out_stride + row_nbytes
-            ].as_strided((rows, row_nbytes), (out_stride, 1)).copy_(box)
+            _copy_box_(
+                compact[
+                    out_offset : out_offset + (rows - 1) * out_stride + row_nbytes
+                ].as_strided((rows, row_nbytes), (out_stride, 1)),
+                box,
+            )
 
     def _copy_out_plan(
         self,

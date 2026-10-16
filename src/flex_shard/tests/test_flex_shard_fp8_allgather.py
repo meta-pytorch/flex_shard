@@ -26,7 +26,7 @@ from .. import (
 from ..custom_placements import (
     fp8_bucketed_block_shard as fp8_bucketed_block_shard_module,
 )
-from ..custom_placements.block_shard import BucketedBlockShard
+from ..custom_placements.block_shard import _copy_box_, BucketedBlockShard
 from ..custom_placements.dense_all_gather_reference import (
     DenseAllGatherReferencePlacement,
 )
@@ -1469,6 +1469,44 @@ class TestFp8ColumnBlocks(TestCase):
                 storage[info.byte_offset :].view(torch.bfloat16).view(info.local_shape)
             )
             self.assertTrue(torch.equal(got, self._local(placement, info, rank, full)))
+
+
+class TestCopyBox(TestCase):
+    def test_copies_through_the_widest_unit(self):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # (dtype, source columns, destination columns, first source column,
+        # first destination column, columns copied, expected unit bytes)
+        cases = [
+            (torch.uint8, 256, 512, 0, 128, 64, 8),
+            (torch.uint8, 256, 512, 4, 128, 64, 4),
+            (torch.uint8, 256, 512, 0, 0, 6, 2),
+            (torch.uint8, 256, 512, 0, 0, 3, 1),
+            (torch.uint8, 255, 512, 0, 0, 64, 1),
+            (torch.bfloat16, 128, 256, 4, 8, 64, 8),
+            (torch.bfloat16, 128, 256, 2, 8, 64, 4),
+            (torch.float32, 64, 128, 0, 2, 6, 8),
+        ]
+        for dtype, src_cols, dst_cols, src_col, dst_col, cols, unit in cases:
+            with self.subTest(
+                dtype=dtype, src_cols=src_cols, src_col=src_col, cols=cols
+            ):
+                src = torch.randint(0, 100, (8, src_cols), device=device).to(dtype)
+                dst = torch.zeros(8, dst_cols, dtype=dtype, device=device)
+                expected = dst.clone()
+                expected[:, dst_col : dst_col + cols] = src[:, src_col : src_col + cols]
+                self.assertEqual(
+                    _copy_box_(
+                        dst[:, dst_col : dst_col + cols],
+                        src[:, src_col : src_col + cols],
+                    ),
+                    unit,
+                )
+                self.assertTrue(torch.equal(dst, expected))
+        # Different dtypes convert through a plain copy.
+        src = torch.randn(4, 64, dtype=torch.bfloat16, device=device)
+        dst = torch.zeros(4, 64, device=device)
+        self.assertEqual(_copy_box_(dst, src), 4)
+        self.assertTrue(torch.equal(dst, src.float()))
 
 
 class TestFp8BlockwiseWeightQuantization(TestCase):
