@@ -666,5 +666,106 @@ class TestBlockwiseFp8FlexShardTraining(FSDPTest):
             self.assertTrue(torch.equal(row_loss, layout_loss))
 
 
+class TestBlockwiseFp8GroupedMM(TestCase):
+    """The routed experts' FP8 grouped GEMM: gathered and per-call weights
+    compute the same bytes, with or without padding, its BF16 weight gradient
+    is PyTorch's, and DeepGEMM matches TorchAO's emulated backend."""
+
+    num_groups, out_dim, in_dim = 3, 256, 384
+
+    def _run(self, x, weight, offsets, *, aligned, preference):
+        from ..blockwise_fp8.fp8_blockwise_grouped_mm import blockwise_fp8_grouped_mm
+
+        x = x.detach().requires_grad_(True)
+        if isinstance(weight, BlockwiseFp8Weight):
+            weight.grad = None
+        else:
+            weight = weight.detach().requires_grad_(True)
+        out = blockwise_fp8_grouped_mm(
+            x,
+            weight,
+            offsets,
+            num_groups=self.num_groups,
+            groups_aligned=aligned,
+            kernel_preference=preference,
+        )
+        generator = torch.Generator(device=out.device).manual_seed(1)
+        out.backward(torch.randn(out.shape, generator=generator, device=out.device))
+        return out.detach(), x.grad.clone(), weight.grad.clone()
+
+    def test_gathered_and_per_call_weights_match(self) -> None:
+        if device_type.type != "cuda" or not is_sm_at_least_90():
+            self.skipTest("The FP8 grouped GEMM runs on SM90+ CUDA.")
+        import importlib.util
+
+        from torchao.quantization.quantize_.common import KernelPreference
+
+        torch.manual_seed(0)
+        rows = 256 * self.num_groups
+        x = torch.randn(rows, self.in_dim, dtype=torch.bfloat16, device=device_type)
+        weight = 0.02 * torch.randn(
+            self.num_groups * self.out_dim,
+            self.in_dim,
+            dtype=torch.bfloat16,
+            device=device_type,
+        )
+        fp8_data, recip_scale = _quantize_dense_weight_to_blockwise_fp8(
+            weight, 128, torch.float8_e4m3fn
+        )
+        gathered = BlockwiseFp8Weight(fp8_data, recip_scale, 128, torch.bfloat16)
+        gathered.requires_grad_(True)
+        cases = {
+            "aligned": (torch.tensor([256, 512, 768]), True),
+            "uneven": (torch.tensor([100, 500, 768]), False),
+        }
+        preferences = [KernelPreference.EMULATED]
+        if importlib.util.find_spec("deep_gemm") is not None:
+            preferences.append(KernelPreference.AUTO)
+        results = {}
+        for preference in preferences:
+            for name, (offsets, aligned) in cases.items():
+                with self.subTest(preference=preference.name, groups=name):
+                    offsets = offsets.to(device_type, torch.int32)
+                    per_call = self._run(
+                        x, weight, offsets, aligned=aligned, preference=preference
+                    )
+                    pre = self._run(
+                        x, gathered, offsets, aligned=aligned, preference=preference
+                    )
+                    for a, b in zip(per_call, pre, strict=True):
+                        self.assertTrue(torch.equal(a, b))
+                    if aligned:
+                        padded = self._run(
+                            x, gathered, offsets, aligned=False, preference=preference
+                        )
+                        for a, b in zip(pre, padded, strict=True):
+                            self.assertTrue(torch.equal(a, b))
+                    # The BF16 weight gradient is PyTorch's grouped GEMM's.
+                    leaf = weight.detach().requires_grad_(True)
+                    reference = torch._grouped_mm(
+                        x,
+                        leaf.view(self.num_groups, self.out_dim, self.in_dim).mT,
+                        offs=offsets,
+                        out_dtype=torch.bfloat16,
+                    )
+                    generator = torch.Generator(device=x.device).manual_seed(1)
+                    reference.backward(
+                        torch.randn(
+                            reference.shape, generator=generator, device=x.device
+                        )
+                    )
+                    self.assertTrue(torch.equal(pre[2], leaf.grad))
+                    results[preference, name] = pre
+        if KernelPreference.AUTO in preferences:
+            for name in cases:
+                deepgemm = results[KernelPreference.AUTO, name]
+                emulated = results[KernelPreference.EMULATED, name]
+                for got, expected in zip(deepgemm[:2], emulated[:2], strict=True):
+                    error = (
+                        got.float() - expected.float()
+                    ).norm() / expected.float().norm()
+                    self.assertLess(error.item(), 1e-2)
+
+
 if __name__ == "__main__":
     run_tests()
