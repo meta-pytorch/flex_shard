@@ -461,6 +461,151 @@ def copy_segments_triton(
     )
 
 
+@triton.jit
+def _copy_boxes_kernel(
+    source,
+    output,
+    src_offsets,
+    dst_offsets,
+    nrows,
+    row_numels,
+    src_strides,
+    dst_strides,
+    UNIT_NBYTES: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+) -> None:
+    # Byte tensors, read and written through UNIT_NBYTES-wide integers.
+    if UNIT_NBYTES == 8:
+        src = source.to(tl.pointer_type(tl.int64))
+        dst = output.to(tl.pointer_type(tl.int64))
+    elif UNIT_NBYTES == 4:
+        src = source.to(tl.pointer_type(tl.int32))
+        dst = output.to(tl.pointer_type(tl.int32))
+    elif UNIT_NBYTES == 2:
+        src = source.to(tl.pointer_type(tl.int16))
+        dst = output.to(tl.pointer_type(tl.int16))
+    else:
+        src = source
+        dst = output
+    tile_id = tl.program_id(0)
+    col_block = tl.program_id(1)
+    src_offset = tl.load(src_offsets + tile_id)
+    dst_offset = tl.load(dst_offsets + tile_id)
+    rows = tl.load(nrows + tile_id)
+    row_numel = tl.load(row_numels + tile_id)
+    src_stride = tl.load(src_strides + tile_id)
+    dst_stride = tl.load(dst_strides + tile_id)
+    row = tl.arange(0, BLOCK_ROWS)[:, None]
+    col = col_block * BLOCK_COLS + tl.arange(0, BLOCK_COLS)[None, :]
+    mask = (row < rows) & (col < row_numel)
+    values = tl.load(src + src_offset + row * src_stride + col, mask=mask)
+    tl.store(dst + dst_offset + row * dst_stride + col, values, mask=mask)
+
+
+_BOX_TILE_UNITS = 4096
+
+
+@dataclass
+class BoxCopyDescriptor:
+    """Device copy plan for 2-D boxes from one byte tensor into another, in
+    units of ``unit_nbytes``.
+
+    Each box copies ``rows`` rows of ``row_numel`` units, read ``src_stride``
+    units apart and written ``dst_stride`` units apart. Boxes are split into
+    tiles of at most ``block_rows`` rows: one program per tile and column block.
+    """
+
+    src_offsets: torch.Tensor
+    dst_offsets: torch.Tensor
+    nrows: torch.Tensor
+    row_numels: torch.Tensor
+    src_strides: torch.Tensor
+    dst_strides: torch.Tensor
+    ntiles: int
+    max_row_numel: int
+    unit_nbytes: int
+    block_rows: int
+    block_cols: int
+    _staged_hosts: tuple[torch.Tensor, ...]
+
+    @classmethod
+    def create(
+        cls,
+        boxes: Sequence[tuple[int, int, int, int, int, int]],
+        *,
+        unit_nbytes: int,
+        device: torch.device,
+    ) -> "BoxCopyDescriptor":
+        """``boxes`` holds ``(src offset, rows, row numel, src stride, dst
+        offset, dst stride)`` in units."""
+        if unit_nbytes not in (1, 2, 4, 8):
+            raise ValueError(f"Unsupported copy unit of {unit_nbytes} bytes.")
+        max_row_numel = max((box[2] for box in boxes), default=0)
+        block_cols = min(256, triton.next_power_of_2(max(1, max_row_numel)))
+        block_rows = max(1, min(64, _BOX_TILE_UNITS // block_cols))
+        tiles: tuple[list[int], ...] = ([], [], [], [], [], [])
+        for src_offset, rows, row_numel, src_stride, dst_offset, dst_stride in boxes:
+            for start in range(0, rows, block_rows):
+                tiles[0].append(src_offset + start * src_stride)
+                tiles[1].append(dst_offset + start * dst_stride)
+                tiles[2].append(min(block_rows, rows - start))
+                tiles[3].append(row_numel)
+                tiles[4].append(src_stride)
+                tiles[5].append(dst_stride)
+        staged = [_staged_cuda_i64_tensor(values, device) for values in tiles]
+        return cls(
+            *(tensor for tensor, _ in staged),
+            ntiles=len(tiles[0]),
+            max_row_numel=max_row_numel,
+            unit_nbytes=unit_nbytes,
+            block_rows=block_rows,
+            block_cols=block_cols,
+            _staged_hosts=tuple(host for _, host in staged),
+        )
+
+
+def copy_boxes_triton(
+    source: torch.Tensor,
+    output: torch.Tensor,
+    descriptor: BoxCopyDescriptor,
+    *,
+    num_warps: int = 4,
+) -> None:
+    """Copy ``descriptor``'s boxes from ``source`` into ``output``, both byte
+    tensors, in one kernel launch.
+
+    Offsets count units from each tensor's first byte, so ``source`` may be a
+    strided view: the kernel reads only its data pointer. Both data pointers
+    must be aligned to ``descriptor.unit_nbytes``.
+    """
+    if descriptor.ntiles == 0 or descriptor.max_row_numel == 0:
+        return
+    if source.dtype != torch.uint8 or output.dtype != torch.uint8:
+        raise ValueError("copy_boxes_triton copies between uint8 tensors.")
+    unit = descriptor.unit_nbytes
+    if source.data_ptr() % unit or output.data_ptr() % unit:
+        raise ValueError(f"Box copy pointers must be {unit}-byte aligned.")
+    grid = (
+        descriptor.ntiles,
+        triton.cdiv(descriptor.max_row_numel, descriptor.block_cols),
+    )
+    _copy_boxes_kernel[grid](
+        source,
+        output,
+        descriptor.src_offsets,
+        descriptor.dst_offsets,
+        descriptor.nrows,
+        descriptor.row_numels,
+        descriptor.src_strides,
+        descriptor.dst_strides,
+        UNIT_NBYTES=unit,
+        BLOCK_ROWS=descriptor.block_rows,
+        BLOCK_COLS=descriptor.block_cols,
+        num_warps=num_warps,
+    )
+
+
 def zero_segments_triton(
     output: torch.Tensor,
     descriptor: SegmentCopyDescriptor,
