@@ -34,7 +34,11 @@ from .blockwise_fp8_weight import BlockwiseFp8Weight
 
 
 class FlexShardFloat8BlockwiseLinear(TorchAOFloat8BlockwiseLinear):
-    """torchao Float8BlockwiseLinear that consumes FlexShard FP8 all-gather output."""
+    """torchao Float8BlockwiseLinear that consumes FlexShard FP8 all-gather output.
+
+    A stacked ``[*stack, out, in]`` weight runs one GEMM on its flattened matrix
+    and returns ``[..., *stack, out]``.
+    """
 
     @classmethod
     def from_float(
@@ -144,7 +148,8 @@ def _blockwise_fp8_linear_forward(
     if block_size != 128:
         raise AssertionError("torchao Float8BlockwiseLinear only supports 128")
 
-    logical_out_dim, logical_in_dim = weight.shape
+    weight_matrix = weight.fp8_data.flatten(0, -2)
+    logical_out_dim, logical_in_dim = weight_matrix.shape
     x_orig_shape = x.shape
     x_2d = x.reshape(-1, x_orig_shape[-1])
     if x_2d.shape[-1] != logical_in_dim:
@@ -152,7 +157,7 @@ def _blockwise_fp8_linear_forward(
             f"input last dim {x_2d.shape[-1]} does not match weight input dim "
             f"{logical_in_dim}"
         )
-    weight_fp8 = _pad_2d_to_block_shape(weight.fp8_data, block_size)
+    weight_fp8 = _pad_2d_to_block_shape(weight_matrix, block_size)
     _, padded_in_dim = weight_fp8.shape
     x_2d = _pad_last_dim_to(x_2d, padded_in_dim)
     x_fp8, x_scale = _torchao_act_quant_lhs(
@@ -173,7 +178,7 @@ def _blockwise_fp8_linear_forward(
         scale_recipe_b=_TORCHAO_BLOCKWISE_128X128_SCALING_TYPE,
         out_dtype=out_dtype,
     )
-    out = out[:, :logical_out_dim].reshape(*x_orig_shape[:-1], logical_out_dim)
+    out = out[:, :logical_out_dim].reshape(*x_orig_shape[:-1], *weight.shape[:-1])
     if bias is not None:
         out = out + bias
     ctx.save_for_backward(x, weight)
@@ -193,15 +198,10 @@ def _blockwise_fp8_linear_backward(
     out_dtype = ctx.out_dtype
     use_triton = ctx.use_triton
     fp8_dtype = weight.fp8_data.dtype
-    grad_output_orig_shape = grad_output.shape
-    grad_output_2d = grad_output.reshape(-1, grad_output_orig_shape[-1]).contiguous()
-    logical_out_dim, logical_in_dim = weight.shape
-    if grad_output_2d.shape[-1] != logical_out_dim:
-        raise ValueError(
-            f"grad_output last dim {grad_output_2d.shape[-1]} does not match "
-            f"weight output dim {logical_out_dim}"
-        )
-    weight_fp8 = _pad_2d_to_block_shape(weight.fp8_data, block_size)
+    weight_matrix = weight.fp8_data.flatten(0, -2)
+    logical_out_dim, logical_in_dim = weight_matrix.shape
+    grad_output_2d = grad_output.reshape(-1, logical_out_dim).contiguous()
+    weight_fp8 = _pad_2d_to_block_shape(weight_matrix, block_size)
     padded_out_dim = weight_fp8.shape[0]
     grad_output_2d_padded = _pad_last_dim_to(grad_output_2d, padded_out_dim)
 
@@ -226,10 +226,7 @@ def _blockwise_fp8_linear_backward(
             scale_recipe_b=_TORCHAO_BLOCKWISE_128X128_SCALING_TYPE,
             out_dtype=out_dtype,
         )
-        grad_x = grad_x[:, :logical_in_dim].reshape(
-            *grad_output_orig_shape[:-1],
-            logical_in_dim,
-        )
+        grad_x = grad_x[:, :logical_in_dim].reshape(x.shape)
     if needs_weight_grad:
         # Both wgrad operands must share a block-aligned token dimension.
         grad_output_2d_wgrad = _pad_2d_to_block_shape(
@@ -266,10 +263,13 @@ def _blockwise_fp8_linear_backward(
         # non-contiguous view; the FlexShard grad reduce path requires contiguous
         # grads, so materialize before returning.
         grad_weight = (
-            grad_weight[:logical_out_dim, :logical_in_dim].to(weight.dtype).contiguous()
+            grad_weight[:logical_out_dim, :logical_in_dim]
+            .to(weight.dtype)
+            .contiguous()
+            .view(weight.shape)
         )
     if ctx.has_bias and needs_bias_grad:
-        grad_bias = grad_output_2d.sum(dim=0)
+        grad_bias = grad_output_2d.sum(dim=0).view(weight.shape[:-1])
     return grad_x, grad_weight, grad_bias
 
 
