@@ -1246,6 +1246,8 @@ class TestFp8ColumnBlocks(TestCase):
         # The eager CUDA copy-out copies every column rectangle in one box
         # kernel per copy unit; while compiling, one strided copy each. A refill
         # writes the persistent buffer and makes no full params.
+        if device_type.type != "cuda":
+            self.skipTest("The FP8 quantization kernels run on CUDA.")
         torch.manual_seed(0)
         fulls = [
             torch.randn(shape, dtype=torch.bfloat16, device=device_type)
