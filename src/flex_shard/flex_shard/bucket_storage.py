@@ -19,6 +19,7 @@ from torch._prims_common import make_contiguous_strides_for
 
 from .placement_contract import (
     get_global_layout,
+    get_partial_grad_group,
     GradientReduceOp,
     GradientReduction,
 )
@@ -293,6 +294,9 @@ class ParamInfo:
     # Outer (TP/EP) layout declared by the input param; ``global_shape`` is then
     # the outer local shape.
     outer_layout: GlobalLayout | None = None
+    # Group over which each rank computes only part of the grad; FlexShard sums
+    # the unsharded grad over it before the reduce-scatter.
+    partial_grad_group: dist.ProcessGroup | None = None
     # Python attributes of the original parameter (e.g. framework tags), copied
     # onto its persistent unsharded parameter.
     param_attrs: dict[str, Any] = field(default_factory=dict)
@@ -676,6 +680,7 @@ class ShardedBucketStorage:
             global_numel=param.numel(),
             bucket_layout=bucket_layout,
             outer_layout=get_global_layout(param),
+            partial_grad_group=get_partial_grad_group(param),
             param_attrs=dict(vars(param)),
             has_explicit_grad_dtype=has_explicit_grad_dtype,
             grad_dtype_override=param.grad_dtype if has_explicit_grad_dtype else None,
@@ -723,6 +728,7 @@ class ShardedBucketStorage:
                 global_shape=info.global_shape,
                 global_stride=info.global_stride,
                 mesh=self._mesh,
+                outer_layout=info.outer_layout,
             )
             for name in (fqn, *info.shared_fqns):
                 _set_param_on_module(self._module, name, new_param)
