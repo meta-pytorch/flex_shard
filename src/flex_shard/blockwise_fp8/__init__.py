@@ -10,6 +10,7 @@ from .blockwise_fp8_weight import (
     blockwise_dequant_weight,
     BlockwiseFp8Weight,
 )
+from .fp8_blockwise_grouped_mm import blockwise_fp8_grouped_mm
 from .fp8_blockwise_linear import (
     convert_to_flex_shard_float8_blockwise_linear,
     FlexShardFloat8BlockwiseLinear,
@@ -19,6 +20,7 @@ from .fp8_blockwise_linear import (
 
 __all__ = [
     "blockwise_dequant_weight",
+    "blockwise_fp8_grouped_mm",
     "BlockwiseFp8Weight",
     "convert_to_flex_shard_float8_blockwise_linear",
     "FlexShardFloat8BlockwiseLinear",
