@@ -550,6 +550,37 @@ class TestBlockwiseFp8FlexShardTraining(FSDPTest):
         """With column blocks for the long-row w2, five training steps give
         bitwise the logits and losses of row blocks only: the layouts differ,
         the math doesn't (2 ranks sum their gradients in one order)."""
+
+        def check(chunks) -> None:
+            self.assertEqual(
+                {chunk.fqn for chunk in chunks if chunk.col_start is not None},
+                {"layers.0.feed_forward.w2.weight"},
+            )
+
+        self._assert_layout_trains_like_row_blocks(
+            check, column_blocks_for_long_rows=True
+        )
+
+    @skip_if_lt_x_gpu(2)
+    def test_tile_units_train_like_row_blocks(self) -> None:
+        """With tile units, where each rank owns a run of 128x128 tiles that
+        starts and ends inside tile rows, five training steps give bitwise the
+        logits and losses of row blocks only."""
+
+        def check(chunks) -> None:
+            tile_chunks = [chunk for chunk in chunks if chunk.tile_start is not None]
+            self.assertEqual(len(tile_chunks), len(chunks))
+            self.assertTrue(
+                any(chunk.tile_start % 2 or chunk.tile_end % 2 for chunk in tile_chunks)
+                or len({chunk.fqn for chunk in tile_chunks}) > 1
+            )
+
+        self._assert_layout_trains_like_row_blocks(check, tile_units=True)
+
+    def _assert_layout_trains_like_row_blocks(self, check, **layout) -> None:
+        """Train a one-layer transformer whose linears' FP8 bucket takes
+        ``layout`` (Fp8BucketedBlockShard options) next to one with row blocks
+        only; ``check`` gets the laid-out model's FP8 chunks."""
         self._skip_unless_blockwise_linear_supported()
         mesh = self._mesh()
         torch.manual_seed(0)
@@ -562,7 +593,7 @@ class TestBlockwiseFp8FlexShardTraining(FSDPTest):
             n_heads=4,
         )
         row_model.to(dtype=torch.bfloat16)
-        column_model = copy.deepcopy(row_model)
+        layout_model = copy.deepcopy(row_model)
         linear_weight_fqns = [
             f"{fqn}.weight"
             for fqn, module in row_model.named_modules()
@@ -573,7 +604,7 @@ class TestBlockwiseFp8FlexShardTraining(FSDPTest):
             for fqn, _ in row_model.named_parameters()
             if fqn not in set(linear_weight_fqns)
         ]
-        for model, columns in ((row_model, False), (column_model, True)):
+        for model, kwargs in ((row_model, {}), (layout_model, layout)):
             convert_to_flex_shard_float8_blockwise_linear(model, use_triton=False)
             flex_shard(
                 model,
@@ -583,7 +614,7 @@ class TestBlockwiseFp8FlexShardTraining(FSDPTest):
                         placement_fn=make_fp8_bucketed_block_placement_fn(
                             weight_factory=BlockwiseFp8Weight,
                             block_size=128,
-                            column_blocks_for_long_rows=columns,
+                            **kwargs,
                         ),
                         mesh=mesh,
                         reshard_after_forward=True,
@@ -596,15 +627,11 @@ class TestBlockwiseFp8FlexShardTraining(FSDPTest):
                     ),
                 ],
             )
-        infos = list(column_model.sharded_bucket_storages[0].param_infos.values())
-        metadata = infos[0].placement._fp8_metadata_from_infos(infos)
-        self.assertEqual(
-            {chunk.fqn for chunk in metadata.chunks if chunk.col_start is not None},
-            {"layers.0.feed_forward.w2.weight"},
-        )
+        infos = list(layout_model.sharded_bucket_storages[0].param_infos.values())
+        check(infos[0].placement._fp8_metadata_from_infos(infos).chunks)
 
         row_optim = make_test_sgd(row_model.parameters(), lr=0.01)
-        column_optim = make_test_sgd(column_model.parameters(), lr=0.01)
+        layout_optim = make_test_sgd(layout_model.parameters(), lr=0.01)
         for step in range(5):
             torch.manual_seed(3 + step)
             tokens = torch.randint(
@@ -622,7 +649,7 @@ class TestBlockwiseFp8FlexShardTraining(FSDPTest):
             dist.broadcast(tokens, src=0)
             dist.broadcast(targets, src=0)
             results = []
-            for model, optim in ((row_model, row_optim), (column_model, column_optim)):
+            for model, optim in ((row_model, row_optim), (layout_model, layout_optim)):
                 optim.zero_grad(set_to_none=True)
                 logits = model(tokens)
                 loss = nn.functional.cross_entropy(
@@ -631,12 +658,12 @@ class TestBlockwiseFp8FlexShardTraining(FSDPTest):
                 loss.backward()
                 optim.step()
                 results.append((logits.detach(), loss.detach()))
-            (row_logits, row_loss), (column_logits, column_loss) = results
+            (row_logits, row_loss), (layout_logits, layout_loss) = results
             self.assertTrue(
-                torch.equal(row_logits, column_logits),
+                torch.equal(row_logits, layout_logits),
                 f"logits diverged at step {step}",
             )
-            self.assertTrue(torch.equal(row_loss, column_loss))
+            self.assertTrue(torch.equal(row_loss, layout_loss))
 
 
 if __name__ == "__main__":
