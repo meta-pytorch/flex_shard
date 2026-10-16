@@ -6,6 +6,7 @@
 
 from dataclasses import dataclass
 from unittest.mock import patch
+import weakref
 
 import torch
 import torch.distributed as dist
@@ -268,14 +269,6 @@ class TestFp8AllGatherLayout(TestCase):
         )
         quantize_patch.start()
         self.addCleanup(quantize_patch.stop)
-        if device_type.type != "cuda":
-            cache_context_patch = patch.object(
-                Fp8BucketedBlockShard,
-                "_local_packed_cache_context",
-                return_value=(device_type, None),
-            )
-            cache_context_patch.start()
-            self.addCleanup(cache_context_patch.stop)
 
     def test_layout_validation_and_partitioning(self) -> None:
         block = 4
@@ -439,14 +432,7 @@ class TestFp8AllGatherLayout(TestCase):
 
     def test_mixed_fp8_member_with_param_dtype_overrides_is_one_group(self) -> None:
         """FP8 members quantize each param from its own dtype in one subgroup."""
-        with (
-            single_rank_cpu_mesh() as mesh,
-            patch.object(
-                Fp8BucketedBlockShard,
-                "_local_packed_cache_context",
-                return_value=(torch.device("cpu"), None),
-            ),
-        ):
+        with single_rank_cpu_mesh() as mesh:
             weight_factory = _RecordingWeightFactory()
             mixed = MixedBucketPlacement({})
             fp8 = mixed.fp8_bucketed_block_shard(
@@ -489,7 +475,9 @@ class TestFp8AllGatherLayout(TestCase):
                 [torch.bfloat16, torch.bfloat16, torch.float32],
             )
 
-    def test_fp8_cache_phase_detects_checkpoint_recompute(self) -> None:
+    def test_fp8_unshard_quantizes_every_gather(self) -> None:
+        """Forward and checkpoint recompute's backward re-gather each quantize
+        the payload, to the same bytes, and the placement keeps neither alive."""
         from torch.utils.checkpoint import checkpoint
 
         mesh = _FakeMesh(1)
@@ -502,18 +490,18 @@ class TestFp8AllGatherLayout(TestCase):
             torch.arange(64, dtype=torch.float32, device=device_type).view(8, 8)
         )
         info = _make_fp8_param_info("w", param, placement, mesh)
-        phases = []
         payloads = []
+        payload_refs = []
 
         def function(tensor: torch.Tensor) -> torch.Tensor:
-            phases.append(fp8_bucketed_block_shard_module._is_backward_graph_task())
             prepared = placement.prepare_unshard_bucket(
                 [param.detach()],
                 [info],
                 mesh,
                 None,
             )
-            payloads.append(prepared.buffers[0])
+            payloads.append(prepared.buffers[0].clone())
+            payload_refs.append(weakref.ref(prepared.buffers[0]))
             return tensor.sin() * tensor.cos()
 
         tensor = torch.randn(8, device=device_type, requires_grad=True)
@@ -524,117 +512,9 @@ class TestFp8AllGatherLayout(TestCase):
         ) as quantize:
             checkpoint(function, tensor, use_reentrant=False).sum().backward()
 
-        self.assertEqual(phases, [False, True])
-        self.assertEqual(quantize.call_count, 1)
-        self.assertIs(payloads[0], payloads[1])
-
-    def test_fp8_local_packed_cache_rebuilds_every_forward(self) -> None:
-        mesh = _FakeMesh(1)
-        placement = Fp8BucketedBlockShard(
-            world_size=1,
-            weight_factory=_return_fp8_data,
-            block_size=4,
-        )
-        param = nn.Parameter(
-            torch.arange(64, dtype=torch.float32, device=device_type).view(8, 8)
-        )
-        info = _make_fp8_param_info("w", param, placement, mesh)
-
-        with (
-            patch.object(
-                fp8_bucketed_block_shard_module,
-                "_is_backward_graph_task",
-                return_value=False,
-            ),
-            patch.object(
-                placement,
-                "_quantize_local_weight",
-                wraps=placement._quantize_local_weight,
-            ) as quantize,
-        ):
-            first = placement.prepare_unshard_bucket(
-                [param.detach()],
-                [info],
-                mesh,
-                None,
-            )
-            first_payload = first.buffers[0].clone()
-            initial_version = param._version
-            param.data[0, 0].add_(1000)
-            self.assertEqual(param._version, initial_version)
-            second = placement.prepare_unshard_bucket(
-                [param.detach()],
-                [info],
-                mesh,
-                None,
-            )
-
         self.assertEqual(quantize.call_count, 2)
-        self.assertIsNot(first.buffers[0], second.buffers[0])
-        self.assertTrue(torch.equal(first.buffers[0], first_payload))
-        self.assertFalse(torch.equal(second.buffers[0], first_payload))
-
-        fp8_data, recip_scale = _packed_rank_views(
-            second.buffers[0],
-            0,
-            second.placement_state.metadata,
-            placement.fp8_dtype,
-        )
-        reference_fp8, reference_scale = _reference_blockwise_quant_weight(
-            param.detach(),
-            placement.block_size,
-        )
-        self.assertTrue(torch.equal(fp8_data.view(param.shape), reference_fp8))
-        self.assertTrue(
-            torch.equal(recip_scale.view(reference_scale.shape), reference_scale)
-        )
-
-    def test_fp8_local_packed_cache_is_bypassed_while_compiling(self) -> None:
-        mesh = _FakeMesh(1)
-        placement = Fp8BucketedBlockShard(
-            world_size=1,
-            weight_factory=_return_fp8_data,
-            block_size=4,
-        )
-        param = nn.Parameter(
-            torch.arange(64, dtype=torch.float32, device=device_type).view(8, 8)
-        )
-        info = _make_fp8_param_info("w", param, placement, mesh)
-        cached = placement.prepare_unshard_bucket(
-            [param.detach()],
-            [info],
-            mesh,
-            None,
-        )
-
-        with patch.object(torch.compiler, "is_compiling", return_value=True):
-            first = placement.prepare_unshard_bucket(
-                [param.detach()],
-                [info],
-                mesh,
-                None,
-            )
-            second = placement.prepare_unshard_bucket(
-                [param.detach()],
-                [info],
-                mesh,
-                None,
-            )
-
-        with patch.object(
-            fp8_bucketed_block_shard_module,
-            "_is_backward_graph_task",
-            return_value=True,
-        ):
-            restored = placement.prepare_unshard_bucket(
-                [param.detach()],
-                [info],
-                mesh,
-                None,
-            )
-        self.assertIsNot(first.buffers[0], second.buffers[0])
-        self.assertIsNot(first.buffers[0], cached.buffers[0])
-        self.assertIs(restored.buffers[0], cached.buffers[0])
+        self.assertTrue(torch.equal(payloads[0], payloads[1]))
+        self.assertTrue(all(ref() is None for ref in payload_refs))
 
     def test_fp8_unshard_uses_single_packed_all_gather(self) -> None:
         """The FP8 placement launches one collective over packed bytes."""
