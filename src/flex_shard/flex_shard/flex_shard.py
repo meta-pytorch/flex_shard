@@ -6,12 +6,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import cast, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 
+from .bucket_comm import begin_explicit_bucket_unshard
 from .bucket_runtime import (
     _EAGER_COMM_CONTEXTS_ATTR,
     _in_backward,
@@ -19,6 +20,7 @@ from .bucket_runtime import (
     _MAX_PENDING_REDUCE_GRADS_ATTR,
     GradientReductionHandle,
     ModuleUnshardHandle,
+    ParamOwnerRef,
 )
 from .bucket_storage import (
     _assign_params_to_buckets,
@@ -27,6 +29,8 @@ from .bucket_storage import (
     BucketSpec,
     GradientReduceOp,
     MixedPrecisionPolicy,
+    ParamInfo,
+    PlacementFn,
     ShardedBucketStorage,
 )
 from .sharded_param import is_flex_shard_param
@@ -47,6 +51,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "flex_shard",
+    "relayout_bucket",
 ]
 
 
@@ -456,6 +461,158 @@ def flex_shard(
     flex_shard_module._install_runtime_if_materialized()
 
     return flex_shard_module
+
+
+def relayout_bucket(
+    module: FlexShardModule,
+    bucket_storage: ShardedBucketStorage,
+    placement_fn: PlacementFn,
+) -> ShardedBucketStorage:
+    """Move one bucket's parameters to the placements ``placement_fn`` gives,
+    moving their values once.
+
+    For a layout that initialization or checkpoint loading can't use, e.g.
+    whole-parameter owners (``BucketedOwned``) where initialization goes
+    through FSDP2-style DTensor views of ``Shard`` placements: initialize or
+    load in the first layout, then move. Call it after the module is
+    materialized and before the bucket's first unshard, and before an
+    optimizer holds its parameters: the bucket's parameters are replaced, and
+    the old storage is freed.
+
+    The parameters are all-gathered in their storage dtype and copied into the
+    new storage, so their values move bitwise. The memory peak is this
+    bucket's old shards, its full parameters and its new storage. The bucket
+    keeps its mesh, mixed precision, reshard and gradient settings, prefetch
+    and forward hooks, and is no longer ``fsdp2_compatible``. Returns the new
+    storage, which replaces the old one in ``module.sharded_bucket_storages``.
+    """
+    storages = module.sharded_bucket_storages
+    index = next(
+        (i for i, storage in enumerate(storages) if storage is bucket_storage), None
+    )
+    if index is None:
+        raise ValueError("bucket_storage is not one of the module's bucket storages.")
+    device = bucket_storage.byte_storage.device
+    if device.type == "meta":
+        raise ValueError(
+            "relayout_bucket needs materialized storage; call to_empty() first."
+        )
+    runtime = _bucket_runtime_of(module, bucket_storage)
+    if runtime is not None and (runtime.is_unsharded or runtime.unsharded_params):
+        raise RuntimeError(
+            "relayout_bucket must run before the bucket's first unshard, e.g. "
+            "right after initialization or checkpoint loading."
+        )
+    infos = list(bucket_storage.param_infos.values())
+    sharded_params = [_module_param(module, info.fqn) for info in infos]
+    if any(param.grad is not None for param in sharded_params):
+        raise RuntimeError("relayout_bucket needs a bucket without gradients.")
+
+    mesh = bucket_storage._mesh
+    with torch.no_grad():
+        # Gather in the storage dtype, not the forward dtype, so master weights
+        # move without rounding.
+        result = begin_explicit_bucket_unshard(
+            [param.detach() for param in sharded_params],
+            [replace(info, param_dtype=None) for info in infos],
+            mesh,
+            async_op=False,
+        ).finish()
+    named_full_params: list[tuple[str, nn.Parameter]] = []
+    for info, full in zip(infos, result.full_params, strict=True):
+        param = nn.Parameter(full.contiguous(), requires_grad=info.requires_grad)
+        # The original parameter's attributes, with any outer layout and
+        # partial-grad group it declared, as flex_shard() recorded them.
+        for name, value in info.param_attrs.items():
+            setattr(param, name, value)
+        if info.has_explicit_grad_dtype:
+            param.grad_dtype = info.grad_dtype_override
+        named_full_params.append((info.fqn, param))
+    del result
+
+    param_placements = placement_fn(named_full_params, mesh)
+    _validate_placements(param_placements, named_full_params)
+    param_infos, total_bytes = ShardedBucketStorage.create_param_infos(
+        named_full_params,
+        mesh,
+        param_placements,
+        _mixed_precision_policy_of(infos),
+    )
+    for info in infos:
+        param_infos[info.fqn].shared_fqns = info.shared_fqns
+    new_storage = ShardedBucketStorage(
+        torch.empty(total_bytes, dtype=torch.uint8, device=device),
+        param_infos,
+        mesh,
+        total_bytes,
+        bucket_storage._module,
+        reshard_after_forward=bucket_storage.reshard_after_forward,
+        gradient_reduce_op=bucket_storage.gradient_reduce_op,
+        pre_backward_hook=bucket_storage._pre_backward_hook,
+        post_reduce_hook=bucket_storage._post_reduce_hook,
+        gradient_divide_factor=bucket_storage.gradient_divide_factor,
+        defer_post_backward=bucket_storage._defer_post_backward,
+        hook_module_fqns=bucket_storage._hook_module_fqns,
+    )
+    new_storage._requires_gradient_sync = bucket_storage._requires_gradient_sync
+    new_storage._reshard_after_backward = bucket_storage._reshard_after_backward
+    new_storage.copy_params_from(named_full_params)
+    new_storage.install_sharded_params(device)
+    for storage in storages:
+        for attr in ("_forward_prefetch", "_backward_prefetch"):
+            prefetch = getattr(storage, attr)
+            if prefetch is not None:
+                setattr(
+                    storage,
+                    attr,
+                    [new_storage if s is bucket_storage else s for s in prefetch],
+                )
+    new_storage._forward_prefetch = bucket_storage._forward_prefetch
+    new_storage._backward_prefetch = bucket_storage._backward_prefetch
+    storages[index] = new_storage
+    if runtime is not None:
+        runtime.rebind_storage(new_storage)
+    return new_storage
+
+
+def _bucket_runtime_of(
+    module: nn.Module, bucket_storage: ShardedBucketStorage
+) -> BucketRuntime | None:
+    for context in getattr(module, _EAGER_COMM_CONTEXTS_ATTR, {}).values():
+        for bucket in context.buckets:
+            if bucket.bucket_storage is bucket_storage:
+                return bucket
+    return None
+
+
+def _module_param(module: nn.Module, fqn: str) -> nn.Parameter:
+    owner = ParamOwnerRef.resolve(module, fqn)
+    return owner.module._parameters[owner.param_name]
+
+
+def _mixed_precision_policy_of(infos: list[ParamInfo]) -> MixedPrecisionPolicy:
+    """The policy that gives each parameter the dtypes flex_shard() resolved."""
+    param_dtypes = {info.param_dtype for info in infos}
+    reduce_dtypes = {info.reduce_dtype for info in infos}
+    assert len(reduce_dtypes) == 1, reduce_dtypes
+    if len(param_dtypes) == 1:
+        return MixedPrecisionPolicy(
+            param_dtype=param_dtypes.pop(), reduce_dtype=reduce_dtypes.pop()
+        )
+    # Overrides may name the parameter's own dtype, the only value other than
+    # param_dtype they allow.
+    param_dtype = next(
+        info.param_dtype for info in infos if info.param_dtype != info.dtype
+    )
+    return MixedPrecisionPolicy(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtypes.pop(),
+        param_dtype_overrides={
+            info.fqn: info.param_dtype
+            for info in infos
+            if info.param_dtype != param_dtype
+        },
+    )
 
 
 def _check_not_already_flex_sharded(module: nn.Module) -> None:

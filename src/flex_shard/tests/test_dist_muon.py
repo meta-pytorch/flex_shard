@@ -19,11 +19,14 @@ from torch.testing._internal.common_utils import parametrize, run_tests, TestCas
 
 from ..custom_placements.block_shard import BlockShard, BucketedBlockShard
 from ..custom_placements.owned import BucketedOwned, BucketedOwnedSegmentSpec
+from ..custom_placements.shard import Shard
 from ..dist_muon.comm_free_adapter import _build_parameter_binding, LocalDistMuonBinding
 from ..dist_muon.storage_layout import (
     _block_shard_layout,
     _bucketed_block_shard_layout,
     _capture_canonical_shard,
+    _owned_layout,
+    _row_shard_layout,
     capture_flex_shard_muon_canonical_shards,
     get_flex_shard_muon_compute_layouts,
     LocalMuonComputeLayout,
@@ -214,12 +217,26 @@ class TestDistMuonStorageLayout(TestCase):
                         global_stride=parameter.stride(),
                         mesh=mesh,
                     )
-                    with self.assertRaisesRegex(
-                        NotImplementedError, "complete 2D matrix"
-                    ):
+                    with self.assertRaisesRegex(NotImplementedError, "complete matrix"):
                         get_flex_shard_muon_compute_layouts(
                             model, [(canonical_name, partial)]
                         )
+
+    def test_owned_matrix_batch(self):
+        # A stacked [gate; up] weight owned whole: the owner computes both.
+        layout = _owned_layout(
+            "w13",
+            torch.empty(2, 4, 3),
+            torch.Size((2, 4, 3)),
+            LocalMuonStateShard(
+                global_shape=torch.Size((2, 4, 3)),
+                global_offset=(0, 0, 0),
+                local_shape=torch.Size((2, 4, 3)),
+            ),
+        )
+        self.assertEqual(layout.kind, "owned")
+        self.assertEqual(layout.state_checkpoint_shard.global_offset, (0, 0, 0))
+        self.assertEqual(layout.state_checkpoint_shard.local_shape, (2, 4, 3))
 
     def test_row_blocks_add_outer_offset_and_use_global_matrix_rows(self):
         layout = _block_shard_layout(
@@ -278,6 +295,38 @@ class TestDistMuonStorageLayout(TestCase):
         self.assertEqual(layout.state_checkpoint_shard.global_shape, (8, 2, 3))
         self.assertEqual(layout.state_checkpoint_shard.global_offset, (5, 0, 0))
         self.assertEqual(layout.state_checkpoint_shard.local_shape, (3, 2, 3))
+
+    def test_row_shard_adds_outer_offset_to_its_chunk(self):
+        # Experts [5, 2, 3] of ep rank 1 (outer offset 5 of 10), Shard(0) on 2
+        # ranks: rank 1 holds experts 3 and 4 of the 5, globally 8 and 9.
+        canonical = LocalMuonStateShard(
+            global_shape=torch.Size((10, 2, 3)),
+            global_offset=(5, 0, 0),
+            local_shape=torch.Size((5, 2, 3)),
+        )
+        layout = _row_shard_layout(
+            "experts",
+            torch.empty(2, 2, 3),
+            torch.Size((5, 2, 3)),
+            canonical,
+            Shard(0),
+            rank=1,
+            world_size=2,
+        )
+        self.assertEqual(layout.kind, "row_shard")
+        self.assertEqual(layout.state_checkpoint_shard.global_shape, (10, 2, 3))
+        self.assertEqual(layout.state_checkpoint_shard.global_offset, (8, 0, 0))
+        self.assertEqual(layout.state_checkpoint_shard.local_shape, (2, 2, 3))
+        with self.assertRaisesRegex(NotImplementedError, "sharded on dim 0"):
+            _row_shard_layout(
+                "experts",
+                torch.empty(5, 1, 3),
+                torch.Size((5, 2, 3)),
+                canonical,
+                Shard(1),
+                rank=1,
+                world_size=2,
+            )
 
 
 class TestDistMuonBinding(TestCase):

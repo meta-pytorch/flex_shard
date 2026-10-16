@@ -18,6 +18,7 @@ from torch.testing._internal.common_utils import TestCase
 from ..custom_placements.block_shard import BucketedBlockShard
 from ..custom_placements.owned import (
     BucketedOwned,
+    make_bucketed_owned_full_param_placement_fn,
     make_bucketed_owned_full_param_segments,
 )
 from ..dist_muon import (
@@ -356,3 +357,47 @@ class TwoLevelOwnerTest(TestCase):
         rank_order = make_bucketed_owned_full_param_segments(named_params, 8)
         self.assertEqual({two_level[p][0].owner_rank for p in ("p0", "p1")}, {0, 4})
         self.assertEqual({rank_order[p][0].owner_rank for p in ("p0", "p1")}, {0, 1})
+
+    def test_placement_fn_carries_loads_across_buckets(self) -> None:
+        # 16 identical buckets of a DeepSeek V3 MoE block's owned matrices on
+        # 64 ranks of 8 hosts, one bucket per block as torchtitan builds them.
+        # Placed one at a time, every bucket gets the same 6 owners; carrying
+        # the loads spreads them over the ranks.
+        shapes = (
+            (7168, 16384),
+            (1536, 7168),
+            (576, 7168),
+            (256, 7168),
+            (2, 2048, 7168),
+            (7168, 2048),
+        )
+        mesh = MagicMock()
+        mesh.mesh = torch.arange(64)
+        mesh.size.return_value = 64
+
+        def owned_numel(placement_fn) -> list[int]:
+            loads = [0] * 64
+            for block in range(16):
+                named_params = [
+                    (
+                        f"layers.{block}.m{i}",
+                        nn.Parameter(torch.empty(s, device="meta")),
+                    )
+                    for i, s in enumerate(shapes)
+                ]
+                placements = placement_fn(named_params, mesh)
+                for fqn, (placement,) in placements.items():
+                    for segment in placement.segments_by_fqn[fqn]:
+                        loads[segment.owner_rank] += segment.numel
+            return loads
+
+        with mock.patch.dict(os.environ, {"LOCAL_WORLD_SIZE": "8"}):
+            per_bucket = owned_numel(make_bucketed_owned_full_param_placement_fn())
+            carried = owned_numel(
+                make_bucketed_owned_full_param_placement_fn(carry_loads=True)
+            )
+        self.assertEqual(sum(load > 0 for load in per_bucket), 6)
+        self.assertEqual(max(per_bucket), 16 * 7168 * 16384)
+        # Each rank owns at most one wo and about a fair share in all.
+        self.assertGreaterEqual(sum(load > 0 for load in carried), 60)
+        self.assertLessEqual(max(carried), 7168 * 16384 + sum(carried) // 64)
