@@ -155,8 +155,10 @@ class _MixedBucketMember:
             debug_fqn,
         )
 
-    def run_prepared_unshard(self, prepared: PlacementPreparedUnshard) -> None:
-        self._mixed_bucket.run_prepared_unshard(prepared)
+    def run_prepared_unshard(
+        self, prepared: PlacementPreparedUnshard, *, async_op: bool = False
+    ) -> dist.Work | None:
+        return self._mixed_bucket.run_prepared_unshard(prepared, async_op=async_op)
 
     def finish_prepared_unshard(
         self,
@@ -550,10 +552,13 @@ class MixedBucketPlacement(Placement):
             ),
         )
 
-    def run_prepared_unshard(self, prepared: PlacementPreparedUnshard) -> None:
+    def run_prepared_unshard(
+        self, prepared: PlacementPreparedUnshard, *, async_op: bool = False
+    ) -> dist.Work | None:
         if isinstance(prepared.placement_state, _OwnerRowsUnshardState):
-            self._run_owner_rows_unshard(prepared, prepared.placement_state)
-            return
+            return self._run_owner_rows_unshard(
+                prepared, prepared.placement_state, async_op=async_op
+            )
         if not isinstance(prepared.placement_state, _MixedUnshardState):
             raise AssertionError(
                 "Expected _MixedUnshardState, "
@@ -563,10 +568,11 @@ class MixedBucketPlacement(Placement):
             "FlexShard::mixed_all_gather",
             prepared.placement_state.debug_fqn,
         ):
-            dist.all_gather_into_tensor(
+            return dist.all_gather_into_tensor(
                 output_tensor=prepared.buffers[1],
                 input_tensor=prepared.buffers[0],
                 group=prepared.placement_state.pg,
+                async_op=async_op,
             )
 
     def finish_prepared_unshard(
@@ -751,7 +757,9 @@ class MixedBucketPlacement(Placement):
         self,
         prepared: PlacementPreparedUnshard,
         state: _OwnerRowsUnshardState,
-    ) -> None:
+        *,
+        async_op: bool = False,
+    ) -> dist.Work | None:
         if prepared.persistent_buffers is not None:
             # A refill gathers straight into the persistent rows.
             gathered = prepared.persistent_buffers[0]
@@ -759,10 +767,11 @@ class MixedBucketPlacement(Placement):
             gathered = prepared.buffers[0].new_empty(state.world_size * state.row_numel)
             prepared.buffers.insert(1, gathered)
         with _record_comm_if_eager("FlexShard::mixed_all_gather", state.debug_fqn):
-            dist.all_gather_into_tensor(
+            return dist.all_gather_into_tensor(
                 output_tensor=gathered,
                 input_tensor=prepared.buffers[0],
                 group=state.pg,
+                async_op=async_op,
             )
 
     def _finish_owner_rows_unshard(
