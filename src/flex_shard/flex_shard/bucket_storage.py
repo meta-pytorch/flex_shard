@@ -159,8 +159,15 @@ class BucketSpec:
             reduce-scatters once the first one's input grads are computed. For
             a bucket of sibling modules, e.g. consecutive transformer layers,
             whose parent would gather it for its whole forward and
-            reduce-scatter it only after its whole backward. Each of them must
-            run a forward of its own, once per forward. Eager only.
+            reduce-scatter it only after its whole backward. As with FSDP2, a
+            forward may skip some of them, and the root module's post-forward
+            then completes the group, e.g. a decoder that returns its norm's
+            output and leaves the output projection in its bucket to the
+            loss. One of them may also run on its own, e.g. that projection
+            on each chunk of the hidden states with a backward per chunk:
+            such a call does not complete the group, so its outputs get no
+            pre-backward hook, and its post-backward runs as soon as its input
+            grads are computed. Eager only.
         placement_fn: Required callable that maps this bucket's
             ``(named_params, mesh)`` to per-parameter placements.
             The minimal eager path expects one ``Placement`` per parameter.

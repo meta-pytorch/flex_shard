@@ -313,8 +313,24 @@ raises, instead of reduce-scattering without the late gradients.
 Some schedules run a module's computation directly, bypassing the forward hooks
 that gather its bucket. One example is Megatron-LM's EP all-to-all overlap,
 which calls each layer's sub-modules. Like FSDP2, call `model.unshard()` first:
-it gathers every bucket and keeps it gathered until the end of a backward or
-`finalize_backward()` finishes it.
+it gathers every bucket and keeps it gathered until the end of a backward that
+re-gathers a bucket, or `finalize_backward()`, finishes it.
+
+Like `fully_shard` on a list of modules, a bucket whose patterns name several
+modules handles forwards that skip some of them and calls of one of them on its
+own. torchtitan's chunked loss does both: the decoder's forward returns the
+norm's output without the output projection that shares its bucket, and the
+loss then applies the projection to each chunk of the hidden states, with a
+backward per chunk. The root module's post-forward completes the bucket's
+forward, so the norm's backward re-gathers it. A call of the projection on its
+own does not complete the bucket: its outputs get no pre-backward hook, and its
+post-backward reduce-scatters, or keeps the gradients without sync, as soon as
+its input gradients are computed. As FSDP2's final callback, the end of a
+backward finishes the buckets it left unsharded and resets per-backward state
+only if the backward re-gathered a bucket in a pre-backward hook; the backward
+of such a call only waits for its reduce-scatters. Combined with the per-bucket
+methods above, this reduce-scatters like FSDP2 under the chunked loss, bit for
+bit.
 
 A regular FlexShard `state_dict()` contains rank-local shards. It is not a
 gathered model checkpoint. Existing FSDP2 checkpoint code needs an explicit
