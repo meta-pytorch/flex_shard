@@ -195,6 +195,7 @@ def make_fp8_bucketed_block_placement_fn(
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
     column_blocks_for_long_rows: bool | None = None,
     tile_units: bool | None = None,
+    cache_forward_payload: bool | None = None,
 ) -> PlacementFn:
     """Assign one FP8 bucketed block placement using the mesh rank count."""
 
@@ -209,6 +210,7 @@ def make_fp8_bucketed_block_placement_fn(
             fp8_dtype=fp8_dtype,
             column_blocks_for_long_rows=column_blocks_for_long_rows,
             tile_units=tile_units,
+            cache_forward_payload=cache_forward_payload,
         )
         return {fqn: (placement,) for fqn, _ in named_params}
 
@@ -357,6 +359,35 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         debug_fqn: str | None
         metadata: Fp8BucketedBlockShard._Fp8BucketMetadata
 
+    @dataclass(frozen=True)
+    class _LocalPackedSourceState:
+        """Source identity and view state for one cached local shard."""
+
+        storage: Any
+        version: int
+        storage_offset: int
+        shape: torch.Size
+        stride: tuple[int, ...]
+        dtype: torch.dtype
+        is_conj: bool
+        is_neg: bool
+
+    @dataclass(frozen=True)
+    class _LocalPackedInfoState:
+        """ParamInfo state that can change the quantized payload."""
+
+        info: ParamInfo
+        unsharded_dtype: torch.dtype
+
+    @dataclass(frozen=True)
+    class _LocalPackedCacheEntry:
+        """Versioned local FP8 send payload for one bucket and rank."""
+
+        info_states: tuple[Fp8BucketedBlockShard._LocalPackedInfoState, ...]
+        source_states: tuple[Fp8BucketedBlockShard._LocalPackedSourceState, ...]
+        metadata: Fp8BucketedBlockShard._Fp8BucketMetadata
+        packed: torch.Tensor
+
     def __init__(
         self,
         *,
@@ -366,6 +397,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         fp8_dtype: torch.dtype = torch.float8_e4m3fn,
         column_blocks_for_long_rows: bool | None = None,
         tile_units: bool | None = None,
+        cache_forward_payload: bool | None = None,
     ) -> None:
         """``column_blocks_for_long_rows`` (experimental, default off; None reads
         ``FLEX_SHARD_FP8_COLUMN_BLOCKS=1``): own a 2-D weight by
@@ -383,7 +415,16 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         of padding even when a weight's block row is larger than a rank's
         share, e.g. DeepSeek V3's attention output projection at 384 ranks. It
         takes precedence over ``column_blocks_for_long_rows``. Distributed
-        checkpointing isn't tested with it yet."""
+        checkpointing isn't tested with it yet.
+
+        ``cache_forward_payload`` (default off; None reads
+        ``FLEX_SHARD_FP8_CACHE_PAYLOAD=1``): keep each forward gather's
+        quantized payload for the backward re-gather, which then skips the
+        copy-in's quantization and packing, saving its CPU time. The payloads
+        stay alive on the unshard stream between the gather buffers, which can
+        fragment its pool when those buffers are large (Llama 3.1 405B's are
+        3.2 GB); with small ones, e.g. DeepSeek V3's at 384 ranks, the CPU
+        saving matters more."""
         if world_size <= 0:
             raise ValueError(
                 f"Fp8BucketedBlockShard world_size must be positive, got {world_size}."
@@ -407,9 +448,18 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         if tile_units is None:
             tile_units = os.environ.get("FLEX_SHARD_FP8_TILE_UNITS") == "1"
         self.tile_units = tile_units
+        if cache_forward_payload is None:
+            cache_forward_payload = (
+                os.environ.get("FLEX_SHARD_FP8_CACHE_PAYLOAD") == "1"
+            )
+        self.cache_forward_payload = cache_forward_payload
         self._metadata_plans: dict[
             int,
             Fp8BucketedBlockShard._Fp8MetadataPlan,
+        ] = {}
+        self._local_packed_cache: dict[
+            tuple[int, int, torch.device, Any],
+            Fp8BucketedBlockShard._LocalPackedCacheEntry,
         ] = {}
         self._copy_out_plans: dict[
             tuple[int, int, bool],
@@ -442,6 +492,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             and self.weight_factory is other.weight_factory
             and self.column_blocks_for_long_rows == other.column_blocks_for_long_rows
             and self.tile_units == other.tile_units
+            and self.cache_forward_payload == other.cache_forward_payload
         )
 
     def __hash__(self) -> int:
@@ -454,6 +505,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                 id(self.weight_factory),
                 self.column_blocks_for_long_rows,
                 self.tile_units,
+                self.cache_forward_payload,
             )
         )
 
@@ -946,6 +998,61 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             )
         return weight
 
+    @staticmethod
+    def _local_packed_source_state(
+        tensor: torch.Tensor,
+    ) -> _LocalPackedSourceState:
+        return Fp8BucketedBlockShard._LocalPackedSourceState(
+            # Keep the storage alive so allocator address reuse cannot turn a
+            # replacement tensor into a false cache hit.
+            storage=tensor.untyped_storage(),
+            version=tensor._version,
+            storage_offset=tensor.storage_offset(),
+            shape=tensor.shape,
+            stride=tensor.stride(),
+            dtype=tensor.dtype,
+            is_conj=tensor.is_conj(),
+            is_neg=tensor.is_neg(),
+        )
+
+    @staticmethod
+    def _local_packed_source_matches(
+        tensor: torch.Tensor,
+        state: _LocalPackedSourceState,
+    ) -> bool:
+        return (
+            tensor._version == state.version
+            and tensor.untyped_storage() is state.storage
+            and tensor.storage_offset() == state.storage_offset
+            and tensor.shape == state.shape
+            and tensor.stride() == state.stride
+            and tensor.dtype == state.dtype
+            and tensor.is_conj() == state.is_conj
+            and tensor.is_neg() == state.is_neg
+        )
+
+    @staticmethod
+    def _local_packed_info_state(info: ParamInfo) -> _LocalPackedInfoState:
+        return Fp8BucketedBlockShard._LocalPackedInfoState(
+            info=info,
+            unsharded_dtype=info.unsharded_dtype,
+        )
+
+    @staticmethod
+    def _local_packed_info_matches(
+        info: ParamInfo,
+        state: _LocalPackedInfoState,
+    ) -> bool:
+        return info is state.info and info.unsharded_dtype == state.unsharded_dtype
+
+    @staticmethod
+    def _local_packed_cache_context(
+        tensors: list[torch.Tensor],
+    ) -> tuple[torch.device, Any]:
+        device = next((t.device for t in tensors if t.numel() > 0), tensors[0].device)
+        stream = torch.cuda.current_stream(device)
+        return device, stream
+
     def _pack_local_quantized_chunks(  # noqa: C901
         self,
         tensors: list[torch.Tensor],
@@ -1039,6 +1146,80 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
             packed_dsts = []
         foreach_copy_(packed_dsts, [*fp8_srcs, *scale_srcs])
         return local_packed
+
+    def _cached_local_quantized_chunks(
+        self,
+        tensors: list[torch.Tensor],
+        infos: list[ParamInfo],
+        rank: int,
+    ) -> tuple[torch.Tensor, _Fp8BucketMetadata]:
+        """Cache one forward payload for its backward re-gather.
+
+        Some fused optimizers mutate parameters without advancing ``_version``.
+        Forward therefore always refreshes the entry; backward may consume that
+        entry once when every secondary source and execution-context check agrees.
+        """
+        metadata = self._fp8_metadata_from_infos(infos)
+        if torch.compiler.is_compiling():
+            return (
+                self._pack_local_quantized_chunks(tensors, infos, rank, metadata),
+                metadata,
+            )
+
+        device, stream = self._local_packed_cache_context(tensors)
+        cache_prefix = (rank, id(metadata))
+        cache_key = (*cache_prefix, device, stream)
+        if not _is_backward_graph_task():
+            packed = self._pack_local_quantized_chunks(
+                tensors,
+                infos,
+                rank,
+                metadata,
+            )
+            for existing_key in tuple(self._local_packed_cache):
+                if existing_key[:2] == cache_prefix:
+                    del self._local_packed_cache[existing_key]
+            self._local_packed_cache[cache_key] = self._LocalPackedCacheEntry(
+                info_states=tuple(
+                    self._local_packed_info_state(info) for info in infos
+                ),
+                source_states=tuple(
+                    self._local_packed_source_state(tensor) for tensor in tensors
+                ),
+                metadata=metadata,
+                packed=packed,
+            )
+            return packed, metadata
+
+        cached = self._local_packed_cache.pop(cache_key, None)
+        info_matches = (
+            cached is not None
+            and cached.metadata is metadata
+            and len(cached.info_states) == len(infos)
+            and all(
+                self._local_packed_info_matches(info, state)
+                for info, state in zip(infos, cached.info_states, strict=True)
+            )
+        )
+        if (
+            cached is not None
+            and info_matches
+            and len(cached.source_states) == len(tensors)
+            and all(
+                self._local_packed_source_matches(tensor, state)
+                for tensor, state in zip(
+                    tensors,
+                    cached.source_states,
+                    strict=True,
+                )
+            )
+        ):
+            return cached.packed, metadata
+
+        return (
+            self._pack_local_quantized_chunks(tensors, infos, rank, metadata),
+            metadata,
+        )
 
     @override
     def bucket_storage_layout(
@@ -1389,18 +1570,22 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         debug_fqn: str | None,
     ) -> PlacementPreparedUnshard:
         """Prepare the local send payload without allocating gather output."""
-        # Every gather quantizes, backward re-gathers included, as FSDP2's
-        # per-gather quantization does. A payload kept from forward to the
-        # backward re-gather would sit between the gather buffers in the
-        # unshard stream's pool and fragment it.
+        rank = mesh.get_local_rank()
         with _record_copy_in_if_eager():
-            metadata = self._fp8_metadata_from_infos(infos)
-            local_packed = self._pack_local_quantized_chunks(
-                tensors,
-                infos,
-                mesh.get_local_rank(),
-                metadata,
-            )
+            if self.cache_forward_payload:
+                local_packed, metadata = self._cached_local_quantized_chunks(
+                    tensors,
+                    infos,
+                    rank,
+                )
+            else:
+                # Every gather quantizes, backward re-gathers included, as
+                # FSDP2's per-gather quantization does (see
+                # cache_forward_payload).
+                metadata = self._fp8_metadata_from_infos(infos)
+                local_packed = self._pack_local_quantized_chunks(
+                    tensors, infos, rank, metadata
+                )
 
         return PlacementPreparedUnshard(
             placement=self,
@@ -2101,6 +2286,10 @@ def _is_vec_copy_viewable(tensor: torch.Tensor) -> bool:
         and tensor.storage_offset() % _VEC_COPY_NBYTES == 0
         and all(stride % _VEC_COPY_NBYTES == 0 for stride in tensor.stride()[:-1])
     )
+
+
+def _is_backward_graph_task() -> bool:
+    return torch._C._current_graph_task_id() >= 0
 
 
 __all__ = [
