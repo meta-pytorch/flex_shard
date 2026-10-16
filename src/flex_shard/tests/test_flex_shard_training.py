@@ -1282,9 +1282,9 @@ class TestFlexShardTraining(FSDPTest):
         bf16, fp32 = torch.bfloat16, torch.float32
         # Each case exercises one source of the unsharded accumulation dtype.
         # Grads of 256, from a backward without sync, and then 1, from a
-        # syncing one, accumulate to 257 only in fp32. As in FSDP2, the upcast
-        # is deferred: the backward without sync still holds the grad in the
-        # compute dtype when it reshards and widens it after.
+        # syncing one, accumulate to 257 only in fp32. As in FSDP2, the
+        # backward without sync starts the grad, so it keeps the upcast: the
+        # grad is already in the accumulation dtype when the bucket reshards.
         cases = (
             ("storage_dtype", fp32, None, bf16, None, fp32, 257.0),
             ("explicit_grad_dtype", bf16, fp32, None, None, fp32, 257.0),
@@ -1341,7 +1341,7 @@ class TestFlexShardTraining(FSDPTest):
                     model.set_requires_gradient_sync(False)
                     model(256 * x).backward()
                 unsharded_param = reshards.call_args.args[0].unsharded_params[0]
-                self.assertEqual(at_reshard, [[compute_dtype]])
+                self.assertEqual(at_reshard, [[accumulation_dtype]])
                 self.assertEqual(unsharded_param.grad.dtype, accumulation_dtype)
                 model.set_requires_gradient_sync(True)
                 model(x).backward()
@@ -1361,6 +1361,49 @@ class TestFlexShardTraining(FSDPTest):
                         world_size=self.world_size,
                     ),
                 )
+
+    @skip_if_lt_x_gpu(2)
+    def test_reshard_restores_deferred_grad_upcast(self):
+        # torch.distributed.pipelining runs a stage's forward and backward to
+        # infer its shapes, with manual backward finalization, then calls
+        # reshard(). That backward syncs, so it defers the upcast, and nothing
+        # finishes it; reshard() must restore the upcast, as FSDP2's
+        # post-backward does after every call.
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+        model = _AccumulatingWeight(device=device_type, dtype=torch.float32)
+        flex_shard(
+            model,
+            buckets=[
+                BucketSpec(
+                    ["*"],
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16),
+                    reshard_after_forward=False,
+                )
+            ],
+        )
+        x = torch.ones(1, 8, dtype=torch.bfloat16, device=device_type)
+        model.set_manual_backward_finalization(True)
+        model(256 * x).backward()
+        unsharded_param = model._parameters["weight"]
+        self.assertIsNone(unsharded_param.grad_dtype)
+        self.assertEqual(unsharded_param.grad.dtype, torch.bfloat16)
+
+        model.reshard()
+        self.assertEqual(unsharded_param.grad_dtype, torch.float32)
+        self.assertEqual(unsharded_param.grad.dtype, torch.float32)
+        # A backward without sync then adds 1 to the kept 256 in fp32.
+        model.set_manual_backward_finalization(False)
+        model.set_requires_gradient_sync(False)
+        model(x).backward()
+        grad = unsharded_param.grad
+        self.assertEqual(grad.dtype, torch.float32)
+        self.assertEqual(grad, torch.full_like(grad, 257.0))
 
     @skip_if_lt_x_gpu(2)
     def test_bucket_reduces_in_promoted_grad_dtype(self):
@@ -1411,11 +1454,12 @@ class TestFlexShardTraining(FSDPTest):
         self.assertEqual(model.a._parameters["weight"].grad.dtype, torch.bfloat16)
         model.set_requires_gradient_sync(True)
         model(x).backward()
-        # b's two uses sum in its bf16 compute dtype while its upcast is
-        # deferred, as in FSDP2, so each backward adds 256 rather than 257.
+        # As in FSDP2, b's first backward, without sync, starts its grad and
+        # keeps the upcast, so its two uses sum to 257 in fp32; the syncing
+        # backward defers the upcast and sums them to 256 in bf16.
         for module, grad_value, grad_dtype in (
             (model.a, 512.0, torch.bfloat16),
-            (model.b, 512.0, torch.float32),
+            (model.b, 513.0, torch.float32),
         ):
             grad = module._parameters["weight"].grad
             self.assertEqual(grad.dtype, grad_dtype)
