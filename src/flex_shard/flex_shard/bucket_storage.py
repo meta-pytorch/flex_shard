@@ -373,6 +373,9 @@ class ShardedBucketStorage:
         # See set_requires_gradient_sync and set_reshard_after_backward.
         self._requires_gradient_sync = True
         self._reshard_after_backward = True
+        # See set_buckets_to_forward_prefetch and set_buckets_to_backward_prefetch.
+        self._forward_prefetch: list[ShardedBucketStorage] | None = None
+        self._backward_prefetch: list[ShardedBucketStorage] | None = None
         self._gradient_reduction = GradientReduction(
             gradient_reduce_op, gradient_divide_factor
         )
@@ -784,6 +787,37 @@ class ShardedBucketStorage:
         """
         self._reshard_after_backward = reshard_after_backward
 
+    def set_buckets_to_forward_prefetch(
+        self, buckets: list[ShardedBucketStorage]
+    ) -> None:
+        """Set the buckets this bucket prefetches in forward, like FSDP2's
+        ``set_modules_to_forward_prefetch``.
+
+        Right after this bucket unshards in its pre-forward hook, the listed
+        buckets start their all-gathers, in order, unless they are unsharded
+        already. Each stays in flight until its own hook takes it, or the
+        backward or ``FlexShardModule.reshard()`` releases it, so listing more
+        buckets overlaps more communication and holds more unsharded buckets
+        at once. Without a list, a bucket prefetches the next bucket in the
+        learned forward order, one prefetch at a time; a list, even an empty
+        one, replaces that. The buckets must come from the same ``flex_shard``
+        call. Eager only.
+        """
+        self._forward_prefetch = _check_prefetch_buckets(buckets)
+
+    def set_buckets_to_backward_prefetch(
+        self, buckets: list[ShardedBucketStorage]
+    ) -> None:
+        """Set the buckets this bucket prefetches in backward, like FSDP2's
+        ``set_modules_to_backward_prefetch``.
+
+        Right after this bucket re-gathers in its pre-backward hook, the listed
+        buckets start their all-gathers, as ``set_buckets_to_forward_prefetch``
+        describes. Without a list, a bucket prefetches the next bucket in the
+        reverse post-forward order; a list, even an empty one, replaces that.
+        """
+        self._backward_prefetch = _check_prefetch_buckets(buckets)
+
     @property
     def world_size(self) -> int:
         """World size of the mesh."""
@@ -793,6 +827,19 @@ class ShardedBucketStorage:
         """Get the local tensor view for a parameter by FQN (from sharded storage)."""
         info = self._param_infos[fqn]
         return info.placement.make_local_storage_view(self._byte_storage, info)
+
+
+def _check_prefetch_buckets(
+    buckets: list[ShardedBucketStorage],
+) -> list[ShardedBucketStorage]:
+    buckets = list(buckets)
+    for bucket in buckets:
+        if not isinstance(bucket, ShardedBucketStorage):
+            raise TypeError(
+                "Prefetch targets must be entries of "
+                f"FlexShardModule.sharded_bucket_storages, got {type(bucket).__name__}."
+            )
+    return buckets
 
 
 def _assign_params_to_buckets(
