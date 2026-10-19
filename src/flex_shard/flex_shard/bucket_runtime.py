@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import _get_device_handle
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
-from torch.utils._pytree import tree_leaves
+from torch.utils._pytree import tree_leaves, tree_map_only
 
 from .bucket_comm import (
     begin_bucket_unshard,
@@ -149,6 +149,20 @@ class PendingReduceGrad:
     result: ReduceGradHandle
 
 
+@dataclass
+class GroupForwardPass:
+    """One forward call of a bucket that hooks several modules: from the call
+    of the first of them until the last finishes (or the root module's
+    post-forward completes it), as FSDP2's group state stays FORWARD."""
+
+    # Whether the call's inputs carry a post-backward trigger.
+    has_trigger: bool = False
+    # Whether the group's post-forward ran for it. A trigger of a call that
+    # never completed (one of the modules run on its own) runs post-backward
+    # as soon as it fires.
+    completed: bool = False
+
+
 class GradientReductionHandle:
     """Returned by ``FlexShardModule.finalize_backward(async_op=True)``.
 
@@ -189,6 +203,9 @@ class BucketCommContext:
     reduce_grad_states: list[PendingReduceGrad] = field(default_factory=list)
     retired_reduce_grad_states: list[PendingReduceGrad] = field(default_factory=list)
     post_backward_callback_queued: bool = False
+    # Whether the queued callback finishes the buckets, not only waits (see
+    # queue_post_backward_callback).
+    finish_at_backward_end: bool = False
     # See FlexShardModule.set_manual_backward_finalization and finalize_backward.
     manual_backward_finalization: bool = False
     pending_finalization: GradientReductionHandle | None = None
@@ -337,26 +354,33 @@ class BucketCommContext:
             # A refill's begin re-allocated the storage (a first unshard has none).
             pending.bucket.free_persistent_storage()
 
-    def queue_post_backward_callback(self) -> None:
+    def queue_post_backward_callback(self, *, finish: bool) -> None:
         """Queue the end-of-backward callback (once per backward).
 
-        It finishes the buckets the backward left (``finish_buckets``), waits
-        on all reduce-grad work, and releases unused prefetches. With manual
-        backward finalization, or outside a backward (``finalize_backward``),
-        nothing is queued.
+        It waits on all reduce-grad work. With ``finish``, requested by a
+        pre-backward hook, it also finishes the buckets the backward left
+        (``finish_buckets``) and releases unused prefetches; FSDP2 likewise
+        queues its final callback only from a pre-backward hook. A backward
+        that only ran post-backward triggers, e.g. of a module called on its
+        own on chunks of an output, so leaves the other buckets' forward to a
+        later backward. With manual backward finalization, or outside a
+        backward (``finalize_backward``), nothing is queued.
         """
-        if (
-            self.post_backward_callback_queued
-            or self.manual_backward_finalization
-            or not _in_backward()
-        ):
+        if self.manual_backward_finalization or not _in_backward():
+            return
+        self.finish_at_backward_end |= finish
+        if self.post_backward_callback_queued:
             return
         self.post_backward_callback_queued = True
 
         def _post_backward_callback() -> None:
-            self.finish_buckets()
+            finish = self.finish_at_backward_end
+            if finish:
+                self.finish_buckets()
             self.wait_and_clear_reduce_grad_states(debug_fqn=None)
-            self.take_pending_unshard(None)
+            if finish:
+                self.take_pending_unshard(None)
+            self.finish_at_backward_end = False
             self.post_backward_callback_queued = False
 
         torch.autograd.Variable._execution_engine.queue_callback(
@@ -516,6 +540,12 @@ class BucketRuntime:
     input_triggers: int = 0
     input_triggers_run: int = 0
     call_has_trigger: list[bool] = field(default_factory=list)
+    # A bucket hooking several modules (BucketSpec.patterns): the modules, the
+    # ones whose forward the current pass still awaits, and its open forward
+    # call, if any (see GroupForwardPass).
+    group_modules: tuple[nn.Module, ...] = field(default=(), repr=False)
+    modules_to_run: set[nn.Module] = field(default_factory=set, repr=False)
+    group_pass: GroupForwardPass | None = None
     # Whether a backward without gradient sync finished this bucket since its
     # last reduce-scatter, so the next syncing backward reduces it even if it
     # does not use the bucket. Unlike grad presence, the same on every rank.
@@ -692,7 +722,7 @@ class BucketRuntime:
                         self.context.reduce_grad_stream,
                     )
             self.context.reduce_grad_states.append(PendingReduceGrad(result))
-            self.context.queue_post_backward_callback()
+            self.context.queue_post_backward_callback(finish=False)
 
     # ------------------------------------------------------------------
     # Eager: persistent unsharded parameters
@@ -816,8 +846,11 @@ class BucketRuntime:
             _free_storage(persistent_buffer)
 
     def reset_backward_state(self) -> None:
-        """Clear the post-backward trigger counts at the end of a backward."""
+        """Clear the post-backward trigger counts and the group's forward
+        state at the end of a backward, as FSDP2's final callback does."""
         self.backward_calls = self.input_triggers = self.input_triggers_run = 0
+        self.modules_to_run.clear()
+        self.group_pass = None
 
     def needs_finish(self) -> bool:
         """Whether backwards left this bucket to finish: still unsharded (no
@@ -835,7 +868,7 @@ class BucketRuntime:
         post-backward trigger (a hook on that same output) frees its params
         before this re-gather, as FSDP2's ordering does.
         """
-        self.context.queue_post_backward_callback()
+        self.context.queue_post_backward_callback(finish=True)
         self.unshard()
         self._set_unsharded_grad_dtypes(defer_upcast=True)
         if self.bucket_storage._pre_backward_hook is not None:
@@ -914,13 +947,31 @@ class BucketRuntime:
         only when every forward call since the last backward carried a trigger
         and all of them ran, so no other call's backward still needs the params.
         A bucket that defers its post-backward waits for
-        ``FlexShardModule.finish_deferred_backward`` instead.
+        ``FlexShardModule.finish_deferred_backward`` instead. Once it fires,
+        the counts restart, as a backward that runs no pre-backward hook does
+        not reset them (see ``BucketCommContext.queue_post_backward_callback``).
         """
         self.input_triggers_run += 1
         if self.bucket_storage._defer_post_backward:
             return
         if self.backward_calls == self.input_triggers == self.input_triggers_run:
             self.post_backward()
+            self.backward_calls = self.input_triggers = self.input_triggers_run = 0
+
+    def on_partial_input_grads(self, forward_pass: GroupForwardPass) -> None:
+        """Post-backward trigger of a forward call that did not complete the
+        group: a module of the bucket called on its own, e.g. an output
+        projection applied to chunks of the hidden states.
+
+        Such a call has no pre-backward hook and no other call to wait for, so
+        as in FSDP2's partial group backward, it reduces right away, or keeps
+        the grads without gradient sync, and the next call starts a new pass.
+        """
+        if self.group_pass is forward_pass:
+            self.group_pass = None
+        if self.bucket_storage._defer_post_backward:
+            return
+        self.post_backward()
 
     def post_backward(self) -> None:
         """Reduce-scatter this backward's grads into the shards and reshard.
@@ -1018,48 +1069,101 @@ class BucketRuntime:
         mod: nn.Module,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> None:
+    ) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
         if torch.compiler.is_compiling():
             self._pre_forward_compile()
-            return
+            return None
         if _in_backward():
-            # Activation-checkpoint recompute: the pre-backward hook usually
-            # re-gathered already; otherwise this consumes its prefetch. A
-            # forward without grad (reentrant checkpointing) left no
-            # pre-backward hook to run the bucket's pre_backward_hook, so run
-            # it here, before the recomputed backward.
             self.call_has_trigger.append(False)
-            self.unshard()
-            if self.bucket_storage._pre_backward_hook is not None:
-                self.bucket_storage._pre_backward_hook(self._named_unsharded_params())
-            return
+            self._unshard_for_recompute()
+            return None
+        self._check_forward_allowed()
+        if self.forward_index is None:
+            self.forward_index = len(self.context.forward_order)
+            self.context.forward_order.append(self)
+        self.unshard()
+        self._prefetch(forward=True)
+        args, kwargs, has_trigger = self._register_input_grad_hook(args, kwargs)
+        self.call_has_trigger.append(has_trigger)
+        return args, kwargs
+
+    def group_pre_forward_hook(
+        self,
+        mod: nn.Module,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
+        """Pre-forward hook of each module of a bucket that hooks several, as
+        FSDP2's ``_register_group_forward_hooks`` runs a group's: every call
+        unshards, and the call that opens a forward pass of the group, by its
+        first module or by one module on its own, gets the post-backward
+        trigger."""
+        if torch.compiler.is_compiling():
+            self._pre_forward_compile()
+            return None
+        if _in_backward():
+            self._unshard_for_recompute()
+            return None
+        self._check_forward_allowed()
+        if not self.modules_to_run:
+            self.modules_to_run.update(self.group_modules)
+        opens_pass = self.group_pass is None
+        if opens_pass and self.forward_index is None:
+            self.forward_index = len(self.context.forward_order)
+            self.context.forward_order.append(self)
+        self.unshard()
+        if not opens_pass:
+            return None
+        self._prefetch(forward=True)
+        forward_pass = GroupForwardPass()
+        args, kwargs, forward_pass.has_trigger = self._register_input_grad_hook(
+            args, kwargs, forward_pass
+        )
+        self.group_pass = forward_pass
+        return args, kwargs
+
+    def _unshard_for_recompute(self) -> None:
+        """Unshard for an activation-checkpoint recompute in backward.
+
+        The pre-backward hook usually re-gathered already; otherwise this
+        consumes its prefetch. A forward without grad (reentrant
+        checkpointing) left no pre-backward hook to run the bucket's
+        pre_backward_hook, so run it here, before the recomputed backward.
+        """
+        self.unshard()
+        if self.bucket_storage._pre_backward_hook is not None:
+            self.bucket_storage._pre_backward_hook(self._named_unsharded_params())
+
+    def _check_forward_allowed(self) -> None:
         self.context.check_no_raised_backward()
         if self.context.pending_finalization is not None:
             raise RuntimeError(
                 "FlexShard: wait on the finalize_backward() handle before the next "
                 "forward."
             )
-        if self.forward_index is None:
-            self.forward_index = len(self.context.forward_order)
-            self.context.forward_order.append(self)
-        self.unshard()
-        self._prefetch(forward=True)
-        self.call_has_trigger.append(self._register_input_grad_hook(args, kwargs))
 
     def _register_input_grad_hook(
         self,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> bool:
-        """Call ``on_input_grads`` once this forward's input grads are computed.
+        forward_pass: GroupForwardPass | None = None,
+    ) -> tuple[tuple[Any, ...], dict[str, Any], bool]:
+        """Run the post-backward trigger once this forward's input grads are
+        computed. Return the args and kwargs to call the module with, and
+        whether the trigger exists.
 
         A multi-grad hook on the inputs does what FSDP2's
-        ``RegisterPostBackwardFunction`` does without wrapping them. Forwards
-        without grad-requiring inputs, or with leaf ones (whose hooks would
-        outlive this graph), get no trigger.
+        ``RegisterPostBackwardFunction`` does without wrapping them. A hook on
+        a leaf input, e.g. a detached chunk of hidden states, would outlive
+        this graph, and one on a view of it would form a reference cycle that
+        keeps the leaf, and the storage it views, alive until the next garbage
+        collection. Inputs that include a leaf are therefore wrapped in an
+        identity autograd function whose backward runs the trigger, as FSDP2
+        wraps all inputs. Forwards without grad-requiring inputs, or with leaf
+        ones inside dataclasses, get no trigger.
         """
         if not torch.is_grad_enabled():
-            return False
+            return args, kwargs, False
         inputs = list(
             {
                 id(tensor): tensor
@@ -1067,12 +1171,37 @@ class BucketRuntime:
                 if tensor.requires_grad
             }.values()
         )
-        if not inputs or any(tensor.grad_fn is None for tensor in inputs):
-            return False
-        torch.autograd.graph.register_multi_grad_hook(
-            inputs, lambda grads: self.on_input_grads()
+        if not inputs:
+            return args, kwargs, False
+        if all(tensor.grad_fn is not None for tensor in inputs):
+            torch.autograd.graph.register_multi_grad_hook(
+                inputs, lambda grads: self._input_grads_ready(forward_pass)
+            )
+            return args, kwargs, True
+        # Only the inputs tree_map reaches can be replaced by the wrapped ones.
+        reachable = {
+            id(leaf)
+            for leaf in tree_leaves((args, kwargs))
+            if isinstance(leaf, torch.Tensor)
+        }
+        if any(id(tensor) not in reachable for tensor in inputs):
+            return args, kwargs, False
+        outputs = _InputGradsTrigger.apply(
+            functools.partial(self._input_grads_ready, forward_pass), *inputs
         )
-        return True
+        wrapped = {
+            id(tensor): output for tensor, output in zip(inputs, outputs, strict=True)
+        }
+        args, kwargs = tree_map_only(
+            torch.Tensor, lambda tensor: wrapped.get(id(tensor), tensor), (args, kwargs)
+        )
+        return args, kwargs, True
+
+    def _input_grads_ready(self, forward_pass: GroupForwardPass | None) -> None:
+        if forward_pass is None or forward_pass.completed:
+            self.on_input_grads()
+        else:
+            self.on_partial_input_grads(forward_pass)
 
     def post_forward_hook(self, mod: nn.Module, args: Any, output: Any) -> None:
         if torch.compiler.is_compiling():
@@ -1083,6 +1212,38 @@ class BucketRuntime:
             # Activation-checkpoint recompute inside backward: this bucket's
             # backward still needs the params; post-backward reshards.
             return
+        self._post_forward(output, has_trigger)
+
+    def group_post_forward_hook(self, mod: nn.Module, args: Any, output: Any) -> None:
+        """Post-forward hook of each module of a bucket that hooks several: the
+        group's post-forward runs once the last module of the pass finishes. A
+        module called on its own leaves the pass open, without post-forward,
+        as in FSDP2's partial group forward."""
+        if torch.compiler.is_compiling():
+            self._swap_in_params(self.sharded_params)
+            return
+        if _in_backward() or mod not in self.modules_to_run:
+            return
+        self.modules_to_run.discard(mod)
+        if not self.modules_to_run:
+            self.complete_group_pass(output)
+
+    def complete_group_pass(self, output: Any) -> None:
+        """Run the group's post-forward on ``output`` for its open forward
+        pass: once the pass's last module finishes, or from the root module's
+        post-forward for modules the forward skipped, as FSDP2's
+        ``_force_complete_incomplete_states`` does."""
+        forward_pass, self.group_pass = self.group_pass, None
+        self.modules_to_run.clear()
+        has_trigger = False
+        if forward_pass is not None:
+            forward_pass.completed = True
+            has_trigger = forward_pass.has_trigger
+        self._post_forward(output, has_trigger)
+
+    def _post_forward(self, output: Any, has_trigger: bool) -> None:
+        """Reshard after a forward call, or hook its outputs to re-gather in
+        backward and count it for the post-backward trigger."""
         if self.post_forward_index is None:
             self.post_forward_index = len(self.context.post_forward_order)
             self.context.post_forward_order.append(self)
@@ -1153,6 +1314,25 @@ class BucketRuntime:
             )
         full_params = _BucketUnshard.apply(self, *self._local_shards(use_autograd=True))
         self._swap_in_params(list(full_params))
+
+
+class _InputGradsTrigger(torch.autograd.Function):
+    """Identity on a forward call's grad-requiring inputs whose backward runs
+    ``callback`` once their grads are computed, as FSDP2's
+    ``RegisterPostBackwardFunction`` runs its post-backward. Unlike hooks on
+    the inputs, it holds nothing that refers back to the graph."""
+
+    @staticmethod
+    def forward(
+        ctx: Any, callback: Callable[[], None], *inputs: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        ctx.callback = callback
+        return inputs
+
+    @staticmethod
+    def backward(ctx: Any, *grads: torch.Tensor) -> tuple[Any, ...]:
+        ctx.callback()
+        return (None, *grads)
 
 
 class _BucketUnshard(torch.autograd.Function):
@@ -1312,6 +1492,7 @@ def _install_bucket_unshard_hooks(
     """Install each bucket's forward hooks (one collective per bucket), and
     state-dict hooks that reshard first, as FSDP2 does."""
     owner_buckets: dict[nn.Module, dict[int, BucketRuntime]] = {}
+    group_buckets: list[BucketRuntime] = []
     for bucket_storage in bucket_storages:
         if not bucket_storage._param_infos:
             raise AssertionError("Expected FlexShard bucket storage to own parameters.")
@@ -1320,56 +1501,55 @@ def _install_bucket_unshard_hooks(
 
         bucket_runtime = BucketRuntime.from_bucket_storage(bucket_storage)
         # A bucket whose patterns name modules hooks those (BucketSpec.patterns).
-        _register_forward_hooks(
+        modules = (
             [
                 _unwrap_checkpoint(bucket_storage._module.get_submodule(fqn))
                 for fqn in bucket_storage._hook_module_fqns
             ]
             if bucket_storage._hook_module_fqns
-            else [bucket_runtime.forward_hook_module()],
-            bucket_runtime.pre_forward_hook,
-            bucket_runtime.post_forward_hook,
+            else [bucket_runtime.forward_hook_module()]
         )
+        if len(modules) == 1:
+            pre_hook = bucket_runtime.pre_forward_hook
+            post_hook = bucket_runtime.post_forward_hook
+        else:
+            bucket_runtime.group_modules = tuple(modules)
+            pre_hook = bucket_runtime.group_pre_forward_hook
+            post_hook = bucket_runtime.group_post_forward_hook
+            group_buckets.append(bucket_runtime)
+        for module in modules:
+            # Prepended so earlier user pre-forward hooks see the unsharded params.
+            module.register_forward_pre_hook(pre_hook, prepend=True, with_kwargs=True)
+            module.register_forward_hook(post_hook, always_call=True)
         bucket_runtime.context.buckets.append(bucket_runtime)
         for bucket_param in bucket_runtime.bucket_params:
             owner_buckets.setdefault(bucket_param.param_owner.module, {})[
                 id(bucket_runtime)
             ] = bucket_runtime
 
+    if group_buckets:
+        # After the buckets' own hooks on the root module, if any.
+        bucket_storages[0]._module.register_forward_hook(
+            functools.partial(_complete_group_passes, tuple(group_buckets))
+        )
     for module, buckets in owner_buckets.items():
         reshard_hook = functools.partial(_reshard_buckets, tuple(buckets.values()))
         module.register_state_dict_pre_hook(reshard_hook)
         module._register_load_state_dict_pre_hook(reshard_hook)
 
 
-def _register_forward_hooks(
-    modules: list[nn.Module],
-    pre_hook: Callable[..., None],
-    post_hook: Callable[..., None],
+def _complete_group_passes(
+    buckets: tuple[BucketRuntime, ...], module: nn.Module, args: Any, output: Any
 ) -> None:
-    """Run ``pre_hook`` when the first of ``modules`` starts its forward and
-    ``post_hook`` once all of them have finished theirs, as FSDP2's
-    ``_register_group_forward_hooks`` does for ``fully_shard`` on a list of
-    modules. With one module, these are its plain forward hooks."""
-    if len(modules) == 1:
-        group_pre_hook, group_post_hook = pre_hook, post_hook
-    else:
-        to_run: set[nn.Module] = set()
-
-        def group_pre_hook(module: nn.Module, args: Any, kwargs: Any) -> None:
-            if not to_run:
-                to_run.update(modules)
-                pre_hook(module, args, kwargs)
-
-        def group_post_hook(module: nn.Module, args: Any, output: Any) -> None:
-            to_run.discard(module)
-            if not to_run:
-                post_hook(module, args, output)
-
-    for module in modules:
-        # Prepended so earlier user pre-forward hooks see the unsharded params.
-        module.register_forward_pre_hook(group_pre_hook, prepend=True, with_kwargs=True)
-        module.register_forward_hook(group_post_hook, always_call=True)
+    """Root post-forward hook: complete the forward pass of each bucket of
+    several modules that the forward ran only some of, e.g. a norm without the
+    output projection it shares a bucket with, as FSDP2's root post-forward
+    completes such groups."""
+    if torch.compiler.is_compiling() or _in_backward():
+        return
+    for bucket in buckets:
+        if bucket.group_pass is not None:
+            bucket.complete_group_pass(output)
 
 
 def _unwrap_checkpoint(module: nn.Module) -> nn.Module:
