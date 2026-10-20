@@ -11,6 +11,7 @@ from .checkpoint import (
     set_state_dict_global_layouts,
 )
 from .flex_shard import flex_shard, relayout_bucket
+from .param_init import init_from_full
 from .placement_contract import (
     BucketParamStorageLayout,
     BucketStorageLayout,
@@ -45,6 +46,7 @@ __all__ = [
     "get_outer_layout",
     "get_partial_grad_group",
     "get_placements",
+    "init_from_full",
     "is_flex_shard_param",
     "LocalStorageLayout",
     "MixedPrecisionPolicy",
