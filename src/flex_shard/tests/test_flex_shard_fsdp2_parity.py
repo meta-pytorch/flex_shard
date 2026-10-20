@@ -95,7 +95,8 @@ class _Block(nn.Module):
         self.unused = nn.Linear(_DIM, 3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.proj(torch.relu(self.stacked(x * self.scale)))
+        # scale is used twice, so its grad accumulates two uses in a backward.
+        return x + self.proj(torch.relu(self.stacked(x * self.scale))) * self.scale
 
 
 class _Decoder(nn.Module):
