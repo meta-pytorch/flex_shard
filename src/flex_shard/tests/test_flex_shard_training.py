@@ -2092,6 +2092,56 @@ class TestFlexShardTraining(FSDPTest):
                     self.assertEqual(param, plain_param)
 
     @skip_if_lt_x_gpu(2)
+    def test_group_buckets_under_selective_activation_checkpointing(self):
+        # A bucket whose patterns name several modules hooks each of them.
+        # Inside a checkpointed block those group hooks unshard again in the
+        # recompute, so selective activation checkpointing must not see them
+        # either.
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+        torch.manual_seed(0)
+        plain = torch.nn.Sequential(*(_GatedBlock(8) for _ in range(3)))
+        plain = plain.to(device_type)
+        model = copy.deepcopy(plain)
+        for idx, block in enumerate(model):
+            model[idx] = checkpoint_wrapper(
+                block, context_fn=_prefer_recompute_context_fn
+            )
+        for module, prefix in ((plain, ""), (model, "_checkpoint_wrapped_module.")):
+            buckets = [
+                BucketSpec(
+                    [f"{idx}.{prefix}attn", f"{idx}.{prefix}mlp"],
+                    placement_fn=per_param_placements,
+                    mesh=mesh,
+                    reshard_after_forward=True,
+                )
+                for idx in range(len(module))
+            ]
+            flex_shard(module, buckets=buckets)
+        optims = [make_test_sgd(m.parameters(), lr=0.1) for m in (plain, model)]
+        for _ in range(3):
+            x = torch.randn(4, 8, device=device_type)
+            plain_loss = plain(x).square().sum()
+            plain_loss.backward()
+            loss = model(x).square().sum()
+            loss.backward()
+            self.assertEqual(loss, plain_loss)
+            for plain_param, param in zip(
+                plain.parameters(), model.parameters(), strict=True
+            ):
+                self.assertEqual(param.grad, plain_param.grad)
+            for optim in optims:
+                optim.step()
+                optim.zero_grad(set_to_none=True)
+        for plain_param, param in zip(
+            plain.parameters(), model.parameters(), strict=True
+        ):
+            self.assertEqual(param, plain_param)
+
+    @skip_if_lt_x_gpu(2)
     def test_pre_backward_and_post_reduce_hooks(self):
         # Kernels that add weight grads into main_grad and give autograd none
         # (fused gradient accumulation) need the grad allocated before their
