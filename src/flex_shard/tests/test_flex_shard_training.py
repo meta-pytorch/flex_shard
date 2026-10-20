@@ -697,7 +697,8 @@ class TestFlexShardTraining(FSDPTest):
         # reads that bucket as is; training matches an unsharded reference, with
         # and without
         # reshard-after-forward and no-sync. Whole-parameter BucketedOwned
-        # buckets (Muon's) do so in their owners' rows of the gathered bucket.
+        # buckets (Muon's) do so in their owners' rows of the gathered bucket,
+        # and get their grads allocated in that layout even without the hook.
         mesh = init_device_mesh(device_type.type, (self.world_size,))
         placement_fns = {
             "bucketed_block": make_bucketed_block_placement_fn(
@@ -806,9 +807,8 @@ class TestFlexShardTraining(FSDPTest):
                 self.assertGreater(len(in_place), 3)
                 self.assertTrue(all(sent_storage), sent_storage)
                 self.assertTrue(reduced_bucket)
-                self.assertTrue(
-                    all(found == gradient_bucket for found in reduced_bucket)
-                )
+                expect_bucket = gradient_bucket or placement == "owned"
+                self.assertTrue(all(found == expect_bucket for found in reduced_bucket))
 
     @skip_if_lt_x_gpu(2)
     def test_owner_rows_hold_no_padding(self):
@@ -902,6 +902,44 @@ class TestFlexShardTraining(FSDPTest):
                 self.assertEqual(calls["reduce_scatter"] > 0, uneven, calls)
                 self.assertEqual(calls["all_gather_into_tensor"] > 0, not uneven, calls)
                 self.assertEqual(calls["reduce_scatter_tensor"] > 0, not uneven, calls)
+
+    @skip_if_lt_x_gpu(2)
+    def test_owner_rows_reduce_grads_in_param_layout(self):
+        # Owner rows reduce grads allocated in the parameter layout as is, so
+        # the bucket runtime allocates them there when the unsharded params are
+        # in the dtype their grads accumulate and reduce in, not when the grads
+        # accumulate in a wider dtype. Shard buckets copy theirs in.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        bf16 = torch.bfloat16
+        owned = make_bucketed_owned_full_param_placement_fn()
+        for placement_fn, mp_policy, expected in (
+            (owned, None, True),
+            (owned, MixedPrecisionPolicy(param_dtype=bf16, reduce_dtype=bf16), True),
+            (owned, MixedPrecisionPolicy(param_dtype=bf16), False),
+            (per_param_placements, None, False),
+        ):
+            with self.subTest(placement_fn=placement_fn, mp_policy=mp_policy):
+                model = torch.nn.Sequential(
+                    torch.nn.Linear(16, 16), torch.nn.Linear(16, 8)
+                ).to(device_type)
+                flex_shard(
+                    model,
+                    buckets=[
+                        BucketSpec(
+                            ["0.*", "1.*"],
+                            placement_fn=placement_fn,
+                            mesh=mesh,
+                            mp_policy=mp_policy,
+                        )
+                    ],
+                )
+                infos = list(model.sharded_bucket_storages[0].param_infos.values())
+                self.assertEqual(
+                    infos[0].placement.reduces_grads_in_param_layout(
+                        infos, self.world_size
+                    ),
+                    expected,
+                )
 
     @skip_if_lt_x_gpu(2)
     def test_gradient_divide_factor(self):

@@ -380,6 +380,14 @@ class BucketedOwned(Placement):
     ) -> PlacementReduceGradResult:
         return self._mixed_member().reduce_prepared_grad(prepared, reduction)
 
+    @override
+    def reduces_grads_in_param_layout(
+        self, infos: list[ParamInfo], world_size: int
+    ) -> bool:
+        return self._mixed_member().reduces_grads_in_param_layout(
+            self._member_infos(infos), world_size
+        )
+
 
 def _assign_params_to_ranks(
     named_params: list[tuple[str, nn.Parameter]],

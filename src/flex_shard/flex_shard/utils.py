@@ -362,3 +362,27 @@ def _validate_bucket_uniform_dtype_and_placement(
                     "one placement layout. Split parameters with incompatible "
                     "placements into separate buckets."
                 )
+
+
+def alloc_grads_in_param_layout(named_params: list[tuple[str, nn.Parameter]]) -> None:
+    """A ``BucketSpec.pre_backward_hook`` that allocates the missing grads
+    zeroed, as views of one buffer per storage the unsharded params view, at
+    their offsets, as Megatron-LM allocates ``main_grad``: a placement whose
+    gradient reduction layout is its parameter layout reduces that buffer as
+    is. The bucket runtime runs it for such a bucket with no hook of its own
+    (see ``Placement.reduces_grads_in_param_layout``)."""
+    buffers: dict[int, torch.Tensor] = {}
+    for _, param in named_params:
+        if not param.requires_grad or param.grad is not None:
+            continue
+        storage = param.untyped_storage()
+        buffer = buffers.get(storage._cdata)
+        if buffer is None:
+            buffer = torch.zeros(
+                storage.nbytes() // param.element_size(),
+                dtype=param.dtype,
+                device=param.device,
+            )
+            buffers[storage._cdata] = buffer
+        offset = param.storage_offset()
+        param.grad = buffer[offset : offset + param.numel()].view(param.shape)
