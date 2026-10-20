@@ -305,15 +305,25 @@ class BucketCommContext:
                 kept.append(pending)
         self.pending_unshards = kept
 
+    def finish_other_prefetches(self, bucket: BucketRuntime) -> None:
+        """Finish other buckets' learned-order prefetches into their storage,
+        where their own unshards find them, instead of releasing them."""
+        kept, finished = [], []
+        for pending in self.pending_unshards:
+            if pending.bucket is not bucket and not pending.explicit:
+                finished.append(pending)
+            else:
+                kept.append(pending)
+        self.pending_unshards = kept
+        for pending in finished:
+            pending.bucket.finish_unshard(pending.result)
+
     def take_pending_unshard(
         self,
         bucket: BucketRuntime | None,
-        *,
-        finish_others: bool = False,
     ) -> UnshardHandle | None:
         """Return ``bucket``'s prefetched unshard and release other buckets'
-        learned-order prefetches, or with ``finish_others`` finish them into
-        their buckets' storage; ``None`` releases every prefetch.
+        learned-order prefetches; ``None`` releases every prefetch.
 
         A learned-order prefetch for another bucket means execution diverged
         from the learned order; releasing it bounds memory and frees the
@@ -321,19 +331,14 @@ class BucketCommContext:
         """
         result = None
         kept = []
-        finished = []
         for pending in self.pending_unshards:
             if bucket is not None and pending.bucket is bucket:
                 result = pending.result
             elif bucket is not None and pending.explicit:
                 kept.append(pending)
-            elif bucket is not None and finish_others:
-                finished.append(pending)
             else:
                 self._release_prefetch(pending)
         self.pending_unshards = kept
-        for pending in finished:
-            pending.bucket.finish_unshard(pending.result)
         return result
 
     def _release_prefetch(self, pending: PendingUnshard) -> None:
@@ -715,9 +720,9 @@ class BucketRuntime:
         them, instead of being released.
         """
         if not self.is_unsharded:
-            result = self.context.take_pending_unshard(
-                self, finish_others=finish_other_prefetch
-            )
+            if finish_other_prefetch:
+                self.context.finish_other_prefetches(self)
+            result = self.context.take_pending_unshard(self)
             if result is None:
                 result = self.begin_unshard()
             self.finish_unshard(result)
