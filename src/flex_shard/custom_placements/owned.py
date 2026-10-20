@@ -453,10 +453,11 @@ def make_bucketed_owned_expert_block_segments(
     *,
     suffix_order: tuple[str, ...] = (".w1", ".w3", ".w2"),
 ) -> dict[str, list[BucketedOwnedSegmentSpec]]:
-    """Build per-expert BucketedOwned segments for packed 3D expert weights.
+    """Build per-expert BucketedOwned segments for packed expert weights.
 
-    Experts are assigned to contiguous owner ranges. ``suffix_order`` preserves
-    the declarative expert-matrix order; lowering uses per-parameter BlockShard
+    Each weight stores experts along dim 0 and has at least 3 dims. Experts are
+    assigned to contiguous owner ranges. ``suffix_order`` preserves the
+    declarative expert-matrix order; lowering uses per-parameter BlockShard
     layouts.
     """
     if world_size <= 0:
@@ -469,10 +470,13 @@ def make_bucketed_owned_expert_block_segments(
     bad = [
         (fqn, tuple(param.shape))
         for fqn, param in named_params
-        if param.dim() != 3 or not fqn.endswith(suffix_order)
+        if param.dim() < 3 or not fqn.endswith(suffix_order)
     ]
     if bad:
-        raise ValueError(f"BucketedOwned expert block expects packed 3D weights: {bad}")
+        raise ValueError(
+            f"BucketedOwned expert block expects packed weights with at least 3 "
+            f"dims and a suffix in {suffix_order}: {bad}"
+        )
 
     num_experts = named_params[0][1].shape[0]
     if any(param.shape[0] != num_experts for _, param in named_params):
@@ -507,7 +511,7 @@ def make_bucketed_owned_expert_block_placement_fn(
     *,
     suffix_order: tuple[str, ...] = (".w1", ".w3", ".w2"),
 ) -> PlacementFn:
-    """Return a placement function for one packed 3D expert-weight bucket."""
+    """Return a placement function for one packed expert-weight bucket."""
 
     def placement_fn(
         named_params: list[tuple[str, nn.Parameter]],

@@ -177,16 +177,17 @@ def _owned_layout(
     global_storage_shape: torch.Size,
     canonical_shard: LocalMuonStateShard,
 ) -> LocalMuonComputeLayout:
-    if len(global_storage_shape) != 2 or parameter.shape != global_storage_shape:
+    if len(global_storage_shape) < 2 or parameter.shape != global_storage_shape:
         raise NotImplementedError(
-            f"BucketedOwned Muon parameter {fqn!r} must own one complete 2D matrix."
+            f"BucketedOwned Muon parameter {fqn!r} must own one complete matrix "
+            "or matrix batch."
         )
     return _local_muon_compute_layout(
         parameter,
         global_storage_shape,
         canonical_shard,
         kind="owned",
-        inner_global_offset=(0, 0),
+        inner_global_offset=(0,) * len(global_storage_shape),
     )
 
 
@@ -224,10 +225,10 @@ def _bucketed_block_shard_layout(
     placement: BucketedBlockShard,
     param_info: ParamInfo,
 ) -> LocalMuonComputeLayout:
-    if len(global_storage_shape) != 3 or placement.dims != (0,):
+    if len(global_storage_shape) < 3 or placement.dims != (0,):
         raise NotImplementedError(
-            f"BucketedBlockShard Muon parameter {fqn!r} must store a 3D "
-            "matrix batch on dim 0."
+            f"BucketedBlockShard Muon parameter {fqn!r} must store a matrix "
+            "batch of at least 3 dims on dim 0."
         )
     matrix_numel = math.prod(global_storage_shape[1:])
     local_flat_offset = _bucketed_block_local_flat_offset(param_info)
@@ -238,7 +239,10 @@ def _bucketed_block_shard_layout(
         global_storage_shape,
         canonical_shard,
         kind="matrix_batch",
-        inner_global_offset=(local_flat_offset // matrix_numel, 0, 0),
+        inner_global_offset=(
+            local_flat_offset // matrix_numel,
+            *(0,) * (len(global_storage_shape) - 1),
+        ),
     )
 
 
