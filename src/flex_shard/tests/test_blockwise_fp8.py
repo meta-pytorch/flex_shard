@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.func import functional_call
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import FSDPTest, get_devtype
 from torch.testing._internal.common_utils import run_tests, TestCase
@@ -19,6 +20,7 @@ from .. import BucketSpec, flex_shard
 from ..blockwise_fp8 import (
     BlockwiseFp8Weight,
     convert_to_flex_shard_float8_blockwise_linear,
+    FlexShardFloat8BlockwiseLinear,
 )
 from ..custom_placements.fp8_bucketed_block_shard import (
     _align_up,
@@ -250,6 +252,99 @@ class TestBlockwiseFp8Weight(TestCase):
         self.assertEqual(
             wrapped.dequantize(torch.float32),
             wrapped.fp8_data.float() * 0.5,
+        )
+
+    def test_stacked_weight_scales_cover_flattened_matrix(self) -> None:
+        block_size = 4
+        fp8_data = (
+            torch.arange(96, dtype=torch.bfloat16)
+            .reshape(2, 6, 8)
+            .to(torch.float8_e4m3fn)
+        )
+        # One scale per 4x4 block of the [12, 8] matrix; block row 1 holds
+        # rows 4..5 of the first matrix and rows 0..1 of the second.
+        recip_scale = torch.arange(1, 7, dtype=torch.float32).reshape(3, 2)
+        wrapped = BlockwiseFp8Weight(
+            fp8_data,
+            recip_scale,
+            block_size,
+            orig_dtype=torch.bfloat16,
+        )
+
+        self.assertEqual(wrapped.shape, (2, 6, 8))
+        matrix_scale = recip_scale.repeat_interleave(block_size, 0).repeat_interleave(
+            block_size, 1
+        )
+        self.assertEqual(
+            wrapped.dequantize(torch.float32),
+            fp8_data.float() * matrix_scale.view(2, 6, 8),
+        )
+
+
+class TestFlexShardFloat8BlockwiseLinear(TestCase):
+    def test_stacked_weight_matches_flattened_matrix(self) -> None:
+        """A ``[2, F, D]`` weight runs the ``[2F, D]`` GEMM, including the block
+        row that straddles both stacked matrices when ``F % 128 != 0``."""
+        if device_type.type != "cuda" or not is_sm_at_least_90():
+            self.skipTest("Float8BlockwiseLinear requires CUDA SM90+")
+        num_linears, out_dim, in_dim = 2, 192, 256
+        torch.manual_seed(0)
+        fp8_data, recip_scale = _quantize_dense_weight_to_blockwise_fp8(
+            torch.randn(
+                num_linears * out_dim,
+                in_dim,
+                device=device_type,
+                dtype=torch.bfloat16,
+            ),
+            128,
+            torch.float8_e4m3fn,
+        )
+        linear = FlexShardFloat8BlockwiseLinear(
+            in_dim,
+            num_linears * out_dim,
+            bias=False,
+            use_triton=True,
+        )
+        x = torch.randn(
+            2,
+            64,
+            in_dim,
+            device=device_type,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        grad_output = torch.randn(
+            2,
+            64,
+            num_linears * out_dim,
+            device=device_type,
+            dtype=torch.bfloat16,
+        )
+
+        def run(weight_shape: tuple[int, ...]) -> tuple[torch.Tensor, ...]:
+            weight = BlockwiseFp8Weight(
+                fp8_data.view(weight_shape),
+                recip_scale,
+                128,
+                orig_dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+            out = functional_call(linear, {"weight": weight}, (x,))
+            return out, *torch.autograd.grad(
+                out,
+                (x, weight),
+                grad_output.view(out.shape),
+            )
+
+        out, grad_x, grad_weight = run((num_linears, out_dim, in_dim))
+        flat_out, flat_grad_x, flat_grad_weight = run((num_linears * out_dim, in_dim))
+
+        self.assertEqual(out.shape, (2, 64, num_linears, out_dim))
+        self.assertEqual(grad_weight.shape, (num_linears, out_dim, in_dim))
+        self.assertTrue(torch.equal(out, flat_out.view(out.shape)))
+        self.assertTrue(torch.equal(grad_x, flat_grad_x))
+        self.assertTrue(
+            torch.equal(grad_weight, flat_grad_weight.view(grad_weight.shape))
         )
 
 

@@ -13,6 +13,11 @@ rows, so it can quantize its dense shard to fp8 locally -- no cross-rank
 gathered fp8 weight is **bit-identical** to "all-gather bf16, then
 block-quantize".
 
+Stacked weights such as ``[num_linears, out_dim, in_dim]`` are planned and
+quantized as their flattened ``[num_linears * out_dim, in_dim]`` matrix, the
+operand stacked linears multiply by. A block row may therefore straddle two
+stacked matrices.
+
 The master weight stays dense bf16/fp32-sharded with no fp8 padding in
 sharded storage. The gathered FP8 data and scales are compacted into one buffer
 that backs the unsharded weights; in eager mode the bucket runtime keeps it as
@@ -21,6 +26,8 @@ a persistent buffer, freed on reshard and refilled on the next unshard.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, TYPE_CHECKING
 
@@ -35,6 +42,7 @@ from typing_extensions import override
 from ..flex_shard.placement_contract import (
     BucketParamStorageLayout,
     BucketStorageLayout,
+    GlobalLayout,
     PlacementPreparedUnshard,
     PlacementUnshardResult,
 )
@@ -66,6 +74,9 @@ _VEC_ALIGN_BYTES = 16
 
 class BlockwiseFp8WeightFactory(Protocol):
     """Construct a consumer-specific tensor from gathered FP8 operands.
+
+    ``fp8_data`` has the parameter's shape. ``recip_scale`` holds one scale per
+    block of the ``(prod(shape[:-1]), shape[-1])`` matrix.
 
     The result must view ``fp8_data`` and ``recip_scale`` (a tensor subclass
     may hold them as inner tensors) rather than copy them: eager unshards
@@ -102,6 +113,19 @@ def _validate_2d_non_empty(shape: torch.Size, what: str) -> tuple[int, int]:
     if out_dim <= 0 or in_dim <= 0:
         raise ValueError(f"{what} requires non-empty 2D shape, got {tuple(shape)}")
     return out_dim, in_dim
+
+
+def _matrix_shape(shape: torch.Size) -> torch.Size:
+    """Return the matrix a stacked weight is quantized as."""
+    return torch.Size((math.prod(shape[:-1]), shape[-1]))
+
+
+def _unravel_index(index: int, shape: Sequence[int]) -> tuple[int, ...]:
+    coords = []
+    for size in reversed(shape):
+        index, coord = divmod(index, size)
+        coords.append(coord)
+    return tuple(reversed(coords))
 
 
 def _scale_shape(shape: torch.Size, block_size: int) -> tuple[int, int]:
@@ -202,6 +226,10 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         fqn: str
         global_shape: torch.Size
         param_offset: int
+
+        @property
+        def matrix_shape(self) -> torch.Size:
+            return _matrix_shape(self.global_shape)
 
     @dataclass(frozen=True)
     class _BlockRowUnit:
@@ -447,15 +475,14 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         return tuple(cuts)
 
     def _validate_param_shape(self, fqn: str, shape: torch.Size) -> None:
-        if len(shape) != 2:
+        if len(shape) < 2:
             raise ValueError(
-                "Fp8BucketedBlockShard only supports 2D weights, "
+                "Fp8BucketedBlockShard only supports 2D or stacked 2D weights, "
                 f"but {fqn!r} has shape {tuple(shape)}."
             )
-        out_dim, in_dim = shape
-        if out_dim <= 0 or in_dim <= 0:
+        if 0 in shape:
             raise ValueError(
-                "Fp8BucketedBlockShard requires non-empty 2D weights, "
+                "Fp8BucketedBlockShard requires non-empty weights, "
                 f"but {fqn!r} has shape {tuple(shape)}."
             )
 
@@ -467,7 +494,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         scale_itemsize = torch.float32.itemsize
         units: list[Fp8BucketedBlockShard._BlockRowUnit] = []
         for param in params:
-            out_dim, in_dim = param.global_shape
+            out_dim, in_dim = param.matrix_shape
             num_col_blocks = _ceil_div(in_dim, self.block_size)
             for row_start in range(0, out_dim, self.block_size):
                 row_end = min(row_start + self.block_size, out_dim)
@@ -564,7 +591,7 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
                     last = rank_units[idx]
                     idx += 1
                 param = params_by_fqn[first.fqn]
-                _, in_dim = param.global_shape
+                _, in_dim = param.matrix_shape
                 row_start = first.row_start
                 row_end = last.row_end
                 scale_row_start = row_start // self.block_size
@@ -995,16 +1022,20 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         storage_layouts: dict[str, BucketParamStorageLayout] = {}
         for param in params:
             chunk = local_chunks.get(param.fqn)
+            # Local shards are matrix row ranges; stacked dims stay as size-1
+            # dims so the shard keeps the parameter's rank.
+            stack_ones = (1,) * (len(param.global_shape) - 2)
+            in_dim = param.global_shape[-1]
             if chunk is None:
-                local_shape = torch.Size([0, param.global_shape[1]])
+                local_shape = torch.Size([*stack_ones, 0, in_dim])
                 local_numel = 0
                 byte_offset = 0
                 local_global_offset = param.param_offset
             else:
                 local_shape = torch.Size(
-                    [chunk.row_end - chunk.row_start, param.global_shape[1]]
+                    [*stack_ones, chunk.row_end - chunk.row_start, in_dim]
                 )
-                local_numel = self._chunk_numel(chunk, param.global_shape[1])
+                local_numel = self._chunk_numel(chunk, in_dim)
                 byte_offset = chunk.rank_dense_offset * dtype.itemsize
                 local_global_offset = chunk.global_dense_offset
             bucket_param_layouts[param.fqn] = BucketParamLayout(
@@ -1041,6 +1072,41 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         return BucketStorageLayout(
             param_layouts=storage_layouts,
             total_bytes=rank_numels[rank] * dtype.itemsize,
+        )
+
+    @override
+    def global_layout(
+        self, info: ParamInfo, rank: int, world_size: int
+    ) -> GlobalLayout:
+        """Split this rank's matrix row range into one box per stacked matrix."""
+        global_shape = tuple(info.global_shape)
+        if info.local_numel == 0:
+            return GlobalLayout(global_shape, (), (), ())
+        *stack_shape, out_dim, in_dim = global_shape
+        stack_zeros = (0,) * len(stack_shape)
+        stack_ones = (1,) * len(stack_shape)
+        param_layout = self._param_layout(info)
+        row_start = (
+            param_layout.local_global_offset - param_layout.param_offset
+        ) // in_dim
+        row_end = row_start + info.local_numel // in_dim
+        global_offsets = []
+        local_offsets = []
+        local_sizes = []
+        for matrix in range(row_start // out_dim, _ceil_div(row_end, out_dim)):
+            matrix_row = matrix * out_dim
+            start = max(row_start, matrix_row)
+            end = min(row_end, matrix_row + out_dim)
+            global_offsets.append(
+                (*_unravel_index(matrix, stack_shape), start - matrix_row, 0)
+            )
+            local_offsets.append((*stack_zeros, start - row_start, 0))
+            local_sizes.append((*stack_ones, end - start, in_dim))
+        return GlobalLayout(
+            global_shape=global_shape,
+            global_offsets=tuple(global_offsets),
+            local_offsets=tuple(local_offsets),
+            local_sizes=tuple(local_sizes),
         )
 
     @override
@@ -1286,7 +1352,10 @@ class Fp8BucketedBlockShard(BucketedBlockShard):
         full_params: list[torch.Tensor] = []
         for info in state.infos:
             fp8_numel = info.global_numel
-            scale_shape = _scale_shape(info.global_shape, self.block_size)
+            scale_shape = _scale_shape(
+                _matrix_shape(info.global_shape),
+                self.block_size,
+            )
             scale_numel = scale_shape[0] * scale_shape[1]
             fp8_data = fp8_flat[fp8_offset : fp8_offset + fp8_numel].view(
                 info.global_shape
