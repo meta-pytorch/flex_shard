@@ -50,6 +50,8 @@ _DTYPE_CONFIGS = [
 ]
 _DIVIDE_FACTORS = [None, 1.0]
 _ACCUMULATIONS = [(1, False), (2, False), (2, True)]
+# Chunks of the batch for the chunked loss.
+_NUM_LOSS_CHUNKS = 3
 
 
 def _configs() -> Iterator[tuple[tuple, str]]:
@@ -104,12 +106,16 @@ class _Decoder(nn.Module):
         self.norm = nn.LayerNorm(_DIM)
         self.lm_head = nn.Linear(_DIM, _VOCAB, bias=False)
         self.norm.bias.requires_grad_(False)
+        # As torchtitan's decoder under its chunked loss: return the norm's
+        # output and leave lm_head to the loss.
+        self.skip_lm_head = False
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         h = self.tok_embeddings(tokens)
         for layer in self.layers:
             h = layer(h)
-        return self.lm_head(self.norm(h))
+        h = self.norm(h)
+        return h if self.skip_lm_head else self.lm_head(h)
 
 
 def _shard_dim(fqn: str) -> int:
@@ -122,6 +128,7 @@ def _apply_fsdp2(
     param_dtype: torch.dtype | None,
     reduce_dtype: torch.dtype | None,
     divide_factor: float | None,
+    head_reshard_after_forward: bool = False,
 ) -> None:
     """Group the decoder as torchtitan's ``apply_fsdp_to_decoder`` does."""
     dims = {param: _shard_dim(fqn) for fqn, param in model.named_parameters()}
@@ -134,7 +141,11 @@ def _apply_fsdp2(
         ),
     }
     fully_shard(model.tok_embeddings, **fsdp_config, reshard_after_forward=True)
-    fully_shard([model.norm, model.lm_head], **fsdp_config, reshard_after_forward=False)
+    fully_shard(
+        [model.norm, model.lm_head],
+        **fsdp_config,
+        reshard_after_forward=head_reshard_after_forward,
+    )
     for layer in model.layers:
         fully_shard(
             layer,
@@ -156,6 +167,7 @@ def _apply_flex_shard(
     reduce_dtype: torch.dtype | None,
     divide_factor: float | None,
     fsdp2_compatible: bool = False,
+    head_reshard_after_forward: bool = False,
 ) -> None:
     def placement_fn(named_params, mesh):
         del mesh
@@ -179,7 +191,7 @@ def _apply_flex_shard(
         buckets=[
             bucket(["tok_embeddings"], True),
             *(bucket([f"layers.{i}"], True) for i in range(len(model.layers))),
-            bucket(["norm", "lm_head"], False),
+            bucket(["norm", "lm_head"], head_reshard_after_forward),
         ],
     )
 
@@ -262,6 +274,107 @@ def _train(
     return history
 
 
+def _set_head_requires_gradient_sync(head, requires_gradient_sync: bool) -> None:
+    if isinstance(head, FSDPModule):
+        head.set_requires_gradient_sync(requires_gradient_sync, recurse=False)
+    else:
+        head.set_requires_gradient_sync(requires_gradient_sync)
+
+
+def _head_reshard_settings(head) -> tuple[bool, bool]:
+    if isinstance(head, FSDPModule):
+        # FSDPModule has setters for these but no getters.
+        (group,) = head._get_fsdp_state()._fsdp_param_groups
+        return group._reshard_after_forward, group.reshard_after_backward
+    return head.reshard_after_forward, head.reshard_after_backward
+
+
+def _chunked_loss(
+    model: _Decoder, head, tokens: torch.Tensor, targets: torch.Tensor
+) -> torch.Tensor:
+    """Forward and backward as torchtitan's ChunkedLossWrapper runs them.
+
+    ``head`` is lm_head's fully_shard group or its bucket's storage. It stays
+    unsharded across the chunks, without gradient sync until the last one,
+    and gets its reshard settings back after them; the gradients of the
+    hidden states then go through the model in one backward.
+    """
+    hidden = model(tokens)
+    reshard_after_forward, reshard_after_backward = _head_reshard_settings(head)
+    head.set_reshard_after_forward(False)
+    head.set_reshard_after_backward(False)
+    _set_head_requires_gradient_sync(head, False)
+    head.unshard()
+    chunks = [
+        chunk.detach().requires_grad_() for chunk in hidden.chunk(_NUM_LOSS_CHUNKS)
+    ]
+    loss = torch.zeros((), device=device_type)
+    for idx, (chunk, target) in enumerate(
+        zip(chunks, targets.chunk(_NUM_LOSS_CHUNKS), strict=True)
+    ):
+        if idx == _NUM_LOSS_CHUNKS - 1:
+            _set_head_requires_gradient_sync(head, True)
+        chunk_loss = (
+            F.cross_entropy(model.lm_head(chunk).float(), target, reduction="sum")
+            / _BATCH
+        )
+        chunk_loss.backward()
+        loss += chunk_loss.detach()
+    head.set_reshard_after_forward(reshard_after_forward)
+    head.set_reshard_after_backward(reshard_after_backward)
+    head.reshard()
+    hidden.backward(torch.cat([chunk.grad for chunk in chunks]))
+    return loss
+
+
+def _train_chunked_loss(
+    model: _Decoder,
+    *,
+    rank: int,
+    steps: int,
+    microbatches: int,
+    no_sync: bool,
+) -> list[dict[str, object]]:
+    """``_train`` with ``_chunked_loss``; without sync, every microbatch but
+    the last also keeps the parameters unsharded after backward, as
+    torchtitan's gradient accumulation does."""
+    model.skip_lm_head = True
+    head = (
+        model.lm_head
+        if isinstance(model.lm_head, FSDPModule)
+        else model.bucket_storage_of(model.lm_head.weight)
+    )
+    optim = torch.optim.AdamW(model.parameters(), lr=1e-2, foreach=True)
+    history: list[dict[str, object]] = []
+    for step in range(steps):
+        losses = []
+        for microbatch in range(microbatches):
+            if no_sync:
+                is_last = microbatch == microbatches - 1
+                model.set_reshard_after_backward(is_last)
+                model.set_requires_gradient_sync(is_last)
+            generator = torch.Generator().manual_seed(
+                10_000 * step + 100 * microbatch + rank
+            )
+            tokens, targets = (
+                torch.randint(_VOCAB, (_BATCH,), generator=generator).to(device_type)
+                for _ in range(2)
+            )
+            losses.append(_chunked_loss(model, head, tokens, targets))
+        grads = {
+            fqn: None if param.grad is None else _local(param.grad).detach().clone()
+            for fqn, param in model.named_parameters()
+        }
+        optim.step()
+        optim.zero_grad()
+        params = {
+            fqn: _local(param).detach().clone()
+            for fqn, param in model.named_parameters()
+        }
+        history.append({"losses": losses, "grads": grads, "params": params})
+    return history
+
+
 class _FullyShardParity(FSDPTest):
     def _assert_bitwise_equal(
         self, expected: torch.Tensor | None, actual: torch.Tensor | None, context: str
@@ -272,6 +385,37 @@ class _FullyShardParity(FSDPTest):
         self.assertEqual(expected.dtype, actual.dtype, msg=context)
         self.assertEqual(expected.shape, actual.shape, msg=context)
         self.assertTrue(torch.equal(expected, actual), msg=context)
+
+    def _assert_same_inputs(
+        self,
+        expected: list[torch.Tensor],
+        actual: list[torch.Tensor],
+        context: str,
+    ) -> None:
+        # Pair the collectives by size, in issue order, in case the backends
+        # prefetch in different orders.
+        def by_numel(inputs):
+            grouped = defaultdict(list)
+            for tensor in inputs:
+                grouped[tensor.numel()].append(tensor)
+            return grouped
+
+        expected_by_numel, actual_by_numel = by_numel(expected), by_numel(actual)
+        self.assertEqual(
+            sorted(expected_by_numel), sorted(actual_by_numel), msg=context
+        )
+        for numel, tensors in expected_by_numel.items():
+            self.assertEqual(len(tensors), len(actual_by_numel[numel]), msg=context)
+            for expected_tensor, actual_tensor in zip(
+                tensors, actual_by_numel[numel], strict=True
+            ):
+                self.assertEqual(
+                    expected_tensor.dtype, actual_tensor.dtype, msg=context
+                )
+                self.assertTrue(
+                    torch.equal(expected_tensor, actual_tensor),
+                    msg=f"{context}: {numel}-element inputs differ",
+                )
 
     def _assert_same_history(
         self,
@@ -344,37 +488,6 @@ class TestFlexShardFSDP2Parity(_FullyShardParity):
         # Sums of four values make the reduction order observable.
         return 4
 
-    def _assert_same_inputs(
-        self,
-        expected: list[torch.Tensor],
-        actual: list[torch.Tensor],
-        context: str,
-    ) -> None:
-        # Pair the collectives by size, in issue order, in case the backends
-        # prefetch in different orders.
-        def by_numel(inputs):
-            grouped = defaultdict(list)
-            for tensor in inputs:
-                grouped[tensor.numel()].append(tensor)
-            return grouped
-
-        expected_by_numel, actual_by_numel = by_numel(expected), by_numel(actual)
-        self.assertEqual(
-            sorted(expected_by_numel), sorted(actual_by_numel), msg=context
-        )
-        for numel, tensors in expected_by_numel.items():
-            self.assertEqual(len(tensors), len(actual_by_numel[numel]), msg=context)
-            for expected_tensor, actual_tensor in zip(
-                tensors, actual_by_numel[numel], strict=True
-            ):
-                self.assertEqual(
-                    expected_tensor.dtype, actual_tensor.dtype, msg=context
-                )
-                self.assertTrue(
-                    torch.equal(expected_tensor, actual_tensor),
-                    msg=f"{context}: {numel}-element inputs differ",
-                )
-
     @skip_if_lt_x_gpu(4)
     def test_matches_fully_shard(self):
         mesh = init_device_mesh(device_type.type, (self.world_size,))
@@ -398,6 +511,70 @@ class TestFlexShardFSDP2Parity(_FullyShardParity):
                     f"{context} {collective}",
                 )
             self._assert_same_history(fsdp2_history, flex_history, context)
+
+
+class TestFlexShardChunkedLossFSDP2Parity(_FullyShardParity):
+    @property
+    def world_size(self) -> int:
+        return 4
+
+    @skip_if_lt_x_gpu(4)
+    def test_matches_fully_shard(self):
+        # torchtitan's chunked loss with the norm and lm_head in one group.
+        # FSDP2 reduce-scatters lm_head's gradient alone at the last chunk and
+        # the norm's alone in the final backward; the bucket must issue the
+        # same reduce-scatters, with or without reshard after forward and
+        # with gradient accumulation without sync, whose microbatches still
+        # reduce-scatter the head group (the chunk loop turns its sync on).
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        torch.manual_seed(0)
+        reference = _Decoder()
+        for (
+            (param_dtype, reduce_dtype),
+            (microbatches, no_sync),
+            head_reshard_after_forward,
+        ) in itertools.product(
+            [(None, None), (torch.bfloat16, torch.float32)],
+            [(1, False), (2, True)],
+            [False, True],
+        ):
+            context = (
+                f"param_dtype={param_dtype} reduce_dtype={reduce_dtype} "
+                f"microbatches={microbatches} no_sync={no_sync} "
+                f"head_reshard_after_forward={head_reshard_after_forward}"
+            )
+            histories, recorded = [], []
+            for apply in (
+                _apply_fsdp2,
+                functools.partial(_apply_flex_shard, fsdp2_compatible=True),
+            ):
+                model = copy.deepcopy(reference).to(device_type)
+                apply(
+                    model,
+                    mesh,
+                    param_dtype,
+                    reduce_dtype,
+                    1.0,
+                    head_reshard_after_forward=head_reshard_after_forward,
+                )
+                with _record_collective_inputs() as inputs:
+                    histories.append(
+                        _train_chunked_loss(
+                            model,
+                            rank=self.rank,
+                            steps=3,
+                            microbatches=microbatches,
+                            no_sync=no_sync,
+                        )
+                    )
+                recorded.append(inputs["reduce_scatter"])
+            # Their all-gathers may differ in number: a syncing backward always
+            # reshards a bucket.
+            self.assertTrue(recorded[0], msg=context)
+            self._assert_same_inputs(
+                recorded[0], recorded[1], f"{context} reduce_scatter"
+            )
+            self._assert_same_history(histories[0], histories[1], context)
 
 
 if __name__ == "__main__":
