@@ -16,7 +16,13 @@ from torch.testing._internal.common_fsdp import FSDPTest, get_devtype
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torchao.utils import is_sm_at_least_90
 
-from .. import BucketSpec, flex_shard, GradientReduction, MixedPrecisionPolicy
+from .. import (
+    BucketSpec,
+    flex_shard,
+    GlobalLayout,
+    GradientReduction,
+    MixedPrecisionPolicy,
+)
 from ..custom_placements import (
     fp8_bucketed_block_shard as fp8_bucketed_block_shard_module,
 )
@@ -207,6 +213,42 @@ def _cpu_reference_quantize_local_weight(
         placement.block_size,
         placement.fp8_dtype,
     )
+
+
+def _local_rows(param: nn.Parameter, info: ParamInfo) -> torch.Tensor:
+    """Return the local shard: a row range of ``param`` viewed as a matrix."""
+    if info.local_numel == 0:
+        return param.new_empty(info.local_shape)
+    param_layout = info.bucket_layout.param_layouts[info.fqn]
+    in_dim = param.shape[-1]
+    row_start = (param_layout.local_global_offset - param_layout.param_offset) // in_dim
+    row_end = row_start + info.local_numel // in_dim
+    return param.detach().flatten(0, -2)[row_start:row_end].reshape(info.local_shape)
+
+
+def _box(offset: tuple[int, ...], size: tuple[int, ...]) -> tuple[slice, ...]:
+    return tuple(
+        slice(start, start + length) for start, length in zip(offset, size, strict=True)
+    )
+
+
+def _prepare_unshard_on_each_rank(
+    placement: Fp8BucketedBlockShard,
+    named_params: list[tuple[str, nn.Parameter]],
+    world_size: int,
+) -> list:
+    prepared_by_rank = []
+    for rank in range(world_size):
+        mesh = _FakeMesh(world_size, rank)
+        infos = _make_fp8_param_infos(named_params, placement, mesh)
+        local_tensors = [
+            _local_rows(param, info)
+            for (_, param), info in zip(named_params, infos, strict=True)
+        ]
+        prepared_by_rank.append(
+            placement.prepare_unshard_bucket(local_tensors, infos, mesh, None)
+        )
+    return prepared_by_rank
 
 
 class TestFp8AllGatherLayout(TestCase):
@@ -648,30 +690,11 @@ class TestFp8AllGatherLayout(TestCase):
                 ),
             ),
         ]
-        prepared_by_rank = []
-        for rank in range(world_size):
-            mesh = _FakeMesh(world_size, rank)
-            infos = _make_fp8_param_infos(named_params, placement, mesh)
-            local_tensors = []
-            for (_, param), info in zip(named_params, infos, strict=True):
-                if info.local_numel == 0:
-                    local_tensors.append(param.new_empty(info.local_shape))
-                    continue
-                param_layout = info.bucket_layout.param_layouts[info.fqn]
-                relative_start = (
-                    param_layout.local_global_offset - param_layout.param_offset
-                )
-                row_start = relative_start // param.shape[1]
-                row_end = row_start + info.local_shape[0]
-                local_tensors.append(param.detach()[row_start:row_end].contiguous())
-            prepared_by_rank.append(
-                placement.prepare_unshard_bucket(
-                    local_tensors,
-                    infos,
-                    mesh,
-                    None,
-                )
-            )
+        prepared_by_rank = _prepare_unshard_on_each_rank(
+            placement,
+            named_params,
+            world_size,
+        )
 
         prepared = prepared_by_rank[0]
         metadata = prepared.placement_state.metadata
@@ -752,6 +775,91 @@ class TestFp8AllGatherLayout(TestCase):
                 )
             )
             self.assertTrue(torch.equal(factory_call.recip_scale, reference_scale))
+
+    def test_stacked_weight_shards_rows_of_flattened_matrix(self) -> None:
+        """A ``[2, 6, 8]`` weight is planned as its ``[12, 8]`` matrix, so the
+        4-row block held by rank 1 straddles the two stacked matrices."""
+        world_size = 3
+        placement = Fp8BucketedBlockShard(
+            world_size=world_size,
+            weight_factory=_return_fp8_data,
+            block_size=4,
+        )
+        param = nn.Parameter(torch.arange(96, dtype=torch.float32).reshape(2, 6, 8))
+        infos = [
+            _make_fp8_param_info("w13", param, placement, _FakeMesh(world_size, rank))
+            for rank in range(world_size)
+        ]
+        self.assertEqual(
+            [tuple(info.local_shape) for info in infos],
+            [(1, 4, 8)] * world_size,
+        )
+        layouts = [
+            placement.global_layout(info, rank, world_size)
+            for rank, info in enumerate(infos)
+        ]
+        self.assertEqual(
+            layouts,
+            [
+                GlobalLayout((2, 6, 8), ((0, 0, 0),), ((0, 0, 0),), ((1, 4, 8),)),
+                GlobalLayout(
+                    (2, 6, 8),
+                    ((0, 4, 0), (1, 0, 0)),
+                    ((0, 0, 0), (0, 2, 0)),
+                    ((1, 2, 8), (1, 2, 8)),
+                ),
+                GlobalLayout((2, 6, 8), ((1, 2, 0),), ((0, 0, 0),), ((1, 4, 8),)),
+            ],
+        )
+        reconstructed = torch.zeros_like(param)
+        for info, layout in zip(infos, layouts, strict=True):
+            local = _local_rows(param, info)
+            for global_offset, local_offset, size in zip(
+                layout.global_offsets,
+                layout.local_offsets,
+                layout.local_sizes,
+                strict=True,
+            ):
+                reconstructed[_box(global_offset, size)] = local[
+                    _box(local_offset, size)
+                ]
+        self.assertEqual(reconstructed, param.detach())
+
+    def test_finish_unshard_quantizes_stacked_weight_as_flattened_matrix(
+        self,
+    ) -> None:
+        block = 4
+        world_size = 3
+        weight_factory = _RecordingWeightFactory()
+        placement = Fp8BucketedBlockShard(
+            world_size=world_size,
+            weight_factory=weight_factory,
+            block_size=block,
+        )
+        torch.manual_seed(0)
+        param = nn.Parameter(torch.randn(2, 6, 8, device=device_type))
+        prepared_by_rank = _prepare_unshard_on_each_rank(
+            placement,
+            [("w13", param)],
+            world_size,
+        )
+        rank_rows = torch.stack([prepared.buffers[0] for prepared in prepared_by_rank])
+
+        placement._finish_unshard_from_rank_rows(prepared_by_rank[0], rank_rows)
+
+        (factory_call,) = weight_factory.calls
+        reference_fp8, reference_scale = _reference_blockwise_quant_weight(
+            param.detach().flatten(0, -2),
+            block,
+        )
+        self.assertEqual(factory_call.fp8_data.shape, param.shape)
+        self.assertTrue(
+            torch.equal(
+                factory_call.fp8_data.flatten(0, -2).view(torch.uint8),
+                reference_fp8.view(torch.uint8),
+            )
+        )
+        self.assertTrue(torch.equal(factory_call.recip_scale, reference_scale))
 
 
 class TestFp8BlockwiseWeightQuantization(TestCase):
