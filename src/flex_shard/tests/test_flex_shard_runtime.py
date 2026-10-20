@@ -650,6 +650,51 @@ class TestFlexShardEagerRuntime(TestCase):
                     [model[1]]
                 )
 
+    def test_bucket_unshard_reshard(self):
+        # A bucket storage takes FSDPModule's unshard(), reshard() and
+        # set_reshard_after_forward() for its group, and bucket_storage_of()
+        # finds it from its local shard or unsharded param.
+        with single_rank_cuda_mesh() as mesh:
+            model = nn.Sequential(nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8))
+            flex_shard(
+                model,
+                buckets=[_bucket([idx], mesh, True) for idx in ("0", "2")],
+            )
+            first, second = model.sharded_bucket_storages
+            first_bucket, second_bucket = _buckets(model)
+            local_shard = model[2].weight
+            self.assertIs(model.bucket_storage_of(local_shard), second)
+            with self.assertRaisesRegex(ValueError, "not in this module's buckets"):
+                model.bucket_storage_of(nn.Parameter(torch.zeros(1)))
+
+            second.unshard()
+            self.assertTrue(second_bucket.is_unsharded)
+            self.assertFalse(first_bucket.is_unsharded)
+            self.assertIsNot(model[2].weight, local_shard)
+            self.assertIs(model.bucket_storage_of(model[2].weight), second)
+            second.reshard()
+            self.assertFalse(second_bucket.is_unsharded)
+            self.assertIs(model[2].weight, local_shard)
+
+            # reshard() releases the bucket's prefetched unshard.
+            first_bucket.context.prefetch(second_bucket)
+            second.reshard()
+            self.assertEqual(first_bucket.context.pending_unshards, [])
+            self.assertFalse(second_bucket.is_unsharded)
+
+            # Without reshard after forward, only that bucket keeps its params
+            # after the forward, until its backward.
+            self.assertTrue(second.reshard_after_forward)
+            self.assertTrue(second.reshard_after_backward)
+            second.set_reshard_after_forward(False)
+            self.assertFalse(second.reshard_after_forward)
+            output = model(torch.randn(4, 8, device="cuda", requires_grad=True))
+            self.assertFalse(first_bucket.is_unsharded)
+            self.assertTrue(second_bucket.is_unsharded)
+            output.register_hook(lambda grad: second.unshard())
+            with self.assertRaisesRegex(RuntimeError, "cannot run in backward"):
+                output.sum().backward()
+
     def test_released_refill_frees_storage(self):
         # A prefetch that refills a bucket's persistent storage, which begin
         # re-allocates, and is then released unused frees that storage; later
