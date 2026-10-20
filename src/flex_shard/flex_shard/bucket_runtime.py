@@ -134,10 +134,13 @@ def _inner_tensors(tensor: torch.Tensor) -> list[torch.Tensor]:
 
 @dataclass
 class PendingUnshard:
-    """The one in-flight prefetched unshard."""
+    """A prefetched unshard in flight until its bucket's hook takes it."""
 
     bucket: BucketRuntime
     result: UnshardHandle
+    # From an explicit prefetch list (ShardedBucketStorage.
+    # set_buckets_to_forward_prefetch), not the learned order.
+    explicit: bool = False
 
 
 @dataclass
@@ -183,7 +186,7 @@ class BucketCommContext:
     # prefetch follows the first; backward prefetch walks the second in reverse.
     forward_order: list[BucketRuntime] = field(default_factory=list)
     post_forward_order: list[BucketRuntime] = field(default_factory=list)
-    pending_unshard: PendingUnshard | None = None
+    pending_unshards: list[PendingUnshard] = field(default_factory=list)
     reduce_grad_states: list[PendingReduceGrad] = field(default_factory=list)
     retired_reduce_grad_states: list[PendingReduceGrad] = field(default_factory=list)
     post_backward_callback_queued: bool = False
@@ -254,26 +257,70 @@ class BucketCommContext:
                 return candidate
         return None
 
-    def prefetch(self, bucket: BucketRuntime | None) -> None:
-        """Start ``bucket``'s unshard ahead of its hook, one prefetch at a time."""
-        if bucket is None or bucket.is_unsharded or self.pending_unshard is not None:
+    def prefetch(self, bucket: BucketRuntime | None, *, explicit: bool = False) -> None:
+        """Start ``bucket``'s unshard ahead of its hook. Learned-order prefetches
+        run one at a time, explicit ones as many as the lists name."""
+        if (
+            bucket is None
+            or bucket.is_unsharded
+            or any(pending.bucket is bucket for pending in self.pending_unshards)
+            or (
+                not explicit
+                and any(not pending.explicit for pending in self.pending_unshards)
+            )
+        ):
             return
-        self.pending_unshard = PendingUnshard(bucket, bucket.begin_unshard())
+        self.pending_unshards.append(
+            PendingUnshard(bucket, bucket.begin_unshard(), explicit)
+        )
+
+    def bucket_runtime(self, bucket_storage: ShardedBucketStorage) -> BucketRuntime:
+        """The runtime of ``bucket_storage``, an explicit prefetch target."""
+        for bucket in self.buckets:
+            if bucket.bucket_storage is bucket_storage:
+                return bucket
+        raise ValueError(
+            "FlexShard: a prefetch target is not a bucket of this flex_shard "
+            "module on this device."
+        )
+
+    def finish_other_prefetches(self, bucket: BucketRuntime) -> None:
+        """Finish other buckets' learned-order prefetches into their storage,
+        where their own unshards find them, instead of releasing them."""
+        kept, finished = [], []
+        for pending in self.pending_unshards:
+            if pending.bucket is not bucket and not pending.explicit:
+                finished.append(pending)
+            else:
+                kept.append(pending)
+        self.pending_unshards = kept
+        for pending in finished:
+            pending.bucket.finish_unshard(pending.result)
 
     def take_pending_unshard(
         self,
         bucket: BucketRuntime | None,
     ) -> UnshardHandle | None:
-        """Return ``bucket``'s prefetched unshard and release any other one.
+        """Return ``bucket``'s prefetched unshard and release other buckets'
+        learned-order prefetches; ``None`` releases every prefetch.
 
-        A prefetch for another bucket means execution diverged from the learned
-        order; releasing it bounds memory and frees the prefetch slot.
+        A learned-order prefetch for another bucket means execution diverged
+        from the learned order; releasing it bounds memory and frees the
+        prefetch slot. Explicit prefetches stay until their buckets take them.
         """
-        pending, self.pending_unshard = self.pending_unshard, None
-        if pending is None:
-            return None
-        if pending.bucket is bucket:
-            return pending.result
+        result = None
+        kept = []
+        for pending in self.pending_unshards:
+            if bucket is not None and pending.bucket is bucket:
+                result = pending.result
+            elif bucket is not None and pending.explicit:
+                kept.append(pending)
+            else:
+                self._release_prefetch(pending)
+        self.pending_unshards = kept
+        return result
+
+    def _release_prefetch(self, pending: PendingUnshard) -> None:
         with _record_function_if_eager(
             "FlexShard::release_unused_prefetch",
             pending.bucket.debug_fqn,
@@ -282,13 +329,12 @@ class BucketCommContext:
             pending.result.release_buffers()
             # A refill's begin re-allocated the storage (a first unshard has none).
             pending.bucket.free_persistent_storage()
-        return None
 
     def queue_post_backward_callback(self) -> None:
         """Queue the end-of-backward callback (once per backward).
 
         It finishes the buckets the backward left (``finish_buckets``), waits
-        on all reduce-grad work, and releases an unused prefetch. With manual
+        on all reduce-grad work, and releases unused prefetches. With manual
         backward finalization, or outside a backward (``finalize_backward``),
         nothing is queued.
         """
@@ -648,22 +694,14 @@ class BucketRuntime:
     def unshard(self, *, finish_other_prefetch: bool = False) -> None:
         """Make the unsharded params hold data and swap them into the modules.
 
-        With ``finish_other_prefetch``, another bucket's prefetch is finished
-        into that bucket's storage, where its own unshard finds it, instead of
-        being released.
+        With ``finish_other_prefetch``, other buckets' learned-order prefetches
+        are finished into those buckets' storage, where their own unshards find
+        them, instead of being released.
         """
         if not self.is_unsharded:
-            pending = self.context.pending_unshard
-            if (
-                finish_other_prefetch
-                and pending is not None
-                and pending.bucket is not self
-            ):
-                self.context.pending_unshard = None
-                pending.bucket.finish_unshard(pending.result)
-                result = None
-            else:
-                result = self.context.take_pending_unshard(self)
+            if finish_other_prefetch:
+                self.context.finish_other_prefetches(self)
+            result = self.context.take_pending_unshard(self)
             if result is None:
                 result = self.begin_unshard()
             self.finish_unshard(result)
@@ -803,7 +841,22 @@ class BucketRuntime:
         self._set_unsharded_grad_dtypes(defer_upcast=True)
         if self.bucket_storage._pre_backward_hook is not None:
             self.bucket_storage._pre_backward_hook(self._named_unsharded_params())
-        self.context.prefetch(self.context.next_backward_bucket(self))
+        self._prefetch(forward=False)
+
+    def _prefetch(self, *, forward: bool) -> None:
+        """Prefetch this bucket's explicit list, if it has one, else the next
+        bucket in the learned order."""
+        storage = self.bucket_storage
+        targets = storage._forward_prefetch if forward else storage._backward_prefetch
+        if targets is None:
+            self.context.prefetch(
+                self.context.next_forward_bucket(self)
+                if forward
+                else self.context.next_backward_bucket(self)
+            )
+            return
+        for target in targets:
+            self.context.prefetch(self.context.bucket_runtime(target), explicit=True)
 
     def _set_unsharded_grad_dtypes(self, *, defer_upcast: bool) -> None:
         """Defer or restore the upcast of grads accumulating in a wider dtype.
@@ -995,7 +1048,7 @@ class BucketRuntime:
             self.forward_index = len(self.context.forward_order)
             self.context.forward_order.append(self)
         self.unshard()
-        self.context.prefetch(self.context.next_forward_bucket(self))
+        self._prefetch(forward=True)
         self.call_has_trigger.append(self._register_input_grad_hook(args, kwargs))
 
     def _register_input_grad_hook(
