@@ -179,8 +179,9 @@ class FlexShardModule:
         For callers that run submodules' computation directly, bypassing the
         forward hooks that gather buckets, e.g. Megatron-LM's EP overlap
         schedule. Buckets whose hooks never run then stay unsharded, with their
-        grads, until the end of a backward or ``finalize_backward`` finishes
-        them, following the sync and reshard settings, or ``reshard()``. Call
+        grads, until the end of a backward that re-gathers a bucket in its
+        pre-backward hook, or ``finalize_backward``, finishes them, following
+        the sync and reshard settings, or until ``reshard()``. Call
         it outside backward and after waiting on any
         ``finalize_backward`` handle. Eager only.
         """
