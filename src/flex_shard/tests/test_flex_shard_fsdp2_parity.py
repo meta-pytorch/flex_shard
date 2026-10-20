@@ -110,13 +110,20 @@ class _Decoder(nn.Module):
         # As torchtitan's decoder under its chunked loss: return the norm's
         # output and leave lm_head to the loss.
         self.skip_lm_head = False
+        # As DeepSeek V3's multi-token prediction, which runs the norm and
+        # lm_head again on shifted hidden states: call the head group twice.
+        self.second_head_call = False
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         h = self.tok_embeddings(tokens)
         for layer in self.layers:
             h = layer(h)
-        h = self.norm(h)
-        return h if self.skip_lm_head else self.lm_head(h)
+        if self.skip_lm_head:
+            return self.norm(h)
+        logits = self.lm_head(self.norm(h))
+        if self.second_head_call:
+            logits = logits + self.lm_head(self.norm(h.roll(1, 0)))
+        return logits
 
 
 def _shard_dim(fqn: str) -> int:
@@ -489,11 +496,10 @@ class TestFlexShardFSDP2Parity(_FullyShardParity):
         # Sums of four values make the reduction order observable.
         return 4
 
-    @skip_if_lt_x_gpu(4)
-    def test_matches_fully_shard(self):
+    def _check_matches_fully_shard(
+        self, reference: _Decoder, collectives: tuple[str, ...]
+    ) -> None:
         mesh = init_device_mesh(device_type.type, (self.world_size,))
-        torch.manual_seed(0)
-        reference = _Decoder()
         apply_fsdp2_compatible = functools.partial(
             _apply_flex_shard, fsdp2_compatible=True
         )
@@ -504,7 +510,7 @@ class TestFlexShardFSDP2Parity(_FullyShardParity):
                 flex_history = self._run_backend(
                     apply_fsdp2_compatible, reference, mesh, config
                 )
-            for collective in ("all_gather", "reduce_scatter"):
+            for collective in collectives:
                 self.assertTrue(fsdp2_recorded[collective], msg=context)
                 self._assert_same_inputs(
                     fsdp2_recorded[collective],
@@ -512,6 +518,24 @@ class TestFlexShardFSDP2Parity(_FullyShardParity):
                     f"{context} {collective}",
                 )
             self._assert_same_history(fsdp2_history, flex_history, context)
+
+    @skip_if_lt_x_gpu(4)
+    def test_matches_fully_shard(self):
+        torch.manual_seed(0)
+        self._check_matches_fully_shard(_Decoder(), ("all_gather", "reduce_scatter"))
+
+    @skip_if_lt_x_gpu(4)
+    def test_matches_fully_shard_with_head_called_twice(self):
+        # FSDP2 runs a post-backward per call, and the first fires before
+        # autograd sums the two calls' grads, so a syncing backward after
+        # backwards without sync reduce-scatters the kept grads alone, then
+        # this backward's. That post-backward also reshards the group, which
+        # FSDP2 then gathers again for the other call: only the reduce-scatters
+        # match.
+        torch.manual_seed(0)
+        reference = _Decoder()
+        reference.second_head_call = True
+        self._check_matches_fully_shard(reference, ("reduce_scatter",))
 
 
 class TestFlexShardChunkedLossFSDP2Parity(_FullyShardParity):
