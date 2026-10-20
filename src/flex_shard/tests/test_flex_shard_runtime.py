@@ -558,6 +558,98 @@ class TestFlexShardEagerRuntime(TestCase):
             # All but the first unshard of forward and of backward were prefetched.
             self.assertEqual(sum(hits), 4)
 
+    def test_explicit_prefetch_replaces_learned_order(self):
+        # As torchtitan sets FSDP2's explicit prefetch: in forward, the first
+        # bucket prefetches the next two; in backward, the last bucket the
+        # previous two; the buckets in between prefetch nothing. Every unshard
+        # after the first of each pass is then prefetched, two in flight at a
+        # time, none released, and training matches a plain model.
+        with single_rank_cuda_mesh() as mesh:
+            model = nn.Sequential(*(nn.Linear(8, 8) for _ in range(4)))
+            reference = copy.deepcopy(model).cuda()
+            flex_shard(
+                model,
+                buckets=[
+                    _bucket([f"{idx}.*"], mesh, reshard_after_forward=True)
+                    for idx in range(4)
+                ],
+            )
+            storages = model.sharded_bucket_storages
+            storages[0].set_buckets_to_forward_prefetch(storages[1:3])
+            storages[2].set_buckets_to_forward_prefetch([storages[3]])
+            storages[3].set_buckets_to_backward_prefetch([storages[2], storages[1]])
+            storages[1].set_buckets_to_backward_prefetch([storages[0]])
+            for idx in (1, 3):
+                storages[idx].set_buckets_to_forward_prefetch([])
+            for idx in (0, 2):
+                storages[idx].set_buckets_to_backward_prefetch([])
+            optim = torch.optim.SGD(model.parameters(), lr=0.1)
+            ref_optim = torch.optim.SGD(reference.parameters(), lr=0.1)
+            x = torch.randn(4, 8, device="cuda")
+            begin_unshard = bucket_runtime.BucketRuntime.begin_unshard
+            finish_unshard = bucket_runtime.BucketRuntime.finish_unshard
+            take = bucket_runtime.BucketCommContext.take_pending_unshard
+            hits = []
+            in_flight = []
+
+            def counting_take(context, bucket):
+                result = take(context, bucket)
+                hits.append(result is not None)
+                return result
+
+            def counting_finish_unshard(bucket, result):
+                in_flight.append(len(bucket.context.pending_unshards))
+                return finish_unshard(bucket, result)
+
+            for _ in range(2):
+                optim.zero_grad()
+                ref_optim.zero_grad()
+                with (
+                    patch.object(
+                        bucket_runtime.BucketRuntime,
+                        "begin_unshard",
+                        autospec=True,
+                        side_effect=begin_unshard,
+                    ) as unshards,
+                    patch.object(
+                        bucket_runtime.BucketRuntime,
+                        "finish_unshard",
+                        counting_finish_unshard,
+                    ),
+                    patch.object(
+                        bucket_runtime.BucketCommContext,
+                        "take_pending_unshard",
+                        counting_take,
+                    ),
+                ):
+                    output = model(x)
+                    output.sum().backward()
+                reference_output = reference(x)
+                torch.testing.assert_close(output, reference_output)
+                reference_output.sum().backward()
+                optim.step()
+                ref_optim.step()
+                self.assertEqual(unshards.call_count, 8)
+            # Each step, every unshard but the first of forward and of backward
+            # was prefetched, and the second bucket of each pass finished while
+            # the third's prefetch was in flight, which the learned order's one
+            # prefetch at a time does not do.
+            self.assertEqual(sum(hits), 12)
+            self.assertEqual(in_flight, [0, 1, 0, 0] * 4)
+            torch.testing.assert_close(model(x).detach(), reference(x).detach())
+
+    def test_prefetch_targets_must_be_bucket_storages(self):
+        with single_rank_cuda_mesh() as mesh:
+            model = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8))
+            flex_shard(
+                model,
+                buckets=[_bucket([f"{idx}.*"], mesh, True) for idx in range(2)],
+            )
+            with self.assertRaisesRegex(TypeError, "sharded_bucket_storages"):
+                model.sharded_bucket_storages[0].set_buckets_to_forward_prefetch(
+                    [model[1]]
+                )
+
     def test_released_refill_frees_storage(self):
         # A prefetch that refills a bucket's persistent storage, which begin
         # re-allocates, and is then released unused frees that storage; later
