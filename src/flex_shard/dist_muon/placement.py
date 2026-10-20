@@ -110,21 +110,16 @@ def get_dim0_block_partitions(
     partition_index: int,
 ) -> tuple[tuple[int, int], ...]:
     local_shapes = [param.shape for _, param in named_params]
-    if any(len(shape) != 3 for shape in local_shapes):
-        raise ValueError("Dimension-0 block parameters must be 3D.")
+    if any(len(shape) < 3 for shape in local_shapes):
+        raise ValueError("Dimension-0 block parameters must have at least 3 dims.")
 
     num_local_blocks = local_shapes[0][0]
-    matrix_numel = math.prod(local_shapes[0][1:])
-    if any(
-        shape[0] != num_local_blocks or math.prod(shape[1:]) != matrix_numel
-        for shape in local_shapes[1:]
-    ):
+    if any(shape[0] != num_local_blocks for shape in local_shapes[1:]):
         raise ValueError(
-            "Dimension-0 block parameters must have matching block counts "
-            "and per-block numel."
+            "Dimension-0 block parameters must have matching block counts."
         )
 
-    block_numel = len(local_shapes) * matrix_numel
+    block_numel = sum(math.prod(shape[1:]) for shape in local_shapes)
     if num_partitions == 1:
         if num_local_blocks <= 0:
             raise ValueError("Dimension-0 block parameters must contain a block.")
