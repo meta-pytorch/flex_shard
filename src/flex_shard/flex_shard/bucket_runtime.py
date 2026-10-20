@@ -704,6 +704,17 @@ class BucketRuntime:
             for bucket_param in self.bucket_params
         ]
 
+    def rebind_storage(self, bucket_storage: ShardedBucketStorage) -> None:
+        """Take over the storage that replaced this bucket's before its first
+        unshard (``relayout_bucket``): the same parameters, hooks and context,
+        with the new storage's parameter infos and sharded parameters."""
+        assert self.unsharded_params is None and not self.is_unsharded
+        rebound = BucketRuntime.from_bucket_storage(bucket_storage, self.context)
+        self.bucket_storage = rebound.bucket_storage
+        self.bucket_params = rebound.bucket_params
+        self.fsdp2_reduce_scatter_order = None
+        self.grads_in_param_layout = None
+
     def forward_hook_module(self) -> nn.Module:
         """Return the module whose forward triggers this bucket.
 

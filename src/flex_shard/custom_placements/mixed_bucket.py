@@ -860,12 +860,18 @@ class MixedBucketPlacement(Placement):
             # all-gather-v that runs at the pace of the longest row;
             # NCCL_ALLGATHERV_ENABLE=0 keeps the broadcasts, much faster
             # across hosts.
-            return dist.all_gather(
-                list(gathered.split(state.row_numels)),
-                prepared.buffers[0],
-                group=state.pg,
-                async_op=async_op,
-            )
+            rows = list(gathered.split(state.row_numels))
+            send = prepared.buffers[0]
+            if not state.row_numels[0] and not state.row_numels[1]:
+                # ProcessGroupNCCL2's allgather takes outputs whose first two
+                # share an address for one aliased buffer and gathers equal
+                # rows instead, and every empty tensor has address 0. So rank 0
+                # sends one spare element, into scratch.
+                rows[0] = gathered.new_empty(1)
+                prepared.buffers.append(rows[0])
+                if state.pg.rank() == 0:
+                    send = rows[0]
+            return dist.all_gather(rows, send, group=state.pg, async_op=async_op)
 
     def _finish_owner_rows_unshard(
         self,

@@ -10,7 +10,7 @@ from .checkpoint import (
     register_optimizer_checkpoint_hook,
     set_state_dict_global_layouts,
 )
-from .flex_shard import flex_shard
+from .flex_shard import flex_shard, relayout_bucket
 from .param_init import init_from_full
 from .placement_contract import (
     BucketParamStorageLayout,
@@ -54,6 +54,7 @@ __all__ = [
     "Placement",
     "PlacementFn",
     "register_optimizer_checkpoint_hook",
+    "relayout_bucket",
     "set_global_layout",
     "set_partial_grad_group",
     "set_state_dict_global_layouts",

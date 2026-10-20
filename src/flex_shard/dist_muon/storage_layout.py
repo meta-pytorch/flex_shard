@@ -22,6 +22,7 @@ from ..custom_placements.block_shard import (
     BucketedBlockShard,
 )
 from ..custom_placements.owned import BucketedOwned
+from ..custom_placements.shard import Shard
 from ..flex_shard.bucket_storage import ParamInfo
 from ..flex_shard.placement_contract import get_global_layout
 from ..flex_shard.sharded_param import (
@@ -44,7 +45,11 @@ class LocalMuonStateShard:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class LocalMuonComputeLayout:
-    kind: Literal["owned", "row_blocks", "matrix_batch"]
+    # "row_shard": a Shard(0) slice of dim 0 whose rows (2D) or matrices (3D
+    # and up) the optimizer computes where they are stored, e.g. whole heads
+    # or experts; the caller checks that its compute units don't straddle
+    # ranks.
+    kind: Literal["owned", "row_blocks", "matrix_batch", "row_shard"]
     state_checkpoint_shard: LocalMuonStateShard
     block_size: int | None = None
 
@@ -144,6 +149,16 @@ def _flex_shard_muon_compute_layout(
             placement,
             bucket_param_infos[canonical_fqn(fqn)],
         )
+    if type(placement) is Shard:
+        return _row_shard_layout(
+            fqn,
+            parameter,
+            global_storage_shape,
+            canonical_shard,
+            placement,
+            rank=mesh.get_local_rank(),
+            world_size=mesh.size(),
+        )
     raise NotImplementedError(
         f"FlexShard placement {placement!r} for Muon parameter {fqn!r} "
         "is not used by the supported recipes."
@@ -217,6 +232,32 @@ def _block_shard_layout(
     )
 
 
+def _row_shard_layout(
+    fqn: str,
+    parameter: torch.Tensor,
+    global_storage_shape: torch.Size,
+    canonical_shard: LocalMuonStateShard,
+    placement: Shard,
+    *,
+    rank: int,
+    world_size: int,
+) -> LocalMuonComputeLayout:
+    if placement.dim != 0 or len(global_storage_shape) < 2:
+        raise NotImplementedError(
+            f"Shard Muon parameter {fqn!r} must be a matrix or a matrix batch "
+            "sharded on dim 0."
+        )
+    chunk = -(-global_storage_shape[0] // world_size)
+    row_offset = min(chunk * rank, global_storage_shape[0])
+    return _local_muon_compute_layout(
+        parameter,
+        global_storage_shape,
+        canonical_shard,
+        kind="row_shard",
+        inner_global_offset=(row_offset,) + (0,) * (len(global_storage_shape) - 1),
+    )
+
+
 def _bucketed_block_shard_layout(
     fqn: str,
     parameter: torch.Tensor,
@@ -258,7 +299,7 @@ def _local_muon_compute_layout(
     global_storage_shape: torch.Size,
     canonical_shard: LocalMuonStateShard,
     *,
-    kind: Literal["owned", "row_blocks", "matrix_batch"],
+    kind: Literal["owned", "row_blocks", "matrix_batch", "row_shard"],
     inner_global_offset: tuple[int, ...],
     block_size: int | None = None,
 ) -> LocalMuonComputeLayout:
