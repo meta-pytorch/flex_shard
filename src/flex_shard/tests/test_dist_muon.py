@@ -20,6 +20,7 @@ from torch.testing._internal.common_utils import parametrize, run_tests, TestCas
 from ..custom_placements.block_shard import BlockShard, BucketedBlockShard
 from ..custom_placements.owned import BucketedOwned, BucketedOwnedSegmentSpec
 from ..dist_muon.comm_free_adapter import _build_parameter_binding, LocalDistMuonBinding
+from ..dist_muon.placement import get_dim0_block_partitions
 from ..dist_muon.storage_layout import (
     _block_shard_layout,
     _bucketed_block_shard_layout,
@@ -215,11 +216,33 @@ class TestDistMuonStorageLayout(TestCase):
                         mesh=mesh,
                     )
                     with self.assertRaisesRegex(
-                        NotImplementedError, "complete 2D matrix"
+                        NotImplementedError, "own one complete matrix"
                     ):
                         get_flex_shard_muon_compute_layouts(
                             model, [(canonical_name, partial)]
                         )
+
+    def test_owned_matrix_batch_uses_complete_local_tensor(self):
+        with single_rank_cpu_mesh() as mesh:
+            model = nn.Module()
+            model.register_parameter("w13", nn.Parameter(torch.empty(2, 4, 3)))
+            capture_flex_shard_muon_canonical_shards(model)
+            parameter = model.w13
+            placement = BucketedOwned(
+                {"w13": [BucketedOwnedSegmentSpec("w13", "w13", 0, 24, 0)]}
+            )
+            set_sharding_info(
+                parameter,
+                placements=(placement,),
+                global_shape=parameter.shape,
+                global_stride=parameter.stride(),
+                mesh=mesh,
+            )
+            (layout,) = get_flex_shard_muon_compute_layouts(model, [("w13", parameter)])
+            self.assertEqual(layout.kind, "owned")
+            self.assertEqual(layout.state_checkpoint_shard.global_shape, (2, 4, 3))
+            self.assertEqual(layout.state_checkpoint_shard.global_offset, (0, 0, 0))
+            self.assertEqual(layout.state_checkpoint_shard.local_shape, (2, 4, 3))
 
     def test_row_blocks_add_outer_offset_and_use_global_matrix_rows(self):
         layout = _block_shard_layout(
@@ -278,6 +301,70 @@ class TestDistMuonStorageLayout(TestCase):
         self.assertEqual(layout.state_checkpoint_shard.global_shape, (8, 2, 3))
         self.assertEqual(layout.state_checkpoint_shard.global_offset, (5, 0, 0))
         self.assertEqual(layout.state_checkpoint_shard.local_shape, (3, 2, 3))
+
+    def test_matrix_batch_offsets_support_fused_expert_weights(self):
+        parameter = torch.empty(3, 2, 2, 3)
+        placement = BucketedBlockShard(dims=(0,), blocks_per_rank=(1, 3))
+        info = ParamInfo(
+            fqn="w13",
+            global_shape=torch.Size((4, 2, 2, 3)),
+            global_stride=(12, 6, 3, 1),
+            dtype=parameter.dtype,
+            requires_grad=False,
+            placements=(placement,),
+            bucket_layout=BucketLayout(
+                global_numel=48,
+                local_numel=36,
+                rank_offsets=(0, 12),
+                rank_numels=(12, 36),
+                param_layouts={"w13": BucketParamLayout(0, 12)},
+            ),
+        )
+        layout = _bucketed_block_shard_layout(
+            "w13",
+            parameter,
+            info.global_shape,
+            LocalMuonStateShard(
+                global_shape=torch.Size((8, 2, 2, 3)),
+                global_offset=(4, 0, 0, 0),
+                local_shape=torch.Size((4, 2, 2, 3)),
+            ),
+            placement,
+            info,
+        )
+        self.assertEqual(layout.kind, "matrix_batch")
+        self.assertEqual(layout.state_checkpoint_shard.global_shape, (8, 2, 2, 3))
+        self.assertEqual(layout.state_checkpoint_shard.global_offset, (5, 0, 0, 0))
+        self.assertEqual(layout.state_checkpoint_shard.local_shape, (3, 2, 2, 3))
+
+
+class TestDim0BlockPartitions(TestCase):
+    def test_block_numel_sums_each_parameter_block(self):
+        partitions = get_dim0_block_partitions(
+            [
+                ("w13", nn.Parameter(torch.empty(4, 2, 5, 3))),
+                ("w2", nn.Parameter(torch.empty(4, 3, 5))),
+            ],
+            num_partitions=1,
+            partition_index=0,
+        )
+        self.assertEqual(partitions, ((4, 45),))
+
+    def test_rejects_matrices_and_mismatched_block_counts(self):
+        for shapes, message in (
+            (((4, 3), (4, 3, 5)), "at least 3 dims"),
+            (((4, 2, 5, 3), (2, 3, 5)), "matching block counts"),
+        ):
+            with self.subTest(shapes=shapes):
+                with self.assertRaisesRegex(ValueError, message):
+                    get_dim0_block_partitions(
+                        [
+                            (f"p{index}", nn.Parameter(torch.empty(shape)))
+                            for index, shape in enumerate(shapes)
+                        ],
+                        num_partitions=1,
+                        partition_index=0,
+                    )
 
 
 class TestDistMuonBinding(TestCase):
