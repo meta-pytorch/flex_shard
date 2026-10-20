@@ -16,15 +16,18 @@ from .placement_contract import (
     BucketParamStorageLayout,
     BucketStorageLayout,
     get_global_layout,
+    get_partial_grad_group,
     GlobalLayout,
     GradientReduction,
     LocalStorageLayout,
     Placement,
     set_global_layout,
+    set_partial_grad_group,
 )
 from .sharded_param import (
     get_global_shape,
     get_mesh,
+    get_outer_layout,
     get_placements,
     is_flex_shard_param,
 )
@@ -40,6 +43,8 @@ __all__ = [
     "get_global_layout",
     "get_global_shape",
     "get_mesh",
+    "get_outer_layout",
+    "get_partial_grad_group",
     "get_placements",
     "init_from_full",
     "is_flex_shard_param",
@@ -50,5 +55,6 @@ __all__ = [
     "PlacementFn",
     "register_optimizer_checkpoint_hook",
     "set_global_layout",
+    "set_partial_grad_group",
     "set_state_dict_global_layouts",
 ]
