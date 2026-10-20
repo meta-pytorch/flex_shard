@@ -4,9 +4,17 @@ FlexShard is an experimental parameter-sharding library for PyTorch. Explicit
 `BucketSpec`s choose which parameters communicate together, which device mesh
 they use, and how they are sharded. Optimizers work on ordinary local tensors.
 
-Train `TinyMoETransformer` with AdamW, sharding dense parameters over `dp` and
-expert parameters over `efsdp` to reproduce FSDP2-style training. Then expose
-the same model's bucket collectives in a full model trace, following
+[`examples/deepseek_v3`](examples/deepseek_v3) trains DeepSeek V3 16B, as
+torchtitan defines it, on 8 GPUs with nothing but PyTorch and FlexShard. From
+the same initial weights and batches, its AdamW training is bitwise equal to
+torchtitan's FSDP2 training. With Muon, every matrix is stored whole on one
+GPU, so the optimizer step needs no communication. See
+[Train DeepSeek V3 16B](#train-deepseek-v3-16b).
+
+[`TinyMoETransformer`](examples/tiny_moe_transformer.py) is a small model to
+start with: train it with AdamW, sharding dense parameters over `dp` and expert
+parameters over `efsdp` to reproduce FSDP2-style training. Then expose the same
+model's bucket collectives in a full model trace, following
 [`test_torch_compile_traces_per_bucket_collectives`](src/flex_shard/tests/test_flex_shard_runtime.py).
 
 ## Requirements and installation
@@ -35,9 +43,46 @@ cd flex_shard
 python -m pip install -e .
 ```
 
-The distribution is named `flex-shard`; import it as `flex_shard`. The AdamW
-example needs four GPUs and uses the CUDA runtime supported by your PyTorch
-build.
+The distribution is named `flex-shard`; import it as `flex_shard`. The tiny
+model's AdamW example needs four GPUs and uses the CUDA runtime supported by
+your PyTorch build. The DeepSeek V3 example runs on 8 GPUs and was tested on
+H100s with 80 GB each; its C4 data needs
+`pip install -r examples/deepseek_v3/requirements.txt`.
+
+## Train DeepSeek V3 16B
+
+[`examples/deepseek_v3`](examples/deepseek_v3) holds torchtitan's DeepSeek V3
+16B model (15.7 billion parameters, multi-head latent attention, 64 routed
+experts in each of its 26 mixture-of-experts blocks) in plain PyTorch, and a
+training loop that shards it with FlexShard over one host's 8 GPUs:
+
+```bash
+pip install -r examples/deepseek_v3/requirements.txt
+torchrun --standalone --nproc-per-node 8 examples/deepseek_v3/train.py \
+    --data c4 --attention flex --local-batch-size 4 --steps 1000
+```
+
+Add `--optimizer muon` for Muon. Without `--data c4`, the example trains on
+random tokens and needs no extra packages.
+
+- **AdamW, as FSDP2.** One bucket per FSDP2 group that torchtitan uses (the
+  embedding, each block, the output layers), with `fsdp2_compatible=True`. From
+  torchtitan's initial weights and on the same batches, losses and gradient
+  norms are bitwise equal to torchtitan's FSDP2 run at every step.
+- **Muon without communication.** After initialization, `relayout_bucket` moves
+  each block's parameters other than the routed experts to whole-parameter
+  owners, and each GPU keeps 8 whole experts. Muon then updates every matrix
+  on the GPU that stores it; its optimizer step runs no NCCL kernel.
+- **Checkpoints.** DCP checkpoints of the model, optimizer and data position,
+  through FlexShard's declared layouts. With `--deterministic`, a resumed run
+  matches an uninterrupted one bit for bit.
+
+On 8 H100s, 1,000 steps on C4 with this command take 27.5 minutes with AdamW
+(10,417 tokens per second per GPU, loss 4.18 over the last 50 steps) and 30
+minutes with Muon (9,602 tokens per second per GPU, loss 4.14).
+
+The example's [README](examples/deepseek_v3/README.md) covers the options, the
+sharding, the Muon layout and the comparison with torchtitan.
 
 ## FSDP2-style training with AdamW
 
@@ -424,8 +469,10 @@ receive those tensor objects:
   only some ranks' losses use can reduce at a different point of backward on
   each rank, or, with `reshard_after_forward=True`, re-gather only on those
   ranks, so the collectives mismatch.
-- Numerical and graph comparisons here concern the small examples and the
-  stated configuration; they are not general FSDP2 or SimpleFSDP benchmarks.
+- Numerical and graph comparisons here concern the examples and the stated
+  configurations; they are not general FSDP2 or SimpleFSDP benchmarks.
+- The DeepSeek V3 example runs on one host: no expert, tensor, pipeline or
+  context parallelism.
 
 ## Development and testing
 
