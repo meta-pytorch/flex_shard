@@ -29,6 +29,7 @@ from .bucket_storage import ParamInfo, ShardedBucketStorage
 from .utils import (
     _get_bucket_storage_debug_fqn,
     _module_path_common_prefix,
+    _outside_selective_checkpoint,
     _record_function_if_eager,
 )
 
@@ -728,10 +729,25 @@ class BucketRuntime:
     # Eager: persistent unsharded parameters
     # ------------------------------------------------------------------
 
-    def unshard(self) -> None:
-        """Make the unsharded params hold data and swap them into the modules."""
+    def unshard(self, *, finish_other_prefetch: bool = False) -> None:
+        """Make the unsharded params hold data and swap them into the modules.
+
+        With ``finish_other_prefetch``, another bucket's prefetch is finished
+        into that bucket's storage, where its own unshard finds it, instead of
+        being released.
+        """
         if not self.is_unsharded:
-            result = self.context.take_pending_unshard(self)
+            pending = self.context.pending_unshard
+            if (
+                finish_other_prefetch
+                and pending is not None
+                and pending.bucket is not self
+            ):
+                self.context.pending_unshard = None
+                pending.bucket.finish_unshard(pending.result)
+                result = None
+            else:
+                result = self.context.take_pending_unshard(self)
             if result is None:
                 result = self.begin_unshard()
             self.finish_unshard(result)
@@ -871,6 +887,7 @@ class BucketRuntime:
             self.needs_sync and self.bucket_storage._requires_gradient_sync
         )
 
+    @_outside_selective_checkpoint
     def pre_backward_hook(self, grad_outputs: Any) -> None:
         """Re-unshard before this bucket's module runs backward.
 
@@ -1075,6 +1092,7 @@ class BucketRuntime:
     # Forward hooks
     # ------------------------------------------------------------------
 
+    @_outside_selective_checkpoint
     def pre_forward_hook(
         self,
         mod: nn.Module,
@@ -1098,6 +1116,7 @@ class BucketRuntime:
         self.call_has_trigger.append(has_trigger)
         return args, kwargs
 
+    @_outside_selective_checkpoint
     def group_pre_forward_hook(
         self,
         mod: nn.Module,
@@ -1137,11 +1156,14 @@ class BucketRuntime:
         """Unshard for an activation-checkpoint recompute in backward.
 
         The pre-backward hook usually re-gathered already; otherwise this
-        consumes its prefetch. A forward without grad (reentrant
-        checkpointing) left no pre-backward hook to run the bucket's
-        pre_backward_hook, so run it here, before the recomputed backward.
+        consumes its prefetch. The recompute visits its buckets in forward
+        order, but backward prefetched in reverse, so another bucket's
+        prefetch is finished for that bucket rather than released and
+        gathered again. A forward without grad (reentrant checkpointing) left
+        no pre-backward hook to run the bucket's pre_backward_hook, so run it
+        here, before the recomputed backward.
         """
-        self.unshard()
+        self.unshard(finish_other_prefetch=True)
         if self.bucket_storage._pre_backward_hook is not None:
             self.bucket_storage._pre_backward_hook(self._named_unsharded_params())
 
@@ -1214,6 +1236,7 @@ class BucketRuntime:
         else:
             self.on_partial_input_grads(forward_pass)
 
+    @_outside_selective_checkpoint
     def post_forward_hook(self, mod: nn.Module, args: Any, output: Any) -> None:
         if torch.compiler.is_compiling():
             self._swap_in_params(self.sharded_params)
@@ -1225,6 +1248,7 @@ class BucketRuntime:
             return
         self._post_forward(output, has_trigger)
 
+    @_outside_selective_checkpoint
     def group_post_forward_hook(self, mod: nn.Module, args: Any, output: Any) -> None:
         """Post-forward hook of each module of a bucket that hooks several: the
         group's post-forward runs once the last module of the pass finishes. A
@@ -1275,16 +1299,16 @@ class BucketRuntime:
             return
         self.input_triggers += has_trigger
         for value in grad_outputs:
-            # Hook the node of a view output's base: an in-place op on the view
-            # replaces the view's node, which would drop a hook on it. Leaves
-            # (e.g. a returned param) get none: hooks on them would persist.
+            # Hook the output's node, which backward reaches first: torch_remat
+            # returns a view whose node starts the checkpoint recompute, which
+            # replays the forward without its hooks. Also hook the node of a
+            # view output's base: an in-place op on the view replaces the
+            # view's node, which would drop a hook on it. The hook may run once
+            # per node. Leaves (e.g. a returned param) get none: hooks on them
+            # would persist.
             base = value._base
-            node = (
-                base.grad_fn
-                if base is not None and base.grad_fn is not None
-                else value.grad_fn
-            )
-            if node is not None:
+            nodes = {value.grad_fn, None if base is None else base.grad_fn}
+            for node in nodes - {None}:
                 node.register_prehook(self.pre_backward_hook)
         if self.bucket_storage._reshard_after_forward:
             persistent = {_storage_ptr(buffer) for buffer in self.persistent_buffers}
