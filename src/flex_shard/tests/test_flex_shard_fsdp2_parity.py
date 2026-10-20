@@ -6,11 +6,16 @@
 
 """FlexShard ``Shard`` buckets against FSDP2's ``fully_shard``, bit for bit."""
 
+import contextlib
 import copy
+import functools
 import itertools
+from collections import defaultdict
 from collections.abc import Callable, Iterator
 
 import torch
+import torch.distributed as dist
+import torch.distributed.distributed_c10d as c10d
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
@@ -83,6 +88,9 @@ class _Block(nn.Module):
         self.scale = nn.Parameter(torch.randn(_DIM))
         self.stacked = _StackedLinear()
         self.proj = nn.Linear(_HIDDEN, _DIM)
+        # Never gets a grad, so FSDP2 leaves it out of the reduce-scatter. Its
+        # three rows leave the last of four ranks an empty shard.
+        self.unused = nn.Linear(_DIM, 3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.proj(torch.relu(self.stacked(x * self.scale)))
@@ -147,6 +155,7 @@ def _apply_flex_shard(
     param_dtype: torch.dtype | None,
     reduce_dtype: torch.dtype | None,
     divide_factor: float | None,
+    fsdp2_compatible: bool = False,
 ) -> None:
     def placement_fn(named_params, mesh):
         del mesh
@@ -162,6 +171,7 @@ def _apply_flex_shard(
             ),
             gradient_divide_factor=divide_factor,
             reshard_after_forward=reshard_after_forward,
+            fsdp2_compatible=fsdp2_compatible,
         )
 
     flex_shard(
@@ -172,6 +182,40 @@ def _apply_flex_shard(
             bucket(["norm", "lm_head"], False),
         ],
     )
+
+
+@contextlib.contextmanager
+def _record_collective_inputs() -> Iterator[dict[str, list[torch.Tensor]]]:
+    """Record every all-gather and reduce-scatter input, by collective.
+
+    FSDP2 calls ``dist.reduce_scatter_single``; FlexShard calls
+    ``dist.reduce_scatter_tensor``, which forwards to c10d's module global.
+    """
+    recorded: dict[str, list[torch.Tensor]] = defaultdict(list)
+    all_gather_single = dist.all_gather_single
+    reduce_scatter_single = c10d.reduce_scatter_single
+
+    def record_all_gather(output, input, *args, **kwargs):
+        recorded["all_gather"].append(input.detach().clone())
+        return all_gather_single(output, input, *args, **kwargs)
+
+    def record_reduce_scatter(output, input, *args, **kwargs):
+        recorded["reduce_scatter"].append(input.detach().clone())
+        return reduce_scatter_single(output, input, *args, **kwargs)
+
+    patches = [
+        (dist, "all_gather_single", record_all_gather),
+        (dist, "reduce_scatter_single", record_reduce_scatter),
+        (c10d, "reduce_scatter_single", record_reduce_scatter),
+    ]
+    originals = [(owner, name, getattr(owner, name)) for owner, name, _ in patches]
+    try:
+        for owner, name, patched in patches:
+            setattr(owner, name, patched)
+        yield recorded
+    finally:
+        for owner, name, original in originals:
+            setattr(owner, name, original)
 
 
 def _local(tensor: torch.Tensor) -> torch.Tensor:
@@ -284,9 +328,75 @@ class TestFlexShardMatchesFullyShard(_FullyShardParity):
         mesh = init_device_mesh(device_type.type, (self.world_size,))
         torch.manual_seed(0)
         reference = _Decoder()
+        # Without fsdp2_compatible, buckets reduce zeros for params without a
+        # grad, where FSDP2 leaves them out; frozen, both skip them.
+        for layer in reference.layers:
+            layer.unused.requires_grad_(False)
         for config, context in _configs():
             fsdp2_history = self._run_backend(_apply_fsdp2, reference, mesh, config)
             flex_history = self._run_backend(_apply_flex_shard, reference, mesh, config)
+            self._assert_same_history(fsdp2_history, flex_history, context)
+
+
+class TestFlexShardFSDP2Parity(_FullyShardParity):
+    @property
+    def world_size(self) -> int:
+        # Sums of four values make the reduction order observable.
+        return 4
+
+    def _assert_same_inputs(
+        self,
+        expected: list[torch.Tensor],
+        actual: list[torch.Tensor],
+        context: str,
+    ) -> None:
+        # Pair the collectives by size, in issue order, in case the backends
+        # prefetch in different orders.
+        def by_numel(inputs):
+            grouped = defaultdict(list)
+            for tensor in inputs:
+                grouped[tensor.numel()].append(tensor)
+            return grouped
+
+        expected_by_numel, actual_by_numel = by_numel(expected), by_numel(actual)
+        self.assertEqual(
+            sorted(expected_by_numel), sorted(actual_by_numel), msg=context
+        )
+        for numel, tensors in expected_by_numel.items():
+            self.assertEqual(len(tensors), len(actual_by_numel[numel]), msg=context)
+            for expected_tensor, actual_tensor in zip(
+                tensors, actual_by_numel[numel], strict=True
+            ):
+                self.assertEqual(
+                    expected_tensor.dtype, actual_tensor.dtype, msg=context
+                )
+                self.assertTrue(
+                    torch.equal(expected_tensor, actual_tensor),
+                    msg=f"{context}: {numel}-element inputs differ",
+                )
+
+    @skip_if_lt_x_gpu(4)
+    def test_matches_fully_shard(self):
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        torch.manual_seed(0)
+        reference = _Decoder()
+        apply_fsdp2_compatible = functools.partial(
+            _apply_flex_shard, fsdp2_compatible=True
+        )
+        for config, context in _configs():
+            with _record_collective_inputs() as fsdp2_recorded:
+                fsdp2_history = self._run_backend(_apply_fsdp2, reference, mesh, config)
+            with _record_collective_inputs() as flex_recorded:
+                flex_history = self._run_backend(
+                    apply_fsdp2_compatible, reference, mesh, config
+                )
+            for collective in ("all_gather", "reduce_scatter"):
+                self.assertTrue(fsdp2_recorded[collective], msg=context)
+                self._assert_same_inputs(
+                    fsdp2_recorded[collective],
+                    flex_recorded[collective],
+                    f"{context} {collective}",
+                )
             self._assert_same_history(fsdp2_history, flex_history, context)
 
 
