@@ -19,7 +19,9 @@ rows, as torchtitan packs a microbatch.
 
 Shape suffixes: B batch, S sequence, T tokens (B * S), D model dim, H heads,
 K query/key head dim, V value head dim, R rotary dim / 2, E experts, F hidden
-dim, N routed tokens (T * top_k), I/O grouped-matmul input/output features.
+dim, N routed tokens (T * top_k), I/O grouped-matmul input/output features. In
+the routed experts, R is instead the tokens this rank's experts process and e
+those experts: N and E without expert parallelism (expert_parallel.py).
 """
 
 import contextlib
@@ -292,6 +294,10 @@ class RoutedExperts(nn.Module):
         self.top_k = config.top_k
         self.w13 = GroupedLinear(experts, (2, hidden), dim)
         self.w2 = GroupedLinear(experts, (dim,), hidden)
+        # With expert parallelism, this rank holds a slice of the experts, and
+        # the dispatcher moves the routed tokens to and from the ranks holding
+        # theirs (expert_parallel.py).
+        self.dispatcher = None
 
     def forward(
         self,
@@ -306,9 +312,24 @@ class RoutedExperts(nn.Module):
         token_ids_N = sorted_N // self.top_k
         routed_ND = x_TD[token_ids_N]
 
-        offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
-        hidden_NF = swiglu(self.w13(routed_ND.bfloat16(), offsets_E))
-        out_ND = self.w2(hidden_NF, offsets_E).type_as(routed_ND)
+        if self.dispatcher is None:
+            routed_RD, num_tokens_per_local_expert_e = (
+                routed_ND,
+                num_tokens_per_expert_E,
+            )
+        else:
+            routed_RD, num_tokens_per_local_expert_e, metadata = (
+                self.dispatcher.dispatch(routed_ND, num_tokens_per_expert_E)
+            )
+        offsets_e = torch.cumsum(
+            num_tokens_per_local_expert_e, dim=0, dtype=torch.int32
+        )
+        hidden_RF = swiglu(self.w13(routed_RD.bfloat16(), offsets_e))
+        out_RD = self.w2(hidden_RF, offsets_e).type_as(routed_RD)
+        if self.dispatcher is None:
+            out_ND = out_RD
+        else:
+            out_ND = self.dispatcher.combine(out_RD, metadata)
 
         # Weight each expert output by its score, in FP32, and sum per token.
         out_ND = (out_ND * scores_N.reshape(-1, 1).to(torch.float32)).to(out_ND.dtype)

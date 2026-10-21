@@ -8,12 +8,16 @@
 
     torchrun --nproc-per-node 8 examples/deepseek_v3/train.py --steps 10
 
-FlexShard shards the parameters over all ranks the way torchtitan's FSDP2
-setup does (one bucket per transformer block, plus the embedding and the
-output layers), with BF16 compute, FP32 gradient reduction and FP32 AdamW. Each
-rank trains on its own batches; the loss is averaged over all ranks' tokens.
-With ``--optimizer muon``, each block's matrices move to owner ranks and
-flex_shard's DistMuon updates them there, without communication.
+FlexShard shards the parameters the way torchtitan's FSDP2 setup does, with
+BF16 compute, FP32 gradient reduction and FP32 AdamW. The routed experts use
+expert parallelism (EP): each group of ``--ep`` ranks splits them, and FlexShard
+shards each rank's experts over the ranks holding the same ones (expert FSDP,
+EFSDP). Everything else is sharded over all ranks (FSDP), one bucket per
+transformer block plus the embedding and the output layers; a MoE block's
+routed experts get a bucket of their own. Each rank trains on its own batches;
+the loss is averaged over all ranks' tokens. With ``--optimizer muon``, each
+block's matrices move to owner ranks and flex_shard's DistMuon updates them
+there, without communication.
 """
 
 import argparse
@@ -28,6 +32,7 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 
 from data import C4Batches, SyntheticBatches
+from expert_parallel import apply_expert_parallel
 from flex_shard import (
     BucketSpec,
     flex_shard,
@@ -59,6 +64,12 @@ def parse_args():
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument(
         "--local-batch-size", type=int, default=1, help="sequences per rank per step"
+    )
+    parser.add_argument(
+        "--ep",
+        type=int,
+        help="expert-parallel degree; by default half the ranks, so that each "
+        "rank's experts are also FSDP-sharded over 2 ranks (EFSDP)",
     )
     parser.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw")
     parser.add_argument("--attention", choices=["flex", "sdpa"], default="flex")
@@ -100,13 +111,15 @@ def parse_args():
     return parser.parse_args()
 
 
-def shard_model(model: DeepSeekV3, mesh, *, muon: bool) -> list[int]:
+def shard_model(model: DeepSeekV3, mesh, *, muon: bool, expert_mesh=None) -> list[int]:
     """Shard the parameters over ``mesh`` in the groups torchtitan's FSDP2 setup
     uses. ``fsdp2_compatible`` makes each bucket's all-gather and reduce-scatter
     match that FSDP2 group's byte for byte.
 
-    For Muon, a MoE block's routed experts get a bucket of their own, so that
-    the rest of the block can move to owners (``store_on_owners``). Returns the
+    With expert parallelism, or for Muon, a MoE block's routed experts get a
+    bucket of their own: over ``expert_mesh``, the ranks holding the same
+    experts, or over ``mesh`` without expert parallelism. For Muon, the rest of
+    each block can then move to owners (``store_on_owners``). Returns the
     indices of those buckets.
     """
     # Shard the [2, F, D] gate/up weights along F, so that each rank keeps rows
@@ -117,7 +130,7 @@ def shard_model(model: DeepSeekV3, mesh, *, muon: bool) -> list[int]:
     def placement_fn(named_params, mesh):
         return {fqn: (Shard(shard_dims.get(p, 0)),) for fqn, p in named_params}
 
-    def bucket(patterns, reshard_after_forward=True):
+    def bucket(patterns, reshard_after_forward=True, mesh=mesh):
         return BucketSpec(
             patterns,
             placement_fn=placement_fn,
@@ -132,17 +145,22 @@ def shard_model(model: DeepSeekV3, mesh, *, muon: bool) -> list[int]:
         )
 
     buckets = [bucket(["tok_embeddings"])]
-    owner_buckets = []
+    block_buckets, expert_buckets, owner_buckets = [], [], []
     for i, block in enumerate(model.layers):
-        if not muon:
-            buckets.append(bucket([f"layers.{i}"]))
-            continue
         names = [f"layers.{i}.{name}" for name, _ in block.named_parameters()]
         experts = [name for name in names if ".routed_experts." in name]
-        owner_buckets.append(len(buckets))
+        if not muon and not (experts and expert_mesh is not None):
+            block_buckets.append([len(buckets)])
+            buckets.append(bucket([f"layers.{i}"]))
+            continue
+        block_buckets.append([len(buckets)])
+        if muon:
+            owner_buckets.append(len(buckets))
         buckets.append(bucket([name for name in names if name not in experts]))
         if experts:
-            buckets.append(bucket(experts))
+            block_buckets[-1].append(len(buckets))
+            expert_buckets.append(len(buckets))
+            buckets.append(bucket(experts, mesh=expert_mesh or mesh))
     # The output layers run last in forward and first in backward, so they stay
     # gathered in between.
     buckets.append(bucket(["norm", "lm_head"], reshard_after_forward=False))
@@ -150,7 +168,36 @@ def shard_model(model: DeepSeekV3, mesh, *, muon: bool) -> list[int]:
         # build_local_dist_muon reads each parameter's coordinates from here.
         capture_flex_shard_muon_canonical_shards(model)
     flex_shard(model, buckets=buckets)
+    if expert_mesh is not None:
+        prefetch_blocks_in_order(
+            list(model.sharded_bucket_storages), block_buckets, expert_buckets
+        )
     return owner_buckets
+
+
+def prefetch_blocks_in_order(storages, block_buckets, expert_buckets) -> None:
+    """Prefetch the next block's buckets in forward and the previous block's in
+    backward, as torchtitan does with expert parallelism: the dispatch waits
+    for token counts on the host, which keeps the CPU from issuing the next
+    all-gathers early otherwise.
+
+    A block prefetches from its first bucket, which runs first; its expert
+    bucket prefetches nothing.
+    """
+    blocks = [[storages[i] for i in buckets] for buckets in block_buckets]
+    embedding, head = storages[0], storages[-1]
+    for i in expert_buckets:
+        storages[i].set_buckets_to_forward_prefetch([])
+        storages[i].set_buckets_to_backward_prefetch([])
+    embedding.set_buckets_to_forward_prefetch(blocks[0])
+    head.set_buckets_to_backward_prefetch(blocks[-1])
+    for i, block in enumerate(blocks):
+        block[0].set_buckets_to_forward_prefetch(
+            blocks[i + 1] if i + 1 < len(blocks) else [head]
+        )
+        block[0].set_buckets_to_backward_prefetch(
+            blocks[i - 1] if i > 0 else [embedding]
+        )
 
 
 def store_on_owners(model, bucket_indices) -> None:
@@ -204,19 +251,42 @@ def build_lr_lambda(*, total_steps, warmup_steps, decay_ratio, min_lr_factor):
     return lr_lambda
 
 
-@torch.no_grad()
-def clip_grad_norm_(params, max_norm):
-    """Clip gradients to a global L2 norm and return it.
+def sharded_grad_norm(params, groups) -> torch.Tensor:
+    """The L2 norm of the gradients that ``params`` shard over ``groups``.
 
-    Each rank holds a shard of every gradient. As for FSDP2's DTensor
-    gradients, sum each gradient's squared shard norms over ranks, then take
-    the norm of the per-gradient norms.
+    As for FSDP2's DTensor gradients: take each gradient's shard norm, then for
+    each mesh dim in order, sum the squares over its group and take the root;
+    finally take the norm of the per-gradient norms.
     """
     # Every rank lists every parameter, even one it stores none of.
     grads = [p.grad if p.grad is not None else p.new_zeros(0) for p in params]
-    squares = torch.stack(torch._foreach_norm(grads, 2.0)) ** 2.0
-    dist.all_reduce(squares)
-    norm = torch.linalg.vector_norm(squares ** (1.0 / 2.0), 2.0)
+    norms = torch.stack(torch._foreach_norm(grads, 2.0))
+    for group in groups:
+        norms = norms**2.0
+        dist.all_reduce(norms, group=group)
+        norms = norms ** (1.0 / 2.0)
+    return torch.linalg.vector_norm(norms, 2.0)
+
+
+@torch.no_grad()
+def clip_grad_norm_(params, max_norm, expert_params=(), expert_groups=()):
+    """Clip gradients to a global L2 norm and return it.
+
+    Each rank holds a shard of every gradient. With expert parallelism, the
+    routed experts' gradients, sharded over ``expert_groups``, get their own
+    norm first, as torchtitan computes it.
+    """
+    if not expert_params:
+        norm = sharded_grad_norm(params, [dist.group.WORLD])
+    else:
+        experts = set(expert_params)
+        dense_norm = sharded_grad_norm(
+            [p for p in params if p not in experts], [dist.group.WORLD]
+        )
+        expert_norm = sharded_grad_norm(
+            [p for p in params if p in experts], expert_groups
+        )
+        norm = (expert_norm**2.0 + dense_norm**2.0) ** (1.0 / 2.0)
     torch.nn.utils.clip_grads_with_norm_(params, max_norm, norm, foreach=True)
     return norm
 
@@ -244,7 +314,17 @@ def build_optimizers(model, *, muon: bool, lr: float, weight_decay: float):
     return optimizers
 
 
-def train_step(model, batch, *, optimizers, schedulers, max_norm, use_positions):
+def train_step(
+    model,
+    batch,
+    *,
+    optimizers,
+    schedulers,
+    max_norm,
+    use_positions,
+    expert_params=(),
+    expert_groups=(),
+):
     """One step on this rank's batch. Returns the loss averaged over all ranks'
     tokens and the gradient norm before clipping."""
     num_tokens = batch["input"].numel()
@@ -270,7 +350,9 @@ def train_step(model, batch, *, optimizers, schedulers, max_norm, use_positions)
     )
     del logits
     loss.backward()
-    grad_norm = clip_grad_norm_(list(model.parameters()), max_norm)
+    grad_norm = clip_grad_norm_(
+        list(model.parameters()), max_norm, expert_params, expert_groups
+    )
     update_expert_biases(model)
     with torch.profiler.record_function("optimizer"):
         for optimizer in optimizers.values():
@@ -378,6 +460,16 @@ def main():
     dist.init_process_group("nccl", device_id=device)
     rank, world_size = dist.get_rank(), dist.get_world_size()
     mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
+    ep = args.ep if args.ep is not None else max(world_size // 2, 1)
+    if world_size % ep:
+        raise ValueError(f"--ep {ep} must divide the {world_size} ranks")
+    expert_mesh = None
+    if ep > 1:
+        # Ranks [i * ep, (i + 1) * ep) split the experts; ranks i, i + ep, ...
+        # hold the same experts and shard them.
+        expert_mesh = init_device_mesh(
+            "cuda", (world_size // ep, ep), mesh_dim_names=("efsdp", "ep")
+        )
 
     config = DeepSeekV3Config(
         max_seq_len=args.seq_len,
@@ -386,7 +478,14 @@ def main():
     )
     with torch.device("meta"):
         model = DeepSeekV3(config)
-    owner_buckets = shard_model(model, mesh, muon=args.optimizer == "muon")
+    if expert_mesh is not None:
+        apply_expert_parallel(model, expert_mesh["ep"])
+    owner_buckets = shard_model(
+        model,
+        mesh,
+        muon=args.optimizer == "muon",
+        expert_mesh=None if expert_mesh is None else expert_mesh["efsdp"],
+    )
     model.to_empty(device=device)
     model.init_buffers(device)
     if args.init_checkpoint:
@@ -397,6 +496,12 @@ def main():
         init_weights(model, args.seed)
     store_on_owners(model, owner_buckets)
     model.train()
+    expert_params, expert_groups = [], []
+    if expert_mesh is not None:
+        expert_params = [
+            p for fqn, p in model.named_parameters() if ".routed_experts." in fqn
+        ]
+        expert_groups = [expert_mesh.get_group("efsdp"), expert_mesh.get_group("ep")]
 
     optimizers = build_optimizers(
         model, muon=args.optimizer == "muon", lr=args.lr, weight_decay=args.weight_decay
@@ -466,6 +571,8 @@ def main():
             max_norm=args.max_norm,
             # SDPA attends across documents, so positions just count up each row.
             use_positions=args.attention == "flex",
+            expert_params=expert_params,
+            expert_groups=expert_groups,
         )
         loss, grad_norm = loss.item(), grad_norm.item()
         elapsed = time.perf_counter() - start
