@@ -251,44 +251,6 @@ update scaling, `0.2 * sqrt(max(rows, columns))`, so Muon takes AdamW's learning
 rate; AdamW trains the embedding, norms and output projection. Checkpoints hold
 the owner-stored weights and DistMuon's momentum.
 
-### Results on 8 H100s
-
-On C4 with the command above (FlexAttention, 4 x 4,096 tokens per GPU and
-torchtitan's learning-rate schedule for 1,000 steps), through step 500, next to
-the same runs without expert parallelism (`--ep 1`). Throughput is the median
-over steps 11 to 500:
-
-| | AdamW | AdamW, `--ep 1` | Muon | Muon, `--ep 1` |
-| --- | --- | --- | --- | --- |
-| Mean loss, steps 451 to 500 | 4.69 | 4.69 | 4.66 | 4.66 |
-| Tokens per second per GPU, median | 9,994 | 10,440 | 9,088 | 9,644 |
-| Peak memory, active and reserved | 42.9 and 57.3 GiB | 42.9 and 58.1 GiB | 36.4 and 51.5 GiB | 36.4 and 51.8 GiB |
-
-Expert parallelism trains to the same losses; the `--ep 1` runs went on to 4.18
-(AdamW) and 4.14 (Muon) over steps 951 to 1,000. On one host it trains 4% fewer
-tokens per second with AdamW and 6% fewer with Muon. EP shrinks each block's
-expert all-gather from 64 experts, 56 of them from seven other GPUs, to 16
-experts, 8 of them from one other GPU, but NVLink makes that gather cheap here,
-while EP adds 6 all-to-alls per MoE block per step: 2 in forward, 2 in the
-recomputed forward and 2 in backward.
-
-Muon's optimizer step takes 204 ms on the GPU, 97% busy: Newton-Schulz matmuls
-at 646 TFLOP/s (112 ms) and element-wise updates (85 ms), against AdamW's 26 ms
-(measured with `--ep 1`, where each GPU also stores 8 whole experts). On one host
-the exchange that owner storage removes would cost little, so these runs show
-the mechanism, not its speedup; [Muon needs whole matrices](#muon-needs-whole-matrices)
-has the 256-GPU numbers. With `--deterministic`, a resumed run matches an
-uninterrupted one bit for bit, with either optimizer and with or without EP.
-
-Attention is FlexAttention, compiled without autotuning: torchtitan's kernel,
-which keeps packed documents apart and is deterministic; the rest of the model
-runs eagerly. FlashAttention needs equal query and value head dims, so
-`--attention sdpa` runs multi-head latent attention (192 and 128) on cuDNN,
-which is faster but not deterministic. Per block at 4,096 tokens, forward and
-backward on the GPU: cuDNN 0.9 ms, FlexAttention 2.0 ms, and SDPA's
-memory-efficient kernel, which it uses with `--deterministic`, 27.6 ms. End to
-end, FlexAttention trains 8% fewer tokens per second than SDPA on cuDNN.
-
 ## Smaller example and tracing
 
 [`examples/train_adamw.py`](examples/train_adamw.py) trains a two-block toy MoE
