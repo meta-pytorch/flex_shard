@@ -251,21 +251,6 @@ update scaling, `0.2 * sqrt(max(rows, columns))`, so Muon takes AdamW's learning
 rate; AdamW trains the embedding, norms and output projection. Checkpoints hold
 the owner-stored weights and DistMuon's momentum.
 
-## Smaller example and tracing
-
-[`examples/train_adamw.py`](examples/train_adamw.py) trains a two-block toy MoE
-for three AdamW steps on 4 GPUs: dense parameters on a 4-rank `dp` mesh, each
-block's experts on a 2-rank `efsdp` submesh. With `--trace`, it captures the
-model with `torch.compile(fullgraph=True)` and checks that each bucket's
-all-gather and reduce-scatter appear as functional collectives in the graph,
-as [`test_torch_compile_traces_per_bucket_collectives`](src/flex_shard/tests/test_flex_shard_runtime.py)
-does. Under `torch.compile`, the traced graph owns buffer lifetimes, so
-`reshard_after_forward` doesn't apply.
-
-```bash
-torchrun --standalone --nproc-per-node=4 examples/train_adamw.py --trace --graph-dir /tmp/trace
-```
-
 ## Gradients, resharding and accumulation
 
 - `gradient_reduce_op` defaults to `dist.ReduceOp.AVG`, the sum over the bucket's
