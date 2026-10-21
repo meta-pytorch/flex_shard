@@ -171,6 +171,36 @@ class DistMuon(Optimizer):
     same mathematical update as ``torch.optim.Muon`` running one matrix at a
     time, but bitwise equality across the two kernel schedules is not part of
     the contract.
+
+    Each parameter must be a real matrix or matrix batch, contiguous on every
+    rank. Its compute layout (``compute_sharding_by_fqn``) decides its Muon
+    matrices and where they are computed:
+
+    - ``BlockShard`` makes each block of rows, e.g. an attention head, its own
+      matrix and spreads the blocks over one mesh axis. The parameter must be
+      2D with rows in whole repetitions of ``block_sizes``, stored as
+      ``Replicate`` or ``Shard(0)`` on that axis and replicated on the others.
+    - ``Owned`` computes the whole tensor on one rank or, with ``block_sizes``
+      (2D, rows in whole repetitions), each block as its own matrix. Unless
+      ``owner_by_fqn`` fixes the owner, as a rank on the parameter's
+      redistribution mesh axis, DistMuon balances Newton-Schulz work over hosts
+      first (``ranks_per_host``, by default torchrun's ``LOCAL_WORLD_SIZE``),
+      then over their ranks, carrying the loads from bucket to bucket.
+    - ``Shard(0)`` spreads a native ``[..., R, C]`` matrix batch, e.g. routed
+      experts, over its leading dimension.
+
+    DistMuon redistributes each parameter, or gathers it to its owner, along
+    at most one mesh axis, and the parameter's storage on every other axis
+    must be replicated. The one exception, for native batches, keeps
+    ``Shard(0)`` storage on one axis, e.g. expert parallelism, when
+    ``shard_order_by_tensor_dim`` orders the redistributing axis after it (see
+    ``ComputeLayout``).
+
+    ``state_dict()`` holds the momentum buffers, in each parameter's storage
+    layout, and the group hyperparameters, but not the compute layouts, so
+    ``load_state_dict`` can't check them. To resume the same optimization,
+    build DistMuon with the same ``compute_sharding_by_fqn``: block sizes
+    decide which matrices Newton-Schulz orthogonalizes.
     """
 
     _specs: tuple[_BucketSpec, ...]
