@@ -50,7 +50,7 @@ that model's weights don't fit this architecture.
 ```bash
 pip install -r examples/deepseek_v3/requirements.txt  # datasets and tokenizers, for C4
 torchrun --standalone --nproc-per-node 8 examples/deepseek_v3/train.py \
-    --data c4 --attention flex --local-batch-size 4 --steps 1000 --optimizer muon
+    --data c4 --local-batch-size 4 --steps 1000 --optimizer muon
 ```
 
 Leave out `--optimizer muon` for AdamW, and `--data c4` for random tokens and no
@@ -152,12 +152,14 @@ TFLOP/s (112 ms) and element-wise updates (85 ms), against AdamW's 26 ms, so
 Muon trains 8% fewer tokens per second than AdamW here. With `--deterministic`,
 a resumed run matches an uninterrupted one bit for bit, with either optimizer.
 
-FlashAttention needs equal query and value head dims, so multi-head latent
-attention (192 and 128) runs SDPA on cuDNN, 6.3 ms per block forward and
-backward at 4,096 tokens and not deterministic, or with `--deterministic` on the
-memory-efficient kernel, 27.9 ms. `--attention flex` uses FlexAttention,
-compiled without autotuning: 3.1 ms, deterministic, and torchtitan's kernel,
-which keeps packed documents apart.
+Attention is FlexAttention, compiled without autotuning: torchtitan's kernel,
+which keeps packed documents apart and is deterministic; the rest of the model
+runs eagerly. FlashAttention needs equal query and value head dims, so
+`--attention sdpa` runs multi-head latent attention (192 and 128) on cuDNN,
+which is faster but not deterministic. Per block at 4,096 tokens, forward and
+backward on the GPU: cuDNN 0.9 ms, FlexAttention 2.0 ms, and SDPA's
+memory-efficient kernel, which it uses with `--deterministic`, 27.6 ms. End to
+end, FlexAttention trains 8% fewer tokens per second than SDPA on cuDNN.
 
 ## Smaller example and tracing
 

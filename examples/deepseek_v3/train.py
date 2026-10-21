@@ -61,7 +61,7 @@ def parse_args():
         "--local-batch-size", type=int, default=1, help="sequences per rank per step"
     )
     parser.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw")
-    parser.add_argument("--attention", choices=["sdpa", "flex"], default="sdpa")
+    parser.add_argument("--attention", choices=["flex", "sdpa"], default="flex")
     parser.add_argument("--data", choices=["synthetic", "c4"], default="synthetic")
     parser.add_argument(
         "--tokenizer",
