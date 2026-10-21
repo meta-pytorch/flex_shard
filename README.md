@@ -9,8 +9,8 @@ device mesh they use, and their placement, including placements that keep
 matrices and quantization tiles whole on one GPU. Optimizers work on ordinary
 local tensors.
 
-- **Buckets like FSDP2's.** `Shard` buckets with `fsdp2_compatible=True` match
-  the collectives of FSDP2's `fully_shard` groups byte for byte, so training is
+- **Buckets like FSDP2's.** With `Shard` placements, a bucket can reproduce
+  the collectives of an FSDP2 `fully_shard` group byte for byte, so training is
   bitwise identical to FSDP2.
 - **Storage the optimizer can use.** Owner storage (`BucketedOwned`) and
   `BlockShard` keep each Muon matrix whole on the GPU that orthogonalizes it, so
@@ -198,7 +198,6 @@ def bucket(patterns, reshard_after_forward=True, mesh=mesh):
         mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
         gradient_divide_factor=1.0,  # sum gradients: the loss is divided by all GPUs' tokens
         reshard_after_forward=reshard_after_forward,
-        fsdp2_compatible=True,  # FSDP2's buffer layout, so collectives match bit for bit
     )
 
 
