@@ -37,8 +37,10 @@ from ..dist_muon import BlockShard, BucketConfig, ComputeLayout, DistMuon, Owned
 
 
 def _config(**kwargs) -> DeepSeekV3Config:
-    """The 16B architecture at small sizes: one dense and two MoE blocks."""
+    """The 16B architecture at small sizes: one dense and two MoE blocks, with
+    SDPA, which needs no compile."""
     return DeepSeekV3Config(
+        attention="sdpa",
         vocab_size=128,
         dim=64,
         n_layers=3,

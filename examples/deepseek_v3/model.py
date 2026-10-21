@@ -72,9 +72,9 @@ class DeepSeekV3Config:
     beta_fast: float = 32.0
     beta_slow: float = 1.0
     original_seq_len: int = 4096
-    # "sdpa": causal attention within each sequence. "flex": FlexAttention,
-    # causal within each document, as torchtitan trains.
-    attention: str = "sdpa"
+    # "flex": FlexAttention, causal within each document, as torchtitan trains.
+    # "sdpa": causal attention within each sequence, without compile.
+    attention: str = "flex"
     activation_checkpointing: bool = True
 
 
