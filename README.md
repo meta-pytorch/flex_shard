@@ -15,9 +15,10 @@ local tensors.
 - **Storage the optimizer can use.** Owner storage (`BucketedOwned`) and
   `BlockShard` keep each Muon matrix whole on the GPU that orthogonalizes it, so
   the optimizer step needs no communication.
-- **Storage quantization can use.** `Fp8BucketedBlockShard` keeps whole
-  128-row blocks on each GPU, which quantizes its own weights and all-gathers
-  FP8.
+- **Storage quantization can use (experimental).** `Fp8BucketedBlockShard`
+  keeps whole 128-row blocks on each GPU, which quantizes its own weights and
+  all-gathers FP8. The [`fp8-stack`](https://github.com/meta-pytorch/flex_shard/tree/fp8-stack)
+  branch has the newest FP8 work.
 - **Placements of your own**, on the same runtime for bucketing, prefetching
   and overlap.
 
@@ -53,6 +54,10 @@ with FSDP2's, 43% shorter. The training step, 69 seconds, varies more than that
 from job to job.
 
 ### Blockwise quantization needs whole tiles
+
+FP8 support is experimental; the
+[`fp8-stack`](https://github.com/meta-pytorch/flex_shard/tree/fp8-stack) branch
+has the newest work.
 
 <p align="center"><img src="docs/images/block_shard_tiles.svg" width="760" alt="Shard(0) cuts some 128 x 128 tiles between ranks; BlockShard cuts only between tiles"></p>
 
@@ -94,17 +99,10 @@ rather than a new FSDP. Built in:
 | Component | Requirement |
 | --- | --- |
 | Python | 3.10 or later |
-| PyTorch | 2.15 or later; use a nightly build until 2.15 is released |
+| PyTorch | 2.16 or later; until 2.16 is released, a nightly from 2.16.0.dev20261009 on |
 | Platform | Linux with NVIDIA GPUs |
 | CUDA and NCCL | A CUDA-enabled PyTorch build with NCCL and a compatible NVIDIA driver |
 | Triton | `~=3.8.0` on Linux |
-
-`Shard` placements call FSDP's native collective copies:
-`fsdp::_all_gather_copy_out_` from
-[pytorch/pytorch#197204](https://github.com/pytorch/pytorch/pull/197204), and
-`fsdp::chunk_cat_mixed_dtype` with `num_leading_dims` from
-[pytorch/pytorch#200179](https://github.com/pytorch/pytorch/pull/200179). Until a
-PyTorch release includes them, they need a PyTorch built with those pull requests.
 
 Install a CUDA-enabled PyTorch build satisfying this requirement, then install
 FlexShard from the repository:
