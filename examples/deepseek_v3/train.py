@@ -12,8 +12,8 @@ FlexShard shards the parameters over all ranks the way torchtitan's FSDP2
 setup does (one bucket per transformer block, plus the embedding and the
 output layers), with BF16 compute, FP32 gradient reduction and FP32 AdamW. Each
 rank trains on its own batches; the loss is averaged over all ranks' tokens.
-With ``--optimizer muon``, each block's matrices move to owner ranks and Muon
-updates them without communication.
+With ``--optimizer muon``, each block's matrices move to owner ranks and
+flex_shard's DistMuon updates them there, without communication.
 """
 
 import argparse
@@ -36,11 +36,11 @@ from flex_shard import (
     MixedPrecisionPolicy,
     register_optimizer_checkpoint_hook,
     relayout_bucket,
-    set_global_layout,
     set_state_dict_global_layouts,
 )
 from flex_shard.custom_placements import make_bucketed_owned_full_param_placement_fn
 from flex_shard.custom_placements.shard import Shard
+from flex_shard.dist_muon import capture_flex_shard_muon_canonical_shards
 from model import (
     DeepSeekV3,
     DeepSeekV3Config,
@@ -48,7 +48,7 @@ from model import (
     param_init_fns,
     update_expert_biases,
 )
-from muon import Muon, muon_parameters
+from muon import build_muon, kimi_matrices
 
 IGNORE_INDEX = -100
 
@@ -146,6 +146,9 @@ def shard_model(model: DeepSeekV3, mesh, *, muon: bool) -> list[int]:
     # The output layers run last in forward and first in backward, so they stay
     # gathered in between.
     buckets.append(bucket(["norm", "lm_head"], reshard_after_forward=False))
+    if muon:
+        # build_local_dist_muon reads each parameter's coordinates from here.
+        capture_flex_shard_muon_canonical_shards(model)
     flex_shard(model, buckets=buckets)
     return owner_buckets
 
@@ -158,22 +161,6 @@ def store_on_owners(model, bucket_indices) -> None:
     storages = list(model.sharded_bucket_storages)
     for index in bucket_indices:
         relayout_bucket(model, storages[index], placement_fn)
-
-
-def register_muon_checkpoint_hook(optimizer: Muon, model) -> None:
-    """Declare where each momentum buffer sits in its full parameter, as
-    ``register_optimizer_checkpoint_hook`` does for AdamW's states."""
-    fqns = {param: fqn for fqn, param in model.named_parameters()}
-    params = [param for group in optimizer.param_groups for param in group["params"]]
-
-    def hook(optimizer, state_dict):
-        layouts = get_flex_shard_global_layouts(model)
-        for index, param in enumerate(params):
-            if (state := state_dict["state"].get(index)) is not None:
-                set_global_layout(state["momentum_buffer"], layouts[fqns[param]])
-        return state_dict
-
-    optimizer.register_state_dict_post_hook(hook)
 
 
 @torch.no_grad()
@@ -235,12 +222,15 @@ def clip_grad_norm_(params, max_norm):
 
 
 def build_optimizers(model, *, muon: bool, lr: float, weight_decay: float):
-    """AdamW for every parameter, or Muon for the matrices and AdamW for the
-    rest. Build them after sharding: they hold the local shards."""
-    matrices = muon_parameters(model) if muon else {}
+    """AdamW for every parameter, or DistMuon for the matrices and AdamW for
+    the rest. Build them after sharding: they hold the local shards."""
     optimizers = {
         "adamw": torch.optim.AdamW(
-            [p for p in model.parameters() if p not in matrices],
+            [
+                p
+                for fqn, p in model.named_parameters()
+                if not (muon and kimi_matrices(fqn, model.config) is not None)
+            ],
             lr=lr,
             betas=(0.9, 0.95),
             eps=1e-8,
@@ -249,11 +239,8 @@ def build_optimizers(model, *, muon: bool, lr: float, weight_decay: float):
         )
     }
     register_optimizer_checkpoint_hook(optimizers["adamw"], model)
-    if matrices:
-        optimizers["muon"] = Muon(
-            list(matrices), matrices, lr=lr, weight_decay=weight_decay
-        )
-        register_muon_checkpoint_hook(optimizers["muon"], model)
+    if muon:
+        optimizers["muon"] = build_muon(model, lr=lr, weight_decay=weight_decay)
     return optimizers
 
 
@@ -297,10 +284,28 @@ def train_step(model, batch, *, optimizers, schedulers, max_norm, use_positions)
     return loss, grad_norm
 
 
+def optimizer_state_dict(name, optimizer):
+    state_dict = optimizer.state_dict()
+    if name != "muon":
+        return state_dict
+    # DistMuon holds only the matrices this rank stores: key their momentum by
+    # name. The tensors are the live states, with their layouts declared.
+    (group,) = state_dict["param_groups"]
+    names = group["param_names"]
+    return {
+        "momentum": {
+            names[i]: s["momentum_buffer"] for i, s in state_dict["state"].items()
+        },
+        "hyperparameters": {
+            k: v for k, v in group.items() if k not in ("params", "param_names")
+        },
+    }
+
+
 def checkpoint_state(model, optimizers, schedulers, step):
     return {
         "model": model_state_dict(model),
-        **{name: optimizer.state_dict() for name, optimizer in optimizers.items()},
+        **{name: optimizer_state_dict(name, o) for name, o in optimizers.items()},
         **{
             f"{name}_lr": scheduler.state_dict()
             for name, scheduler in schedulers.items()
@@ -333,7 +338,10 @@ def load_checkpoint(path, *, model, optimizers, schedulers, data):
     dcp.load(state, checkpoint_id=path)
     model.load_state_dict(state["model"])
     for name, optimizer in optimizers.items():
-        optimizer.load_state_dict(state[name])
+        if name == "muon":  # dcp.load restored the live momentum in place
+            optimizer.param_groups[0].update(state[name]["hyperparameters"])
+        else:
+            optimizer.load_state_dict(state[name])
     for name, scheduler in schedulers.items():
         scheduler.load_state_dict(state[f"{name}_lr"])
     data.load_state_dict(
