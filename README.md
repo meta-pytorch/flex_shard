@@ -6,9 +6,9 @@ they use, and how they are sharded. Optimizers work on ordinary local tensors.
 
 Because each bucket decides how its parameters are stored, it can store them the
 way the optimizer computes on them. [Train DeepSeek V3 16B](#train-deepseek-v3-16b)
-shows both sides: AdamW with buckets that match FSDP2 bit for bit, and Muon
-with every matrix stored whole on the GPU that orthogonalizes it, so its
-optimizer step needs no communication.
+shows both sides: AdamW with expert parallelism and buckets that match FSDP2 bit
+for bit, and Muon with every matrix stored whole on the GPU that orthogonalizes
+it, so its optimizer step needs no communication.
 
 ## Requirements and installation
 
@@ -54,19 +54,36 @@ torchrun --standalone --nproc-per-node 8 examples/deepseek_v3/train.py \
 ```
 
 Leave out `--optimizer muon` for AdamW, and `--data c4` for random tokens and no
-extra packages. `--checkpoint-dir` saves DCP checkpoints and resumes from the
+extra packages. `--ep` sets the expert-parallel degree, `--ep 1` turning expert
+parallelism off; `--checkpoint-dir` saves DCP checkpoints and resumes from the
 latest; `--deterministic` makes runs bitwise reproducible; `--help` lists the
 rest.
 
-### Buckets like FSDP2's
+### Expert parallelism, and buckets like FSDP2's
+
+The routed experts use expert parallelism (EP) over `--ep` GPUs, half of them by
+default: GPUs 0 to 3 split each block's 64 experts, 16 each, and so do GPUs 4 to
+7. [`expert_parallel.py`](examples/deepseek_v3/expert_parallel.py) ports
+torchtitan's all-to-all token dispatch: each routed copy of a token goes to the
+GPU holding its expert and its output comes back, one all-to-all each way.
+FlexShard then shards each GPU's 16 experts over the GPUs that hold the same
+ones (expert FSDP, EFSDP): GPUs 0 and 4, 1 and 5, and so on, 8 experts each.
+Everything else is sharded over all 8 GPUs (FSDP).
 
 The model is built on the meta device, sharded, then initialized with
 `init_from_full`, which has every rank draw each full parameter and keep its
-part, so the weights don't depend on the number of GPUs. Each bucket is one
+part, so the weights don't depend on the number of GPUs. `apply_expert_parallel`
+declares where each GPU's experts sit in the full weights (`set_global_layout`),
+so initialization and checkpoints see full weights there too. Each bucket is one
 group of torchtitan's FSDP2 setup:
 
 ```python
-def bucket(patterns, reshard_after_forward=True):
+mesh = init_device_mesh("cuda", (8,), mesh_dim_names=("dp",))
+expert_mesh = init_device_mesh("cuda", (2, 4), mesh_dim_names=("efsdp", "ep"))
+apply_expert_parallel(model, expert_mesh["ep"])  # keep this GPU's experts
+
+
+def bucket(patterns, reshard_after_forward=True, mesh=mesh):
     return BucketSpec(
         patterns,
         placement_fn=placement_fn,  # Shard(1) for [2, F, D] gate/up weights, else Shard(0)
@@ -77,19 +94,26 @@ def bucket(patterns, reshard_after_forward=True):
         fsdp2_compatible=True,
     )
 
+
 buckets = [bucket(["tok_embeddings"])]
-buckets += [bucket([f"layers.{i}"]) for i in range(len(model.layers))]
+for i, block in enumerate(model.layers):
+    names = [f"layers.{i}.{name}" for name, _ in block.named_parameters()]
+    experts = [name for name in names if ".routed_experts." in name]
+    buckets.append(bucket([name for name in names if name not in experts]))
+    if experts:
+        buckets.append(bucket(experts, mesh=expert_mesh["efsdp"]))
 buckets.append(bucket(["norm", "lm_head"], reshard_after_forward=False))
 flex_shard(model, buckets=buckets)
 ```
 
 `fsdp2_compatible=True` orders a bucket's parameters as `fully_shard` does, so
 its all-gather and reduce-scatter buffers match that FSDP2 group's byte for
-byte. From torchtitan's initial weights and on the same batches, losses and
-gradient norms are bitwise equal to torchtitan's FSDP2 training at every step
-of a 10-step deterministic run, with SDPA and with FlexAttention. There is no
-expert parallelism: each GPU gathers a block's 64 experts, about 1.1 GB in BF16,
-and runs its own tokens through them with `torch._grouped_mm`.
+byte. As torchtitan, the example prefetches the next block's buckets explicitly
+under EP, and clips with the experts' gradient norm taken over their two mesh
+dims in order, as DTensor reduces it. From torchtitan's initial weights and on
+the same batches, losses and gradient norms are bitwise equal to torchtitan's
+FSDP2 training with the same EP at every step of a 10-step deterministic run,
+with SDPA and with FlexAttention, and so they are with `--ep 1`.
 
 | FSDP2 | FlexShard |
 | --- | --- |
@@ -109,8 +133,8 @@ every matrix on every GPU, so each optimizer step would gather every matrix to
 one GPU and send the result back. With `--optimizer muon`, FlexShard stores each
 matrix where Muon computes it instead:
 
-- A mixture-of-experts block's routed experts get a bucket of their own, whose
-  `Shard(0)` keeps experts whole: each GPU stores 8.
+- A mixture-of-experts block's routed experts already have a bucket of their
+  own, whose `Shard(0)` keeps experts whole: each GPU stores 8.
 - After initialization or loading, `relayout_bucket` moves the rest of each block
   to whole-parameter owners (`BucketedOwned`), balanced over the GPUs across
   blocks. Forward and backward gather each parameter from its owner and reduce
@@ -135,8 +159,8 @@ owner-stored weights and DistMuon's momentum.
 
 ### Results on 8 H100s
 
-1,000 steps on C4 with the command above (FlexAttention, 4 x 4,096 tokens per
-GPU, torchtitan's learning-rate schedule):
+1,000 steps on C4 with the command above and `--ep 1` (FlexAttention, 4 x 4,096
+tokens per GPU, torchtitan's learning-rate schedule):
 
 | | AdamW | Muon |
 | --- | --- | --- |
@@ -264,8 +288,9 @@ default thread-based one keeps them.
 - Every rank must run the same graph. A bucket whose outputs only some ranks'
   losses use can reduce at a different point of backward on each rank, so the
   collectives mismatch.
-- The DeepSeek V3 example runs on one host: no expert, tensor, pipeline or
-  context parallelism.
+- The DeepSeek V3 example runs on one host, with expert parallelism but no
+  tensor, pipeline or context parallelism; `--ep` must divide the GPUs and the
+  64 experts.
 - Numerical comparisons here concern the stated configurations; they are not
   general FSDP2 benchmarks.
 
