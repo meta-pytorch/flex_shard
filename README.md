@@ -122,14 +122,16 @@ for storage in owner_buckets:  # each block's bucket other than the routed exper
     relayout_bucket(model, storage, placement_fn)
 ```
 
-Every GPU then updates its own matrices: profiles of the optimizer step show no
-NCCL kernel on any GPU, and on a three-block cut of the model the updates equal
-the same Muon run on one GPU on the full parameters and gradients, bit for bit.
-Muon uses Kimi K2's matrices (attention projections per head and role, each
-expert, gate and up as two) and its update scaling, `0.2 * sqrt(max(rows,
-columns))`, so it takes AdamW's learning rate; AdamW trains the embedding,
-norms and output projection. Checkpoints hold the owner-stored weights and
-their momentum.
+`build_local_dist_muon` then runs `flex_shard.dist_muon.DistMuon` on each GPU's
+own storage, on a one-GPU mesh where storage already is the compute layout, so
+the step moves nothing ([`muon.py`](examples/deepseek_v3/muon.py)). Profiles of
+the optimizer step show no NCCL kernel on any GPU, and on a three-block cut of
+the model its updates equal DistMuon's on the full parameters and gradients,
+bit for bit. The compute layouts are Kimi K2's matrices (attention projections
+per head and role, each expert, the rest whole), with its update scaling,
+`0.2 * sqrt(max(rows, columns))`, so Muon takes AdamW's learning rate; AdamW
+trains the embedding, norms and output projection. Checkpoints hold the
+owner-stored weights and DistMuon's momentum.
 
 ### Results on 8 H100s
 
@@ -140,15 +142,15 @@ GPU, torchtitan's learning-rate schedule):
 | --- | --- | --- |
 | Mean loss, steps 451 to 500 | 4.69 | 4.66 |
 | Mean loss, steps 951 to 1,000 | 4.18 | 4.14 |
-| Tokens per second per GPU, median | 10,417 | 9,602 |
-| Peak memory, active and reserved | 42.9 and 58.1 GiB | 35.8 and 51.4 GiB |
-| Optimizer step on the GPU | 26 ms | 80 ms of kernels over about 200 ms |
+| Tokens per second per GPU, median | 10,417 | 9,589 |
+| Peak memory, active and reserved | 42.9 and 58.1 GiB | 36.4 and 51.8 GiB |
+| Optimizer step on the GPU | 26 ms | 204 ms, 97% busy |
 
 On one host, the exchange the owners remove would cost little: this run shows
-the mechanism, not its speedup. Muon's step launches about 2,300 small kernels,
-and Muon trains 8% fewer tokens per second than AdamW here. With
-`--deterministic`, a resumed run matches an uninterrupted one bit for bit, with
-either optimizer.
+the mechanism, not its speedup. Muon's step is Newton-Schulz matmuls at 646
+TFLOP/s (112 ms) and element-wise updates (85 ms), against AdamW's 26 ms, so
+Muon trains 8% fewer tokens per second than AdamW here. With `--deterministic`,
+a resumed run matches an uninterrupted one bit for bit, with either optimizer.
 
 FlashAttention needs equal query and value head dims, so multi-head latent
 attention (192 and 128) runs SDPA on cuDNN, 6.3 ms per block forward and

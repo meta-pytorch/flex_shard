@@ -21,7 +21,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import FSDPTest
 from torch.testing._internal.common_utils import run_tests, TestCase
@@ -30,9 +30,10 @@ sys.path.insert(0, str(Path(__file__).parents[3] / "examples" / "deepseek_v3"))
 import train  # noqa: E402
 from data import SyntheticBatches  # noqa: E402
 from model import DeepSeekV3, DeepSeekV3Config, GateUpLinear, param_init_fns  # noqa: E402
-from muon import kimi_matrices, Muon  # noqa: E402
+from muon import kimi_matrices  # noqa: E402
 
 from .. import get_flex_shard_global_layouts, init_from_full  # noqa: E402
+from ..dist_muon import BlockShard, BucketConfig, ComputeLayout, DistMuon, Owned  # noqa: E402
 
 
 def _config(**kwargs) -> DeepSeekV3Config:
@@ -121,32 +122,27 @@ class TestDeepSeekV3Model(TestCase):
         self.assertEqual([lr_lambda(step) for step in range(12)], expected)
 
     def test_kimi_matrices(self) -> None:
-        # Muon's matrices: per head and role for attention, per expert, the gate
-        # and up projections as two; AdamW for embeddings, norms and the head.
+        # Muon's matrices: per head and role for attention, per expert, the rest
+        # whole; AdamW for embeddings, norms and the output projection.
         config = _config()
         with torch.device("meta"):
             model = DeepSeekV3(config)
         expected = {
-            "attention.wq.weight": [(4, 16, 64), (4, 8, 64)],
-            "attention.wkv_a.weight": [(1, 32, 64), (1, 8, 64)],
-            "attention.wkv_b.weight": [(8, 16, 32)],
-            "attention.wo.weight": [(1, 64, 64)],
-            "feed_forward.w13.weight": [(2, 96, 64)],
-            "feed_forward.w2.weight": [(1, 64, 96)],
-            "moe.router.gate.weight": [(1, 8, 64)],
-            "moe.routed_experts.w13.weight": [(16, 32, 64)],
-            "moe.routed_experts.w2.weight": [(8, 64, 32)],
-            "moe.shared_experts.w13.weight": [(2, 64, 64)],
-            "moe.shared_experts.w2.weight": [(1, 64, 64)],
+            "attention.wq.weight": BlockShard(dim=0, block_sizes=(16, 8)),
+            "attention.wkv_a.weight": BlockShard(dim=0, block_sizes=(32, 8)),
+            "attention.wkv_b.weight": BlockShard(dim=0, block_sizes=(16, 16)),
+            "attention.wo.weight": Owned(),
+            "feed_forward.w13.weight": Owned(),
+            "feed_forward.w2.weight": Owned(),
+            "moe.router.gate.weight": Owned(),
+            "moe.routed_experts.w13.weight": Shard(0),
+            "moe.routed_experts.w2.weight": Shard(0),
+            "moe.shared_experts.w13.weight": Owned(),
+            "moe.shared_experts.w2.weight": Owned(),
         }
-        for fqn, param in model.named_parameters():
-            matrices = kimi_matrices(fqn, config)
+        for fqn, _ in model.named_parameters():
             suffix = fqn.split(".", 2)[-1] if fqn.startswith("layers.") else fqn
-            if suffix not in expected:
-                self.assertIsNone(matrices, fqn)
-                continue
-            shapes = [tuple(view.shape) for view in matrices(param)]
-            self.assertEqual(shapes, expected[suffix], fqn)
+            self.assertEqual(kimi_matrices(fqn, config), expected.get(suffix), fqn)
 
 
 class TestDeepSeekV3Training(FSDPTest):
@@ -270,8 +266,8 @@ class TestDeepSeekV3Training(FSDPTest):
 
     @skip_if_lt_x_gpu(4)
     def test_muon_step_is_local_and_exact(self) -> None:
-        # With Muon, every matrix is whole on one rank: the optimizer step runs
-        # no NCCL kernel, and its updates equal Muon on the full tensors.
+        # With Muon, every matrix is whole on one rank: DistMuon's step runs no
+        # NCCL kernel, and its updates equal DistMuon's on the full tensors.
         torch.use_deterministic_algorithms(True)
         config = _config()
         model, optimizers, _ = self._sharded(config, _full_weights(config), muon=True)
@@ -281,9 +277,10 @@ class TestDeepSeekV3Training(FSDPTest):
         torch.nn.functional.cross_entropy(
             logits.float(), batch["labels"].flatten(), reduction="sum"
         ).div(tokens).backward()
-        muon = optimizers["muon"]
-        params = muon.param_groups[0]["params"]
-        fqns = {param: fqn for fqn, param in model.named_parameters()}
+        fqns = [
+            fqn for fqn, _ in model.named_parameters() if kimi_matrices(fqn, config)
+        ]
+        params = dict(model.named_parameters())
         layouts = get_flex_shard_global_layouts(model)
 
         def gather(tensors):
@@ -291,14 +288,11 @@ class TestDeepSeekV3Training(FSDPTest):
             pieces = [None] * self.world_size
             dist.all_gather_object(
                 pieces,
-                [
-                    (layouts[fqns[p]], t.detach().cpu())
-                    for p, t in zip(params, tensors, strict=True)
-                ],
+                [(layouts[fqn], tensors[fqn].detach().cpu()) for fqn in fqns],
             )
-            full = []
-            for index, param in enumerate(params):
-                out = torch.empty(layouts[fqns[param]].global_shape)
+            full = {}
+            for index, fqn in enumerate(fqns):
+                out = torch.empty(layouts[fqn].global_shape)
                 for rank_pieces in pieces:
                     layout, local = rank_pieces[index]
                     for g_off, l_off, size in zip(
@@ -307,11 +301,15 @@ class TestDeepSeekV3Training(FSDPTest):
                         out[tuple(slice(o, o + n) for o, n in zip(g_off, size))] = (
                             local[tuple(slice(o, o + n) for o, n in zip(l_off, size))]
                         )
-                full.append(out.cuda())
+                full[fqn] = out.cuda()
             return full
 
-        grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in params]
+        grads = {
+            fqn: p.grad if p.grad is not None else torch.zeros_like(p)
+            for fqn, p in params.items()
+        }
         full_params, full_grads = gather(params), gather(grads)
+        muon = optimizers["muon"]
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CUDA]
         ) as profile:
@@ -325,21 +323,31 @@ class TestDeepSeekV3Training(FSDPTest):
         self.assertTrue(kernels)
         self.assertFalse([k for k in kernels if "nccl" in k.lower()])
 
-        references = [torch.nn.Parameter(p) for p in full_params]
-        for reference, grad in zip(references, full_grads, strict=True):
-            reference.grad = grad
-        Muon(
-            references,
-            {
-                r: kimi_matrices(fqns[p], config)
-                for r, p in zip(references, params, strict=True)
+        # DistMuon on the full tensors, on the same one-rank mesh.
+        mesh = muon.param_groups[0]["params"][0].device_mesh
+        (axis,) = mesh.mesh_dim_names
+        references = {}
+        for fqn in fqns:
+            reference = torch.nn.Parameter(
+                DTensor.from_local(full_params[fqn], mesh, (Replicate(),))
+            )
+            reference.grad = DTensor.from_local(full_grads[fqn], mesh, (Replicate(),))
+            references[fqn] = reference
+        DistMuon(
+            [{"params": list(references.values()), "param_names": fqns}],
+            compute_sharding_by_fqn={
+                fqn: ComputeLayout(
+                    shardings_by_mesh_axis={axis: kimi_matrices(fqn, config)}
+                )
+                for fqn in fqns
             },
+            bucket_configs=[BucketConfig(name="all", patterns=("*",))],
             lr=1e-3,
+            adjust_lr_fn="match_rms_adamw",
         ).step()
-        for param, reference, updated in zip(
-            params, references, gather(params), strict=True
-        ):
-            self.assertTrue(torch.equal(updated, reference.detach()), fqns[param])
+        updated = gather(params)
+        for fqn in fqns:
+            self.assertTrue(torch.equal(updated[fqn], references[fqn].to_local()), fqn)
 
     @skip_if_lt_x_gpu(4)
     def test_checkpoint_resume_is_bitwise(self) -> None:
