@@ -5,8 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 """The DeepSeek V3 example (``examples/deepseek_v3``) at small sizes: its
-bucket layout trains bitwise like FSDP2, its checkpoints resume bitwise, and
-activation checkpointing changes nothing."""
+bucket layout trains bitwise like FSDP2, its Muon step is local and exact, its
+checkpoints resume bitwise, and activation checkpointing changes nothing."""
 
 import os
 import shutil
@@ -21,7 +21,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import FSDPTest
 from torch.testing._internal.common_utils import run_tests, TestCase
@@ -30,13 +30,17 @@ sys.path.insert(0, str(Path(__file__).parents[3] / "examples" / "deepseek_v3"))
 import train  # noqa: E402
 from data import SyntheticBatches  # noqa: E402
 from model import DeepSeekV3, DeepSeekV3Config, GateUpLinear, param_init_fns  # noqa: E402
+from muon import kimi_matrices  # noqa: E402
 
 from .. import get_flex_shard_global_layouts, init_from_full  # noqa: E402
+from ..dist_muon import BlockShard, BucketConfig, ComputeLayout, DistMuon, Owned  # noqa: E402
 
 
 def _config(**kwargs) -> DeepSeekV3Config:
-    """The 16B architecture at small sizes: one dense and two MoE blocks."""
+    """The 16B architecture at small sizes: one dense and two MoE blocks, with
+    SDPA, which needs no compile."""
     return DeepSeekV3Config(
+        attention="sdpa",
         vocab_size=128,
         dim=64,
         n_layers=3,
@@ -119,18 +123,41 @@ class TestDeepSeekV3Model(TestCase):
         )
         self.assertEqual([lr_lambda(step) for step in range(12)], expected)
 
+    def test_kimi_matrices(self) -> None:
+        # Muon's matrices: per head and role for attention, per expert, the rest
+        # whole; AdamW for embeddings, norms and the output projection.
+        config = _config()
+        with torch.device("meta"):
+            model = DeepSeekV3(config)
+        expected = {
+            "attention.wq.weight": BlockShard(dim=0, block_sizes=(16, 8)),
+            "attention.wkv_a.weight": BlockShard(dim=0, block_sizes=(32, 8)),
+            "attention.wkv_b.weight": BlockShard(dim=0, block_sizes=(16, 16)),
+            "attention.wo.weight": Owned(),
+            "feed_forward.w13.weight": Owned(),
+            "feed_forward.w2.weight": Owned(),
+            "moe.router.gate.weight": Owned(),
+            "moe.routed_experts.w13.weight": Shard(0),
+            "moe.routed_experts.w2.weight": Shard(0),
+            "moe.shared_experts.w13.weight": Owned(),
+            "moe.shared_experts.w2.weight": Owned(),
+        }
+        for fqn, _ in model.named_parameters():
+            suffix = fqn.split(".", 2)[-1] if fqn.startswith("layers.") else fqn
+            self.assertEqual(kimi_matrices(fqn, config), expected.get(suffix), fqn)
+
 
 class TestDeepSeekV3Training(FSDPTest):
     @property
     def world_size(self) -> int:
         return 4
 
-    def _sharded(self, config, weights):
+    def _sharded(self, config, weights, *, muon: bool):
         """The model as train.py builds it, from ``weights``."""
         mesh = init_device_mesh("cuda", (self.world_size,))
         with torch.device("meta"):
             model = DeepSeekV3(config)
-        train.shard_model(model, mesh)
+        owner_buckets = train.shard_model(model, mesh, muon=muon)
         model.to_empty(device="cuda")
         model.init_buffers(torch.device("cuda"))
         layouts = get_flex_shard_global_layouts(model)
@@ -139,7 +166,8 @@ class TestDeepSeekV3Training(FSDPTest):
                 init_from_full(
                     param, layouts[fqn], lambda full, fqn=fqn: full.copy_(weights[fqn])
                 )
-        optimizers = train.build_optimizers(model, lr=1e-3, weight_decay=0.1)
+        train.store_on_owners(model, owner_buckets)
+        optimizers = train.build_optimizers(model, muon=muon, lr=1e-3, weight_decay=0.1)
         lr_lambda = train.build_lr_lambda(
             total_steps=4, warmup_steps=1, decay_ratio=0.8, min_lr_factor=0.1
         )
@@ -172,7 +200,7 @@ class TestDeepSeekV3Training(FSDPTest):
         config = _config()
         weights = _full_weights(config)
         batches = _batches(config, self.rank, steps=3)
-        model, optimizers, schedulers = self._sharded(config, weights)
+        model, optimizers, schedulers = self._sharded(config, weights, muon=False)
         flex = self._steps(model, optimizers, schedulers, batches)
 
         with torch.device("cuda"):
@@ -239,48 +267,142 @@ class TestDeepSeekV3Training(FSDPTest):
             )
 
     @skip_if_lt_x_gpu(4)
+    def test_muon_step_is_local_and_exact(self) -> None:
+        # With Muon, every matrix is whole on one rank: DistMuon's step runs no
+        # NCCL kernel, and its updates equal DistMuon's on the full tensors.
+        torch.use_deterministic_algorithms(True)
+        config = _config()
+        model, optimizers, _ = self._sharded(config, _full_weights(config), muon=True)
+        batch = _batches(config, self.rank, steps=1)[0]
+        tokens = torch.tensor(batch["input"].numel() * self.world_size, device="cuda")
+        logits = model(batch["input"], aux_loss_denominator=tokens)
+        torch.nn.functional.cross_entropy(
+            logits.float(), batch["labels"].flatten(), reduction="sum"
+        ).div(tokens).backward()
+        fqns = [
+            fqn for fqn, _ in model.named_parameters() if kimi_matrices(fqn, config)
+        ]
+        params = dict(model.named_parameters())
+        layouts = get_flex_shard_global_layouts(model)
+
+        def gather(tensors):
+            # Every rank's (layout, local tensor), assembled into full tensors.
+            pieces = [None] * self.world_size
+            dist.all_gather_object(
+                pieces,
+                [(layouts[fqn], tensors[fqn].detach().cpu()) for fqn in fqns],
+            )
+            full = {}
+            for index, fqn in enumerate(fqns):
+                out = torch.empty(layouts[fqn].global_shape)
+                for rank_pieces in pieces:
+                    layout, local = rank_pieces[index]
+                    for g_off, l_off, size in zip(
+                        layout.global_offsets, layout.local_offsets, layout.local_sizes
+                    ):
+                        out[tuple(slice(o, o + n) for o, n in zip(g_off, size))] = (
+                            local[tuple(slice(o, o + n) for o, n in zip(l_off, size))]
+                        )
+                full[fqn] = out.cuda()
+            return full
+
+        grads = {
+            fqn: p.grad if p.grad is not None else torch.zeros_like(p)
+            for fqn, p in params.items()
+        }
+        full_params, full_grads = gather(params), gather(grads)
+        muon = optimizers["muon"]
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as profile:
+            muon.step()
+            torch.cuda.synchronize()
+        kernels = [
+            e.name
+            for e in profile.events()
+            if e.device_type == torch.autograd.DeviceType.CUDA
+        ]
+        self.assertTrue(kernels)
+        self.assertFalse([k for k in kernels if "nccl" in k.lower()])
+
+        # DistMuon on the full tensors, on the same one-rank mesh.
+        mesh = muon.param_groups[0]["params"][0].device_mesh
+        (axis,) = mesh.mesh_dim_names
+        references = {}
+        for fqn in fqns:
+            reference = torch.nn.Parameter(
+                DTensor.from_local(full_params[fqn], mesh, (Replicate(),))
+            )
+            reference.grad = DTensor.from_local(full_grads[fqn], mesh, (Replicate(),))
+            references[fqn] = reference
+        DistMuon(
+            [{"params": list(references.values()), "param_names": fqns}],
+            compute_sharding_by_fqn={
+                fqn: ComputeLayout(
+                    shardings_by_mesh_axis={axis: kimi_matrices(fqn, config)}
+                )
+                for fqn in fqns
+            },
+            bucket_configs=[BucketConfig(name="all", patterns=("*",))],
+            lr=1e-3,
+            adjust_lr_fn="match_rms_adamw",
+        ).step()
+        updated = gather(params)
+        for fqn in fqns:
+            self.assertTrue(torch.equal(updated[fqn], references[fqn].to_local()), fqn)
+
+    @skip_if_lt_x_gpu(4)
     def test_checkpoint_resume_is_bitwise(self) -> None:
         # 2 steps, a checkpoint, a fresh model loading it and 2 more steps match
-        # 4 straight steps.
+        # 4 straight steps, with AdamW and with Muon.
         torch.use_deterministic_algorithms(True)
         config = _config()
         weights = _full_weights(config)
         batches = _batches(config, self.rank, steps=4)
-        straight = self._steps(*self._sharded(config, weights), batches)
-        model, optimizers, schedulers = self._sharded(config, weights)
-        first = self._steps(model, optimizers, schedulers, batches[:2])
-        data = SyntheticBatches(
-            vocab_size=128, batch_size=2, seq_len=32, rank=self.rank
-        )
         path = [tempfile.mkdtemp() if self.rank == 0 else None]
         dist.broadcast_object_list(path)
         try:
-            train.save_checkpoint(
-                path[0],
-                model=model,
-                optimizers=optimizers,
-                schedulers=schedulers,
-                data=data,
-                step=2,
-            )
-            model, optimizers, schedulers = self._sharded(
-                config, _full_weights(config, seed=1)
-            )
-            step = train.load_checkpoint(
-                path[0],
-                model=model,
-                optimizers=optimizers,
-                schedulers=schedulers,
-                data=data,
-            )
+            for muon in (False, True):
+                with self.subTest(muon=muon):
+                    straight = self._steps(
+                        *self._sharded(config, weights, muon=muon), batches
+                    )
+                    model, optimizers, schedulers = self._sharded(
+                        config, weights, muon=muon
+                    )
+                    first = self._steps(model, optimizers, schedulers, batches[:2])
+                    data = SyntheticBatches(
+                        vocab_size=128, batch_size=2, seq_len=32, rank=self.rank
+                    )
+                    checkpoint = os.path.join(path[0], f"muon{muon}")
+                    train.save_checkpoint(
+                        checkpoint,
+                        model=model,
+                        optimizers=optimizers,
+                        schedulers=schedulers,
+                        data=data,
+                        step=2,
+                    )
+                    model, optimizers, schedulers = self._sharded(
+                        config, _full_weights(config, seed=1), muon=muon
+                    )
+                    step = train.load_checkpoint(
+                        checkpoint,
+                        model=model,
+                        optimizers=optimizers,
+                        schedulers=schedulers,
+                        data=data,
+                    )
+                    self.assertEqual(step, 2)
+                    resumed = first + self._steps(
+                        model, optimizers, schedulers, batches[2:]
+                    )
+                    for index, (a, b) in enumerate(zip(straight, resumed, strict=True)):
+                        self.assertTrue(torch.equal(a, b), index)
         finally:
             dist.barrier()
             if self.rank == 0:
                 shutil.rmtree(path[0])
-        self.assertEqual(step, 2)
-        resumed = first + self._steps(model, optimizers, schedulers, batches[2:])
-        for index, (a, b) in enumerate(zip(straight, resumed, strict=True)):
-            self.assertTrue(torch.equal(a, b), index)
 
 
 if __name__ == "__main__":

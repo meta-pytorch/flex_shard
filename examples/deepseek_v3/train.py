@@ -12,6 +12,8 @@ FlexShard shards the parameters over all ranks the way torchtitan's FSDP2
 setup does (one bucket per transformer block, plus the embedding and the
 output layers), with BF16 compute, FP32 gradient reduction and FP32 AdamW. Each
 rank trains on its own batches; the loss is averaged over all ranks' tokens.
+With ``--optimizer muon``, each block's matrices move to owner ranks and
+flex_shard's DistMuon updates them there, without communication.
 """
 
 import argparse
@@ -33,9 +35,12 @@ from flex_shard import (
     init_from_full,
     MixedPrecisionPolicy,
     register_optimizer_checkpoint_hook,
+    relayout_bucket,
     set_state_dict_global_layouts,
 )
+from flex_shard.custom_placements import make_bucketed_owned_full_param_placement_fn
 from flex_shard.custom_placements.shard import Shard
+from flex_shard.dist_muon import capture_flex_shard_muon_canonical_shards
 from model import (
     DeepSeekV3,
     DeepSeekV3Config,
@@ -43,6 +48,7 @@ from model import (
     param_init_fns,
     update_expert_biases,
 )
+from muon import build_muon, kimi_matrices
 
 IGNORE_INDEX = -100
 
@@ -54,7 +60,8 @@ def parse_args():
     parser.add_argument(
         "--local-batch-size", type=int, default=1, help="sequences per rank per step"
     )
-    parser.add_argument("--attention", choices=["sdpa", "flex"], default="sdpa")
+    parser.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw")
+    parser.add_argument("--attention", choices=["flex", "sdpa"], default="flex")
     parser.add_argument("--data", choices=["synthetic", "c4"], default="synthetic")
     parser.add_argument(
         "--tokenizer",
@@ -93,10 +100,15 @@ def parse_args():
     return parser.parse_args()
 
 
-def shard_model(model: DeepSeekV3, mesh) -> None:
+def shard_model(model: DeepSeekV3, mesh, *, muon: bool) -> list[int]:
     """Shard the parameters over ``mesh`` in the groups torchtitan's FSDP2 setup
     uses. ``fsdp2_compatible`` makes each bucket's all-gather and reduce-scatter
-    match that FSDP2 group's byte for byte."""
+    match that FSDP2 group's byte for byte.
+
+    For Muon, a MoE block's routed experts get a bucket of their own, so that
+    the rest of the block can move to owners (``store_on_owners``). Returns the
+    indices of those buckets.
+    """
     # Shard the [2, F, D] gate/up weights along F, so that each rank keeps rows
     # of both projections. Everything else, routed experts included, shards
     # along dim 0.
@@ -120,11 +132,35 @@ def shard_model(model: DeepSeekV3, mesh) -> None:
         )
 
     buckets = [bucket(["tok_embeddings"])]
-    buckets += [bucket([f"layers.{i}"]) for i in range(len(model.layers))]
+    owner_buckets = []
+    for i, block in enumerate(model.layers):
+        if not muon:
+            buckets.append(bucket([f"layers.{i}"]))
+            continue
+        names = [f"layers.{i}.{name}" for name, _ in block.named_parameters()]
+        experts = [name for name in names if ".routed_experts." in name]
+        owner_buckets.append(len(buckets))
+        buckets.append(bucket([name for name in names if name not in experts]))
+        if experts:
+            buckets.append(bucket(experts))
     # The output layers run last in forward and first in backward, so they stay
     # gathered in between.
     buckets.append(bucket(["norm", "lm_head"], reshard_after_forward=False))
+    if muon:
+        # build_local_dist_muon reads each parameter's coordinates from here.
+        capture_flex_shard_muon_canonical_shards(model)
     flex_shard(model, buckets=buckets)
+    return owner_buckets
+
+
+def store_on_owners(model, bucket_indices) -> None:
+    """Move each bucket's parameters to whole-parameter owners, balanced over
+    ranks across buckets. Muon then finds each matrix whole on one rank. Call
+    it after initializing or loading the weights, before the first forward."""
+    placement_fn = make_bucketed_owned_full_param_placement_fn(carry_loads=True)
+    storages = list(model.sharded_bucket_storages)
+    for index in bucket_indices:
+        relayout_bucket(model, storages[index], placement_fn)
 
 
 @torch.no_grad()
@@ -176,7 +212,8 @@ def clip_grad_norm_(params, max_norm):
     gradients, sum each gradient's squared shard norms over ranks, then take
     the norm of the per-gradient norms.
     """
-    grads = [p.grad for p in params if p.grad is not None]
+    # Every rank lists every parameter, even one it stores none of.
+    grads = [p.grad if p.grad is not None else p.new_zeros(0) for p in params]
     squares = torch.stack(torch._foreach_norm(grads, 2.0)) ** 2.0
     dist.all_reduce(squares)
     norm = torch.linalg.vector_norm(squares ** (1.0 / 2.0), 2.0)
@@ -184,12 +221,16 @@ def clip_grad_norm_(params, max_norm):
     return norm
 
 
-def build_optimizers(model, *, lr: float, weight_decay: float):
-    """AdamW for every parameter, by name. Build it after sharding: it holds
-    the local shards."""
+def build_optimizers(model, *, muon: bool, lr: float, weight_decay: float):
+    """AdamW for every parameter, or DistMuon for the matrices and AdamW for
+    the rest. Build them after sharding: they hold the local shards."""
     optimizers = {
         "adamw": torch.optim.AdamW(
-            model.parameters(),
+            [
+                p
+                for fqn, p in model.named_parameters()
+                if not (muon and kimi_matrices(fqn, model.config) is not None)
+            ],
             lr=lr,
             betas=(0.9, 0.95),
             eps=1e-8,
@@ -198,6 +239,8 @@ def build_optimizers(model, *, lr: float, weight_decay: float):
         )
     }
     register_optimizer_checkpoint_hook(optimizers["adamw"], model)
+    if muon:
+        optimizers["muon"] = build_muon(model, lr=lr, weight_decay=weight_decay)
     return optimizers
 
 
@@ -241,10 +284,28 @@ def train_step(model, batch, *, optimizers, schedulers, max_norm, use_positions)
     return loss, grad_norm
 
 
+def optimizer_state_dict(name, optimizer):
+    state_dict = optimizer.state_dict()
+    if name != "muon":
+        return state_dict
+    # DistMuon holds only the matrices this rank stores: key their momentum by
+    # name. The tensors are the live states, with their layouts declared.
+    (group,) = state_dict["param_groups"]
+    names = group["param_names"]
+    return {
+        "momentum": {
+            names[i]: s["momentum_buffer"] for i, s in state_dict["state"].items()
+        },
+        "hyperparameters": {
+            k: v for k, v in group.items() if k not in ("params", "param_names")
+        },
+    }
+
+
 def checkpoint_state(model, optimizers, schedulers, step):
     return {
         "model": model_state_dict(model),
-        **{name: optimizer.state_dict() for name, optimizer in optimizers.items()},
+        **{name: optimizer_state_dict(name, o) for name, o in optimizers.items()},
         **{
             f"{name}_lr": scheduler.state_dict()
             for name, scheduler in schedulers.items()
@@ -277,7 +338,10 @@ def load_checkpoint(path, *, model, optimizers, schedulers, data):
     dcp.load(state, checkpoint_id=path)
     model.load_state_dict(state["model"])
     for name, optimizer in optimizers.items():
-        optimizer.load_state_dict(state[name])
+        if name == "muon":  # dcp.load restored the live momentum in place
+            optimizer.param_groups[0].update(state[name]["hyperparameters"])
+        else:
+            optimizer.load_state_dict(state[name])
     for name, scheduler in schedulers.items():
         scheduler.load_state_dict(state[f"{name}_lr"])
     data.load_state_dict(
@@ -322,7 +386,7 @@ def main():
     )
     with torch.device("meta"):
         model = DeepSeekV3(config)
-    shard_model(model, mesh)
+    owner_buckets = shard_model(model, mesh, muon=args.optimizer == "muon")
     model.to_empty(device=device)
     model.init_buffers(device)
     if args.init_checkpoint:
@@ -331,9 +395,12 @@ def main():
         model.load_state_dict(state_dict)
     else:
         init_weights(model, args.seed)
+    store_on_owners(model, owner_buckets)
     model.train()
 
-    optimizers = build_optimizers(model, lr=args.lr, weight_decay=args.weight_decay)
+    optimizers = build_optimizers(
+        model, muon=args.optimizer == "muon", lr=args.lr, weight_decay=args.weight_decay
+    )
     lr_lambda = build_lr_lambda(
         total_steps=args.steps,
         warmup_steps=args.warmup_steps,
