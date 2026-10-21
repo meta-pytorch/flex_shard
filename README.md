@@ -1,14 +1,93 @@
 # FlexShard
 
-FlexShard is an experimental parameter-sharding library for PyTorch. Explicit
-`BucketSpec`s choose which parameters communicate together, which device mesh
-they use, and how they are sharded. Optimizers work on ordinary local tensors.
+FlexShard is an experimental data-parallel sharding library for PyTorch. Like
+FSDP2, it shards parameters, gradients and optimizer states over GPUs, gathers
+each layer's parameters for forward and backward, and reduce-scatters their
+gradients. Unlike FSDP2, it lets each group of parameters choose how it is
+stored: explicit buckets name the parameters that communicate together, the
+device mesh they use, and their placement, including placements that keep
+matrices and quantization tiles whole on one GPU. Optimizers work on ordinary
+local tensors.
 
-Because each bucket decides how its parameters are stored, it can store them the
-way the optimizer computes on them. [Train DeepSeek V3 16B](#train-deepseek-v3-16b)
-shows both sides: AdamW with expert parallelism and buckets that match FSDP2 bit
-for bit, and Muon with every matrix stored whole on the GPU that orthogonalizes
-it, so its optimizer step needs no communication.
+- **Buckets like FSDP2's.** `Shard` buckets with `fsdp2_compatible=True` match
+  the collectives of FSDP2's `fully_shard` groups byte for byte, so training is
+  bitwise identical to FSDP2.
+- **Storage the optimizer can use.** Owner storage (`BucketedOwned`) and
+  `BlockShard` keep each Muon matrix whole on the GPU that orthogonalizes it, so
+  the optimizer step needs no communication.
+- **Storage quantization can use.** `Fp8BucketedBlockShard` keeps whole
+  128-row blocks on each GPU, which quantizes its own weights and all-gathers
+  FP8.
+- **Placements of your own**, on the same runtime for bucketing, prefetching
+  and overlap.
+
+[Train DeepSeek V3 16B](#train-deepseek-v3-16b) shows the first two at work:
+expert parallelism with buckets that train bitwise like torchtitan's FSDP2, and
+Muon without communication.
+
+## Why FlexShard
+
+### Muon needs whole matrices
+
+<p align="center"><img src="docs/images/muon_whole_matrices.svg" width="760" alt="FSDP2's Shard(0) stores 896 rows of a [7168, 2048] matrix on each of 8 ranks; FlexShard's Owned stores the whole matrix on rank 3"></p>
+
+Muon orthogonalizes each matrix's momentum with a Newton-Schulz iteration, so
+each matrix has to be whole on the GPU that runs it. FSDP2's `Shard(0)` leaves a
+slice of every matrix on every GPU, and Megatron's distributed optimizer cuts
+matrices where its buffer's rank ranges meet, so each step gathers matrices to
+the GPUs that run them and sends the updates back. FlexShard's
+owner storage (`BucketedOwned`) keeps a whole matrix on one GPU, and `BlockShard`
+keeps whole blocks of its rows, such as attention heads, so the optimizer runs on
+local storage.
+
+<p align="center"><img src="docs/images/dist_muon_timeline.svg" width="760" alt="With FSDP2, each bucket's exchange waits for that bucket's slowest owner, so a made-up example takes 6 + 5 + 4 = 15 units plus 6 exchanges; with FlexShard each rank runs its own matrices and the slowest rank takes 8"></p>
+
+The exchange also makes GPUs wait for each other. DistMuon sends each bucket of
+matrices to the GPUs that orthogonalize them, so every bucket waits for its
+slowest GPU, and the step takes the sum of those slowest times. When each matrix
+is stored where it is orthogonalized, each GPU runs its own matrices back to
+back, and the step takes the slowest GPU's own total. On DeepSeek V3 671B with
+256 H100s (pipeline parallelism 4, data parallelism 64), the slowest GPU's
+optimizer step, timed on the GPU, took 301 ms with owner storage against 527 ms
+with FSDP2's, 43% shorter. The training step, 69 seconds, varies more than that
+from job to job.
+
+### Blockwise quantization needs whole tiles
+
+<p align="center"><img src="docs/images/block_shard_tiles.svg" width="760" alt="Shard(0) cuts some 128 x 128 tiles between ranks; BlockShard cuts only between tiles"></p>
+
+FP8 training with blockwise scaling gives each 128 x 128 tile of a weight its
+own scale. FSDP2's equal shards can cut a tile where two shards meet, and no GPU
+holds all of a cut tile, so the weights are either all-gathered in BF16 and
+quantized after, or quantized after an all-reduce of each tile's largest value
+(amax).
+`Fp8BucketedBlockShard` gives each GPU whole 128-row blocks of a bucket instead:
+
+<p align="center"><img src="docs/images/fp8_all_gather.svg" width="760" alt="Three pipelines: BF16 all-gather then quantize; FSDP2's amax all-reduce, quantize, FP8 all-gather; FlexShard's local quantize then FP8 all-gather"></p>
+
+Each GPU quantizes its own tiles without an all-reduce, and the all-gather moves
+FP8 data and one scale per tile, about half the bytes of BF16. The gathered
+weight is bit for bit the one all-gathering BF16 and quantizing after would give
+([`fp8_bucketed_block_shard.py`](src/flex_shard/custom_placements/fp8_bucketed_block_shard.py)).
+
+### Placements are pluggable
+
+A placement decides which part of each parameter a GPU stores, and how a bucket
+gathers its parameters and reduces their gradients: `Shard` uses all-gather and
+reduce-scatter, for example. One runtime serves every placement, with
+bucketing, prefetching, overlap of communication and compute, resharding,
+gradient accumulation and distributed checkpoints, so a new storage scheme is a
+`Placement` subclass
+([`placement_contract.py`](src/flex_shard/flex_shard/placement_contract.py))
+rather than a new FSDP. Built in:
+
+| Placement | Each GPU stores | As in |
+| --- | --- | --- |
+| `Shard(i)` | an equal slice of each parameter, along dim `i` | FSDP2 |
+| `BucketedBlockShard` | a range of one flat buffer per bucket | FSDP1, Megatron's distributed optimizer, veScale-FSDP |
+| `BucketedOwned` | whole parameters, or whole slabs along dim 0 | new |
+| `BlockShard` | whole blocks of a parameter, along one dim | new |
+| `Fp8BucketedBlockShard` | whole 128-row blocks, gathered as FP8 | new |
 
 ## Requirements and installation
 
@@ -37,6 +116,34 @@ python -m pip install -e .
 ```
 
 The distribution is named `flex-shard`; import it as `flex_shard`.
+
+## Buckets, storage sharding and compute sharding
+
+Three choices describe how FlexShard shards a model:
+
+- **Bucket**: which parameters and gradients go together in one all-gather and
+  one reduce-scatter. `BucketSpec(patterns, ...)` names them by fully qualified
+  name.
+- **Storage sharding**: how a bucket stores its parameters between uses: its
+  `placement_fn` and its device `mesh`.
+- **Compute sharding**: how parameters are laid out where they are used. Forward
+  and backward see them replicated over the bucket's mesh; tensor or expert
+  parallelism shard them further, which FlexShard takes as an
+  [outer sharding](#outer-shardings). The optimizer may compute in yet another
+  layout, which [`flex_shard.dist_muon`](src/flex_shard/dist_muon)'s DistMuon
+  describes per parameter.
+
+Coming from FSDP2:
+
+| FSDP2 | FlexShard |
+| --- | --- |
+| Apply `fully_shard` to child modules, then the root | Call `flex_shard` once with explicit buckets |
+| `shard_placement_fn` returning `Shard(i)` | A `placement_fn` returning `Shard(i)`; one bucket may mix dims |
+| `fully_shard(layer.experts, mesh=efsdp_mesh)` | Expert `BucketSpec(..., mesh=efsdp_mesh)` |
+| `set_modules_to_forward_prefetch` / `set_modules_to_backward_prefetch` | `set_buckets_to_forward_prefetch` / `set_buckets_to_backward_prefetch` on entries of `sharded_bucket_storages` |
+| `unshard()`, `reshard()` and `set_reshard_after_forward` on one `fully_shard` group | The same methods on its bucket's storage, from `sharded_bucket_storages` or `model.bucket_storage_of(param)` |
+| The optimizer manages DTensor parameters | The optimizer manages ordinary local shards; construct it after sharding |
+| DCP checkpoints DTensor state dicts | DCP checkpoints local shards that declare their layouts; see [Distributed checkpoints](#distributed-checkpoints) |
 
 ## Train DeepSeek V3 16B
 
@@ -89,9 +196,9 @@ def bucket(patterns, reshard_after_forward=True, mesh=mesh):
         placement_fn=placement_fn,  # Shard(1) for [2, F, D] gate/up weights, else Shard(0)
         mesh=mesh,
         mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
-        gradient_divide_factor=1.0,  # the loss is divided by the global token count
+        gradient_divide_factor=1.0,  # sum gradients: the loss is divided by all GPUs' tokens
         reshard_after_forward=reshard_after_forward,
-        fsdp2_compatible=True,
+        fsdp2_compatible=True,  # FSDP2's buffer layout, so collectives match bit for bit
     )
 
 
@@ -106,32 +213,20 @@ buckets.append(bucket(["norm", "lm_head"], reshard_after_forward=False))
 flex_shard(model, buckets=buckets)
 ```
 
-`fsdp2_compatible=True` orders a bucket's parameters as `fully_shard` does, so
-its all-gather and reduce-scatter buffers match that FSDP2 group's byte for
-byte. As torchtitan, the example prefetches the next block's buckets explicitly
-under EP, and clips with the experts' gradient norm taken over their two mesh
-dims in order, as DTensor reduces it. From torchtitan's initial weights and on
-the same batches, losses and gradient norms are bitwise equal to torchtitan's
-FSDP2 training with the same EP at every step of a 10-step deterministic run,
-with SDPA and with FlexAttention, and so they are with `--ep 1`.
-
-| FSDP2 | FlexShard |
-| --- | --- |
-| Apply `fully_shard` to child modules, then the root | Call `flex_shard` once with explicit buckets |
-| `shard_placement_fn` returning `Shard(i)` | A `placement_fn` returning `Shard(i)`; one bucket may mix dims |
-| `fully_shard(layer.experts, mesh=efsdp_mesh)` | Expert `BucketSpec(..., mesh=efsdp_mesh)` |
-| `set_modules_to_forward_prefetch` / `set_modules_to_backward_prefetch` | `set_buckets_to_forward_prefetch` / `set_buckets_to_backward_prefetch` on entries of `sharded_bucket_storages` |
-| `unshard()`, `reshard()` and `set_reshard_after_forward` on one `fully_shard` group | The same methods on its bucket's storage, from `sharded_bucket_storages` or `model.bucket_storage_of(param)` |
-| The optimizer manages DTensor parameters | The optimizer manages ordinary local shards; construct it after sharding |
-| DCP checkpoints DTensor state dicts | DCP checkpoints local shards that declare their layouts; see [Distributed checkpoints](#distributed-checkpoints) |
+With EP, each expert's gradient already sums the tokens of its EP group, so the
+expert buckets can't take the default, which averages over each bucket's own
+mesh; summing everywhere, with the loss divided by all GPUs' tokens, is what
+torchtitan does. As torchtitan does under EP, the example also prefetches the
+next block's buckets explicitly, and clips with the experts' gradient norm taken
+over their two mesh dims in turn, as DTensor reduces it. From torchtitan's
+initial weights and on the same batches, losses and gradient norms are bitwise
+equal to torchtitan's FSDP2 training with the same EP at every step of a 10-step
+deterministic run, with SDPA and with FlexAttention, and so they are with
+`--ep 1`.
 
 ### Muon without communication
 
-Muon orthogonalizes each matrix's momentum with a Newton-Schulz iteration, so
-each matrix has to be whole on the GPU that runs it. FSDP2 stores a slice of
-every matrix on every GPU, so each optimizer step would gather every matrix to
-one GPU and send the result back. With `--optimizer muon`, FlexShard stores each
-matrix where Muon computes it instead:
+With `--optimizer muon`, FlexShard stores each matrix where Muon computes it:
 
 - A mixture-of-experts block's routed experts already have a bucket of their
   own, whose `Shard(0)` keeps experts whole: each GPU stores 8.
@@ -151,30 +246,40 @@ own storage, on a one-GPU mesh where storage already is the compute layout, so
 the step moves nothing ([`muon.py`](examples/deepseek_v3/muon.py)). Profiles of
 the optimizer step show no NCCL kernel on any GPU, and on a three-block cut of
 the model its updates equal DistMuon's on the full parameters and gradients,
-bit for bit. The compute layouts are Kimi K2's matrices (attention projections
-per head and role, each expert, the rest whole), with its update scaling,
-`0.2 * sqrt(max(rows, columns))`, so Muon takes AdamW's learning rate; AdamW
-trains the embedding, norms and output projection. Checkpoints hold the
-owner-stored weights and DistMuon's momentum.
+bit for bit, with or without EP. The compute layouts are Kimi K2's matrices
+(attention projections per head and role, each expert, the rest whole), with its
+update scaling, `0.2 * sqrt(max(rows, columns))`, so Muon takes AdamW's learning
+rate; AdamW trains the embedding, norms and output projection. Checkpoints hold
+the owner-stored weights and DistMuon's momentum.
 
 ### Results on 8 H100s
 
-1,000 steps on C4 with the command above and `--ep 1` (FlexAttention, 4 x 4,096
-tokens per GPU, torchtitan's learning-rate schedule):
+On C4 with the command above (FlexAttention, 4 x 4,096 tokens per GPU and
+torchtitan's learning-rate schedule for 1,000 steps), through step 500, next to
+the same runs without expert parallelism (`--ep 1`). Throughput is the median
+over steps 11 to 500:
 
-| | AdamW | Muon |
-| --- | --- | --- |
-| Mean loss, steps 451 to 500 | 4.69 | 4.66 |
-| Mean loss, steps 951 to 1,000 | 4.18 | 4.14 |
-| Tokens per second per GPU, median | 10,417 | 9,589 |
-| Peak memory, active and reserved | 42.9 and 58.1 GiB | 36.4 and 51.8 GiB |
-| Optimizer step on the GPU | 26 ms | 204 ms, 97% busy |
+| | AdamW | AdamW, `--ep 1` | Muon | Muon, `--ep 1` |
+| --- | --- | --- | --- | --- |
+| Mean loss, steps 451 to 500 | 4.69 | 4.69 | 4.66 | 4.66 |
+| Tokens per second per GPU, median | 9,994 | 10,440 | 9,088 | 9,644 |
+| Peak memory, active and reserved | 42.9 and 57.3 GiB | 42.9 and 58.1 GiB | 36.4 and 51.5 GiB | 36.4 and 51.8 GiB |
 
-On one host, the exchange the owners remove would cost little: this run shows
-the mechanism, not its speedup. Muon's step is Newton-Schulz matmuls at 646
-TFLOP/s (112 ms) and element-wise updates (85 ms), against AdamW's 26 ms, so
-Muon trains 8% fewer tokens per second than AdamW here. With `--deterministic`,
-a resumed run matches an uninterrupted one bit for bit, with either optimizer.
+Expert parallelism trains to the same losses; the `--ep 1` runs went on to 4.18
+(AdamW) and 4.14 (Muon) over steps 951 to 1,000. On one host it trains 4% fewer
+tokens per second with AdamW and 6% fewer with Muon. EP shrinks each block's
+expert all-gather from 64 experts, 56 of them from seven other GPUs, to 16
+experts, 8 of them from one other GPU, but NVLink makes that gather cheap here,
+while EP adds 6 all-to-alls per MoE block per step: 2 in forward, 2 in the
+recomputed forward and 2 in backward.
+
+Muon's optimizer step takes 204 ms on the GPU, 97% busy: Newton-Schulz matmuls
+at 646 TFLOP/s (112 ms) and element-wise updates (85 ms), against AdamW's 26 ms
+(measured with `--ep 1`, where each GPU also stores 8 whole experts). On one host
+the exchange that owner storage removes would cost little, so these runs show
+the mechanism, not its speedup; [Muon needs whole matrices](#muon-needs-whole-matrices)
+has the 256-GPU numbers. With `--deterministic`, a resumed run matches an
+uninterrupted one bit for bit, with either optimizer and with or without EP.
 
 Attention is FlexAttention, compiled without autotuning: torchtitan's kernel,
 which keeps packed documents apart and is deterministic; the rest of the model
@@ -278,6 +383,15 @@ state-dict tensors: a copy, such as a `.to(dtype)` cast, needs
 them and saves each shard as if it were the full tensor, without raising; the
 default thread-based one keeps them.
 
+## FlexShard in training frameworks
+
+- [weifengpy/torchtitan-flexshard](https://github.com/weifengpy/torchtitan-flexshard):
+  torchtitan with `parallelism.fsdp_backend="flex_shard"`, which trains bitwise
+  like its FSDP2 backend, and DistMuon from `flex_shard.dist_muon`.
+- [weifengpy/Megatron-flexshard](https://github.com/weifengpy/Megatron-flexshard):
+  Megatron-LM with FlexShard as a data-parallel backend (`--use-flex-shard`),
+  next to DDP and the distributed optimizer.
+
 ## Limitations
 
 - The API is experimental and uses private PyTorch APIs; the declared version
@@ -303,6 +417,8 @@ python -m pytest
 
 Use at least four GPUs for the full suite. Tests skip when required hardware
 is unavailable; CPU-only checks do not validate distributed training.
+[`docs/images/make_figures.py`](docs/images/make_figures.py) redraws this
+README's figures (it needs matplotlib).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
