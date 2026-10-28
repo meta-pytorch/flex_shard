@@ -29,8 +29,19 @@ from ..flex_shard.utils import (
     _record_copy_out_if_eager,
     _record_function_if_eager,
 )
-from .block_shard import _grad_reduce_dtype, _unsharded_dtype, BlockShard
-from .fp8_bucketed_block_shard import _align_up, _VEC_ALIGN_BYTES, Fp8BucketedBlockShard
+from .block_shard import (
+    _grad_reduce_dtype,
+    _unsharded_dtype,
+    BlockShard,
+    BucketedBlockShard,
+)
+from .blockwise_quant_bucketed_block_shard import (
+    _align_up,
+    _VEC_ALIGN_BYTES,
+    BlockwiseQuantBucketedBlockShard,
+)
+from .fp8_bucketed_block_shard import Fp8BucketedBlockShard
+from .mxfp8_bucketed_block_shard import Mxfp8BucketedBlockShard
 from .owned import BucketedOwned
 from .owner_rows_transport import (
     gather_owner_rows,
@@ -290,14 +301,21 @@ class _MixedBucketedOwned(_MixedBucketMember, BucketedOwned):
         self._collective_placement = mixed_bucket._bucketed_owned
 
 
-class _MixedFp8BucketedBlockShard(
+class _MixedBlockwiseQuantMember(
     _MixedBucketMember,
-    Fp8BucketedBlockShard,
+    BlockwiseQuantBucketedBlockShard,
 ):
-    """Optimizer-visible blockwise FP8 member of one mixed bucket placement."""
+    """Optimizer-visible blockwise quantized member of one mixed bucket placement."""
 
     __eq__ = _MixedBucketMember.__eq__
     __hash__ = _MixedBucketMember.__hash__
+
+
+class _MixedFp8BucketedBlockShard(
+    _MixedBlockwiseQuantMember,
+    Fp8BucketedBlockShard,
+):
+    """Optimizer-visible blockwise FP8 member of one mixed bucket placement."""
 
     def __init__(
         self,
@@ -309,10 +327,42 @@ class _MixedFp8BucketedBlockShard(
             world_size=placement.world_size,
             weight_factory=placement.weight_factory,
             block_size=placement.block_size,
-            fp8_dtype=placement.fp8_dtype,
+            fp8_dtype=placement.qdata_dtype,
         )
         self._mixed_bucket = mixed_bucket
         self._collective_placement = placement
+
+
+class _MixedMxfp8BucketedBlockShard(
+    _MixedBlockwiseQuantMember,
+    Mxfp8BucketedBlockShard,
+):
+    """Optimizer-visible MXFP8 member of one mixed bucket placement."""
+
+    def __init__(
+        self,
+        mixed_bucket: MixedBucketPlacement,
+        placement: Mxfp8BucketedBlockShard,
+    ) -> None:
+        Mxfp8BucketedBlockShard.__init__(
+            self,
+            world_size=placement.world_size,
+            weight_factory=placement.weight_factory,
+            scaling_mode=placement.scaling_mode,
+        )
+        self._mixed_bucket = mixed_bucket
+        self._collective_placement = placement
+
+
+# Each member type's constructor takes the mixed bucket and the collective
+# placement it copies.
+_MIXED_BLOCKWISE_QUANT_MEMBER_TYPES: dict[
+    type[BlockwiseQuantBucketedBlockShard],
+    Callable[[MixedBucketPlacement, Any], _MixedBlockwiseQuantMember],
+] = {
+    Fp8BucketedBlockShard: _MixedFp8BucketedBlockShard,
+    Mxfp8BucketedBlockShard: _MixedMxfp8BucketedBlockShard,
+}
 
 
 class MixedBucketPlacement(Placement):
@@ -332,7 +382,7 @@ class MixedBucketPlacement(Placement):
         self._block_shard_members_by_config: dict[
             tuple[int, tuple[int, ...]], _MixedBlockShard
         ] = {}
-        self._fp8_bucketed_block_member: _MixedFp8BucketedBlockShard | None = None
+        self._blockwise_quant_member: _MixedBlockwiseQuantMember | None = None
 
     def block_shard(
         self,
@@ -347,17 +397,23 @@ class MixedBucketPlacement(Placement):
             self._block_shard_members_by_config[key] = member
         return member
 
-    def fp8_bucketed_block_shard(
+    def blockwise_quant_bucketed_block_shard(
         self,
-        placement: Fp8BucketedBlockShard,
-    ) -> Fp8BucketedBlockShard:
-        member = self._fp8_bucketed_block_member
+        placement: BlockwiseQuantBucketedBlockShard,
+    ) -> BlockwiseQuantBucketedBlockShard:
+        member = self._blockwise_quant_member
         if member is None:
-            member = _MixedFp8BucketedBlockShard(self, placement)
-            self._fp8_bucketed_block_member = member
+            member_type = _MIXED_BLOCKWISE_QUANT_MEMBER_TYPES.get(type(placement))
+            if member_type is None:
+                raise TypeError(
+                    "Mixed FlexShard buckets do not support blockwise quantized "
+                    f"placement {type(placement).__name__}."
+                )
+            member = member_type(self, placement)
+            self._blockwise_quant_member = member
         elif member._collective_placement is not placement:
             raise NotImplementedError(
-                "A mixed bucket supports one FP8 bucketed block placement instance."
+                "A mixed bucket supports one blockwise quantized placement instance."
             )
         return member
 
@@ -666,7 +722,7 @@ class MixedBucketPlacement(Placement):
                 group_gathered_by_rank = gathered_by_rank[
                     :, group.offset : group.offset + group.numel
                 ]
-                if isinstance(placement, Fp8BucketedBlockShard):
+                if isinstance(placement, BlockwiseQuantBucketedBlockShard):
                     gathered = group_gathered_by_rank
                     group.prepared.persistent = prepared.persistent
                     group.prepared.persistent_buffers = group_persistent_buffers
@@ -1080,6 +1136,30 @@ class MixedBucketPlacement(Placement):
                     group_numel = layout.padded_segment_numel
                     group_dtype = _grad_reduce_dtype(group.infos[0])
                     group_device = group.tensors[0].device
+                elif isinstance(
+                    group.placement, BlockwiseQuantBucketedBlockShard
+                ) and group.placement._packs_reduce_scatter_grad_in_one_pass(
+                    group.tensors, _grad_reduce_dtype(group.infos[0])
+                ):
+                    # The grads are packed straight into the bucket's send
+                    # buffer below, in one pass, rather than into a
+                    # world-size buffer of their own first.
+                    group_numel = max(
+                        group.placement._bucket_layout(group.infos[0]).rank_numels
+                    )
+                    prepared = PlacementPreparedReduceGrad(
+                        placement=group.placement,
+                        buffers=[],
+                        placement_state=BucketedBlockShard._ReduceGradState(
+                            infos=group.infos,
+                            rank=mesh.get_local_rank(),
+                            pg=mesh.get_group(),
+                            debug_fqn=debug_fqn,
+                            padded_segment_numel=group_numel,
+                        ),
+                    )
+                    group_dtype = _grad_reduce_dtype(group.infos[0])
+                    group_device = group.tensors[0].device
                 else:
                     prepared = group.placement.prepare_reduce_grad(
                         group.tensors,
@@ -1291,7 +1371,7 @@ def _prepare_mixed_unshard_group(
     mesh: DeviceMesh,
     debug_fqn: str | None,
 ) -> PlacementPreparedUnshard:
-    if isinstance(placement, Fp8BucketedBlockShard):
+    if isinstance(placement, BlockwiseQuantBucketedBlockShard):
         return placement._prepare_local_unshard_payload(
             tensors,
             infos,
@@ -1340,17 +1420,17 @@ def _build_mixed_unshard_layout(
         for group_prepared, _ in prepared_groups
     ]
     group_placements = [prepared.placement for prepared, _ in prepared_groups]
-    fp8_transport_groups = [
-        isinstance(prepared.placement, Fp8BucketedBlockShard)
+    quant_transport_groups = [
+        isinstance(prepared.placement, BlockwiseQuantBucketedBlockShard)
         and prepared.buffers[0].dtype == torch.uint8
         for prepared, _ in prepared_groups
     ]
-    align_fp8_transport = any(fp8_transport_groups)
+    align_quant_transport = any(quant_transport_groups)
     group_alignments = [
-        _VEC_ALIGN_BYTES if is_fp8_transport else 1
-        for is_fp8_transport in fp8_transport_groups
+        _VEC_ALIGN_BYTES if is_quant_transport else 1
+        for is_quant_transport in quant_transport_groups
     ]
-    row_alignment = _VEC_ALIGN_BYTES if align_fp8_transport else 1
+    row_alignment = _VEC_ALIGN_BYTES if align_quant_transport else 1
     offsets, owner_ranks, row_numel, max_exclusive_payload_numel = _plan_group_offsets(
         group_placements,
         group_numels,
@@ -1408,11 +1488,12 @@ def _group_tensors_by_placement(
             info.global_shape,
             world_size,
         )
-        # FP8 pack plans span the whole member and index infos by position, and
-        # FP8 quantizes each param from its own dtype, so never split it.
+        # Quantized pack plans span the whole member and index infos by
+        # position, and quantization reads each param in its own dtype, so
+        # never split a quantized member.
         key = (
             None
-            if key_fn is None or isinstance(placement, Fp8BucketedBlockShard)
+            if key_fn is None or isinstance(placement, BlockwiseQuantBucketedBlockShard)
             else key_fn(info)
         )
         for group in groups:
@@ -1451,9 +1532,9 @@ def _group_local_params_by_placement(
 
 def _num_persistent_buffers(placement: Placement, num_params: int) -> int:
     """persistent buffers a group's persistent unshard returns (see finish)."""
-    # Fp8 groups back all params with one compact buffer; Shard and
-    # BlockShard groups back each param with its own buffer.
-    return 1 if isinstance(placement, Fp8BucketedBlockShard) else num_params
+    # Blockwise quantized groups back all params with one compact buffer;
+    # Shard and BlockShard groups back each param with its own buffer.
+    return 1 if isinstance(placement, BlockwiseQuantBucketedBlockShard) else num_params
 
 
 def _collective_placement(
@@ -1711,11 +1792,11 @@ def _validate_mixed_groups(groups: list[_PlacementGroup]) -> None:
             isinstance(placement, BlockShard)
             or isinstance(placement, Shard)
             and placement.dim == 0
-            or isinstance(placement, Fp8BucketedBlockShard)
+            or isinstance(placement, BlockwiseQuantBucketedBlockShard)
         ):
             raise ValueError(
                 "Mixed FlexShard bucket collectives currently support only "
-                "Shard(0), BlockShard, and Fp8BucketedBlockShard subgroups."
+                "Shard(0), BlockShard, and blockwise quantized subgroups."
             )
 
 
@@ -1741,7 +1822,7 @@ def _finish_mixed_reduce_group(
         )
     if isinstance(placement, BlockShard):
         return placement._unpack_reduce_scatter_grad(recv, state)
-    if isinstance(placement, Fp8BucketedBlockShard):
+    if isinstance(placement, BlockwiseQuantBucketedBlockShard):
         bucket_layout = placement._bucket_layout(state.infos[0])
         rank_offset = bucket_layout.rank_offsets[state.rank]
         return [
@@ -1755,6 +1836,6 @@ def _finish_mixed_reduce_group(
         ]
     raise TypeError(
         "Mixed FlexShard reduce-grad supports only Shard(0), BlockShard, "
-        "and Fp8BucketedBlockShard, "
+        "and blockwise quantized placements, "
         f"but got {type(placement).__name__}."
     )

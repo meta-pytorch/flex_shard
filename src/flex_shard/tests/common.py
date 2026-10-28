@@ -23,6 +23,8 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 from .. import BucketSpec, flex_shard
 from ..custom_placements.shard import per_param_placements
+from ..flex_shard.bucket_storage import ParamInfo
+from ..flex_shard.placement_contract import Placement
 from ..flex_shard.utils import alloc_grads_in_param_layout  # noqa: F401
 
 
@@ -253,3 +255,51 @@ def transformer_bucket_specs(
             ),
         ]
     )
+
+
+class FakeMesh:
+    """Minimal mesh for exercising bucket_storage_layout without a real PG."""
+
+    def __init__(self, size: int, rank: int = 0) -> None:
+        self._size = size
+        self._rank = rank
+
+    def size(self) -> int:
+        return self._size
+
+    def get_local_rank(self) -> int:
+        return self._rank
+
+    def get_group(self):
+        return None
+
+
+def make_param_infos(
+    named_params: list[tuple[str, nn.Parameter]],
+    placement: Placement,
+    mesh: FakeMesh,
+) -> list[ParamInfo]:
+    """ParamInfos for params sharing one placement's bucket storage layout."""
+    placements = {fqn: (placement,) for fqn, _ in named_params}
+    layout = placement.bucket_storage_layout(
+        named_params,
+        placements,
+        mesh,
+    )
+    return [
+        ParamInfo(
+            fqn=fqn,
+            global_shape=param.shape,
+            global_stride=tuple(param.stride()),
+            dtype=param.dtype,
+            requires_grad=param.requires_grad,
+            placements=(placement,),
+            local_shape=layout.param_layouts[fqn].local_shape,
+            local_numel=layout.param_layouts[fqn].local_numel,
+            byte_offset=layout.param_layouts[fqn].byte_offset,
+            storage_nbytes=layout.param_layouts[fqn].storage_nbytes,
+            global_numel=param.numel(),
+            bucket_layout=layout.param_layouts[fqn].bucket_layout,
+        )
+        for fqn, param in named_params
+    ]
