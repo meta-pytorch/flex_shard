@@ -23,26 +23,17 @@ from ..blockwise_fp8 import (
     FlexShardFloat8BlockwiseLinear,
 )
 from ..custom_placements.fp8_bucketed_block_shard import (
-    _align_up,
     _quantize_dense_weight_to_blockwise_fp8,
-    _VEC_ALIGN_BYTES,
     BlockwiseFp8WeightFactory,
     Fp8BucketedBlockShard,
     make_fp8_bucketed_block_placement_fn,
 )
 from ..custom_placements.shard import per_param_placements
-from ..custom_placements.utils import foreach_copy_
-from ..flex_shard.bucket_storage import ParamInfo, PlacementFn
-from ..flex_shard.placement_contract import (
-    Placement,
-    PlacementPreparedUnshard,
-    PlacementUnshardResult,
-)
-from ..flex_shard.utils import (
-    _record_copy_in_if_eager,
-    _record_copy_out_if_eager,
-)
+from ..flex_shard.bucket_storage import PlacementFn
+from ..flex_shard.placement_contract import Placement
 from .common import make_test_sgd, make_transformer_model
+
+from .blockwise_quant_reference import DenseAllGatherReferenceMixin
 
 
 device_type = torch.device(get_devtype())
@@ -69,161 +60,11 @@ def _make_dense_all_gather_reference_placement_fn(
     return dense_all_gather_reference_placements
 
 
-class _DenseAllGatherReferencePlacement(Fp8BucketedBlockShard):
+class _DenseAllGatherReferencePlacement(
+    DenseAllGatherReferenceMixin,
+    Fp8BucketedBlockShard,
+):
     """All-gather dense shards using the FP8 placement's shard layout."""
-
-    def _dense_send_numel_per_rank(
-        self,
-        metadata: Fp8BucketedBlockShard._Fp8BucketMetadata,
-    ) -> int:
-        return _align_up(
-            max(metadata.rank_fp8_numels, default=0),
-            _VEC_ALIGN_BYTES,
-        )
-
-    def _pack_local_dense_chunks(
-        self,
-        tensors: list[torch.Tensor],
-        infos: list[ParamInfo],
-        rank: int,
-        metadata: Fp8BucketedBlockShard._Fp8BucketMetadata,
-    ) -> torch.Tensor:
-        dtype = infos[0].unsharded_dtype
-        device = next((t.device for t in tensors if t.numel() > 0), tensors[0].device)
-        local_dense = torch.empty(
-            self._dense_send_numel_per_rank(metadata),
-            dtype=dtype,
-            device=device,
-        )
-        payload_end = metadata.rank_fp8_numels[rank]
-        if payload_end < local_dense.numel():
-            local_dense[payload_end:].zero_()
-        tensors_by_fqn = {
-            info.fqn: tensor.reshape(info.local_shape)
-            for tensor, info in zip(tensors, infos, strict=True)
-        }
-        infos_by_fqn = {info.fqn: info for info in infos}
-        for chunk in metadata.chunks:
-            if chunk.rank != rank:
-                continue
-            info = infos_by_fqn[chunk.fqn]
-            tensor = tensors_by_fqn[chunk.fqn]
-            expected_numel = self._chunk_numel(chunk, info.global_shape[1])
-            if tensor.numel() != expected_numel:
-                raise AssertionError(
-                    "Dense reference local shard does not match planned chunk for "
-                    f"{chunk.fqn!r}: expected {expected_numel} elements, got "
-                    f"{tensor.numel()}."
-                )
-            local_dense[chunk.fp8_offset : chunk.fp8_offset + tensor.numel()].copy_(
-                tensor.reshape(-1)
-            )
-        return local_dense
-
-    def _prepare_local_unshard_payload(
-        self,
-        tensors: list[torch.Tensor],
-        infos: list[ParamInfo],
-        mesh: DeviceMesh,
-        debug_fqn: str | None,
-    ) -> PlacementPreparedUnshard:
-        rank = mesh.get_local_rank()
-        metadata = self._fp8_metadata_from_infos(infos)
-        with _record_copy_in_if_eager():
-            local_dense = self._pack_local_dense_chunks(
-                tensors,
-                infos,
-                rank,
-                metadata,
-            )
-        return PlacementPreparedUnshard(
-            placement=self,
-            buffers=[local_dense],
-            placement_state=Fp8BucketedBlockShard._Fp8UnshardState(
-                infos=infos,
-                pg=mesh.get_group(),
-                debug_fqn=debug_fqn,
-                metadata=metadata,
-            ),
-        )
-
-    def _finish_unshard_from_rank_rows(
-        self,
-        prepared: PlacementPreparedUnshard,
-        rank_rows: torch.Tensor,
-    ) -> PlacementUnshardResult:
-        state = prepared.placement_state
-        if not isinstance(state, Fp8BucketedBlockShard._Fp8UnshardState):
-            raise AssertionError(
-                "Expected Fp8BucketedBlockShard._Fp8UnshardState, "
-                f"got {type(state).__name__}"
-            )
-        expected_shape = (
-            len(state.metadata.rank_fp8_numels),
-            self._dense_send_numel_per_rank(state.metadata),
-        )
-        if tuple(rank_rows.shape) != expected_shape:
-            raise ValueError(
-                f"Expected gathered rank rows with shape {expected_shape}, "
-                f"got {tuple(rank_rows.shape)}."
-            )
-
-        infos_by_fqn = {info.fqn: info for info in state.infos}
-        dense_by_fqn = {
-            info.fqn: torch.empty(
-                info.global_shape,
-                dtype=rank_rows.dtype,
-                device=rank_rows.device,
-            )
-            for info in state.infos
-        }
-        copy_dsts: list[torch.Tensor] = []
-        copy_srcs: list[torch.Tensor] = []
-        with _record_copy_out_if_eager():
-            for chunk in state.metadata.chunks:
-                info = infos_by_fqn[chunk.fqn]
-                in_dim = info.global_shape[1]
-                numel = self._chunk_numel(chunk, in_dim)
-                copy_dsts.append(
-                    dense_by_fqn[chunk.fqn][chunk.row_start : chunk.row_end, :]
-                )
-                copy_srcs.append(
-                    rank_rows[
-                        chunk.rank,
-                        chunk.fp8_offset : chunk.fp8_offset + numel,
-                    ].view(chunk.row_end - chunk.row_start, in_dim)
-                )
-            foreach_copy_(copy_dsts, copy_srcs)
-        full_params = []
-        persistent_buffers: list[torch.Tensor] = []
-        for index, info in enumerate(state.infos):
-            dense_weight = dense_by_fqn[info.fqn]
-            dense_weight.requires_grad_(info.requires_grad)
-            fp8_data, recip_scale = _quantize_dense_weight_to_blockwise_fp8(
-                dense_weight,
-                self.block_size,
-                self.fp8_dtype,
-            )
-            if prepared.persistent_buffers is not None:
-                # Persistent unshard: refill the previous fp8 data and scales.
-                persistent_data = prepared.persistent_buffers[2 * index]
-                persistent_scale = prepared.persistent_buffers[2 * index + 1]
-                persistent_data.copy_(fp8_data)
-                persistent_scale.copy_(recip_scale)
-                fp8_data, recip_scale = persistent_data, persistent_scale
-            persistent_buffers.extend((fp8_data, recip_scale))
-            full_params.append(
-                self._make_blockwise_fp8_weight(
-                    fp8_data,
-                    recip_scale,
-                    orig_dtype=dense_weight.dtype,
-                    requires_grad=dense_weight.requires_grad,
-                )
-            )
-        return PlacementUnshardResult(
-            full_params=full_params,
-            persistent_buffers=persistent_buffers if prepared.persistent else [],
-        )
 
 
 def _make_blockwise_fp8_weight() -> BlockwiseFp8Weight:

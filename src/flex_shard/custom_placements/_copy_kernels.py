@@ -120,6 +120,47 @@ def _pack_segments_bf16_to_bf16_kernel(
     tl.store(output + dst_offset + offsets, values, mask=mask)
 
 
+@triton.jit
+def _copy_segments_kernel(
+    source,
+    src_offsets,
+    numels,
+    dst_offsets,
+    output,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    chunk_id = tl.program_id(0)
+    segment_id = tl.program_id(1)
+    offsets = chunk_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    src_offset = tl.load(src_offsets + segment_id)
+    numel = tl.load(numels + segment_id)
+    dst_offset = tl.load(dst_offsets + segment_id)
+    mask = offsets < numel
+
+    values = tl.load(source + src_offset + offsets, mask=mask)
+    tl.store(output + dst_offset + offsets, values, mask=mask)
+
+
+@triton.jit
+def _zero_segments_kernel(
+    numels,
+    dst_offsets,
+    output,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    chunk_id = tl.program_id(0)
+    segment_id = tl.program_id(1)
+    offsets = chunk_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    numel = tl.load(numels + segment_id)
+    dst_offset = tl.load(dst_offsets + segment_id)
+    mask = offsets < numel
+
+    zeros = tl.zeros([BLOCK_SIZE], dtype=output.dtype.element_ty)
+    tl.store(output + dst_offset + offsets, zeros, mask=mask)
+
+
 def _staged_cuda_i64_tensor(
     values: Sequence[int],
     device: torch.device,
@@ -318,7 +359,135 @@ def pack_segments_into_flat_buffer_triton(
     return scratch
 
 
+# CUDA caps grid dimension 1, the segment axis, at 65535.
+_MAX_GRID_SEGMENTS = 65535
+
+
+@dataclass
+class SegmentCopyDescriptor:
+    """Device copy plan for segments of one source tensor, in elements.
+
+    Segments longer than ``max_chunks_per_segment`` chunks are split, so the
+    chunk axis of the grid stays short when segment sizes differ a lot: a
+    grid sized by the longest segment would otherwise leave most programs
+    idle.
+    """
+
+    src_offsets: torch.Tensor
+    numels: torch.Tensor
+    dst_offsets: torch.Tensor
+    max_segment_numel: int
+    nsegments: int
+    block_size: int
+    _staged_hosts: tuple[torch.Tensor, ...]
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        src_offsets: Sequence[int],
+        numels: Sequence[int],
+        dst_offsets: Sequence[int],
+        device: torch.device,
+        block_size: int = 4096,
+        max_chunks_per_segment: int = 8,
+    ) -> "SegmentCopyDescriptor":
+        if not (len(src_offsets) == len(numels) == len(dst_offsets)):
+            raise ValueError("Segment descriptor lists must have the same length.")
+        if len(numels) > _MAX_GRID_SEGMENTS:
+            raise ValueError(
+                f"At most {_MAX_GRID_SEGMENTS} segments are supported, got "
+                f"{len(numels)}."
+            )
+        split_numel = max_chunks_per_segment * block_size
+        while (
+            sum(triton.cdiv(numel, split_numel) for numel in numels)
+            > _MAX_GRID_SEGMENTS
+        ):
+            split_numel *= 2
+        split_src_offsets: list[int] = []
+        split_numels: list[int] = []
+        split_dst_offsets: list[int] = []
+        for src_offset, numel, dst_offset in zip(
+            src_offsets, numels, dst_offsets, strict=True
+        ):
+            for start in range(0, numel, split_numel):
+                split_src_offsets.append(src_offset + start)
+                split_numels.append(min(split_numel, numel - start))
+                split_dst_offsets.append(dst_offset + start)
+        src_offsets_t, src_offsets_host = _staged_cuda_i64_tensor(
+            split_src_offsets, device
+        )
+        numels_t, numels_host = _staged_cuda_i64_tensor(split_numels, device)
+        dst_offsets_t, dst_offsets_host = _staged_cuda_i64_tensor(
+            split_dst_offsets, device
+        )
+        return cls(
+            src_offsets=src_offsets_t,
+            numels=numels_t,
+            dst_offsets=dst_offsets_t,
+            max_segment_numel=max(split_numels, default=0),
+            nsegments=len(split_numels),
+            block_size=block_size,
+            _staged_hosts=(src_offsets_host, numels_host, dst_offsets_host),
+        )
+
+
+def copy_segments_triton(
+    source: torch.Tensor,
+    output: torch.Tensor,
+    descriptor: SegmentCopyDescriptor,
+    *,
+    num_warps: int = 4,
+) -> None:
+    """Copy ``descriptor``'s segments from ``source`` into ``output``.
+
+    One kernel launch for any number of segments. Offsets count elements from
+    each tensor's first element, so ``source`` may be a strided view: the kernel
+    reads only its data pointer and dtype.
+    """
+    if descriptor.nsegments == 0 or descriptor.max_segment_numel == 0:
+        return
+    block_size = descriptor.block_size
+    grid = (triton.cdiv(descriptor.max_segment_numel, block_size), descriptor.nsegments)
+    _copy_segments_kernel[grid](
+        source,
+        descriptor.src_offsets,
+        descriptor.numels,
+        descriptor.dst_offsets,
+        output,
+        BLOCK_SIZE=block_size,
+        num_warps=num_warps,
+    )
+
+
+def zero_segments_triton(
+    output: torch.Tensor,
+    descriptor: SegmentCopyDescriptor,
+    *,
+    num_warps: int = 4,
+) -> None:
+    """Zero ``descriptor``'s destination segments of ``output``, in one launch.
+
+    Reads only the descriptor's lengths and destination offsets.
+    """
+    if descriptor.nsegments == 0 or descriptor.max_segment_numel == 0:
+        return
+    block_size = descriptor.block_size
+    grid = (triton.cdiv(descriptor.max_segment_numel, block_size), descriptor.nsegments)
+    _zero_segments_kernel[grid](
+        descriptor.numels,
+        descriptor.dst_offsets,
+        output,
+        BLOCK_SIZE=block_size,
+        num_warps=num_warps,
+    )
+
+
 __all__ = [
+    "SegmentCopyDescriptor",
     "SegmentPackDescriptor",
+    "copy_segments_triton",
     "pack_segments_into_flat_buffer_triton",
+    "zero_segments_triton",
 ]

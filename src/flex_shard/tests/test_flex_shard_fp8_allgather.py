@@ -24,15 +24,18 @@ from .. import (
     MixedPrecisionPolicy,
 )
 from ..custom_placements import (
+    blockwise_quant_bucketed_block_shard as blockwise_quant_module,
     fp8_bucketed_block_shard as fp8_bucketed_block_shard_module,
 )
-from ..custom_placements.fp8_bucketed_block_shard import (
+from ..custom_placements.block_shard import BucketedBlockShard
+from ..custom_placements.blockwise_quant_bucketed_block_shard import (
     _VEC_ALIGN_BYTES,
-    Fp8BucketedBlockShard,
 )
+from ..custom_placements.fp8_bucketed_block_shard import Fp8BucketedBlockShard
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..flex_shard.bucket_storage import ParamInfo, ShardedBucketStorage
-from .common import single_rank_cpu_mesh
+from .common import FakeMesh, make_param_infos, single_rank_cpu_mesh
+from .dense_all_gather_reference import DenseAllGatherReferencePlacement
 
 
 device_type = torch.device(get_devtype())
@@ -45,17 +48,17 @@ def _reference_blockwise_quant_weight(
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a weight without using the production TorchAO kernel."""
-    fp8_bucketed_block_shard_module._validate_block_size(block_size)
-    out_dim, in_dim = fp8_bucketed_block_shard_module._validate_2d_non_empty(
+    blockwise_quant_module._validate_block_size(block_size)
+    out_dim, in_dim = blockwise_quant_module._validate_2d_non_empty(
         weight.shape,
         "reference blockwise quantization",
     )
-    padded_weight = fp8_bucketed_block_shard_module._pad_2d_to_block_shape(
+    padded_weight = blockwise_quant_module._pad_2d_to_block_shape(
         weight,
         block_size,
     )
     padded_out_dim, padded_in_dim = padded_weight.shape
-    scale_rows, scale_cols = fp8_bucketed_block_shard_module._scale_shape(
+    scale_rows, scale_cols = blockwise_quant_module._scale_shape(
         weight.shape,
         block_size,
     )
@@ -133,69 +136,22 @@ class _RecordingWeightFactory:
         return fp8_data
 
 
-class _FakeMesh:
-    """Minimal mesh for exercising bucket_storage_layout without a real PG."""
-
-    def __init__(self, size: int, rank: int = 0) -> None:
-        self._size = size
-        self._rank = rank
-
-    def size(self) -> int:
-        return self._size
-
-    def get_local_rank(self) -> int:
-        return self._rank
-
-    def get_group(self):
-        return None
-
-
 def _make_fp8_param_info(
     fqn: str,
     param: nn.Parameter,
     placement: Fp8BucketedBlockShard,
-    mesh: _FakeMesh,
+    mesh: FakeMesh,
 ) -> ParamInfo:
-    return _make_fp8_param_infos([(fqn, param)], placement, mesh)[0]
-
-
-def _make_fp8_param_infos(
-    named_params: list[tuple[str, nn.Parameter]],
-    placement: Fp8BucketedBlockShard,
-    mesh: _FakeMesh,
-) -> list[ParamInfo]:
-    placements = {fqn: (placement,) for fqn, _ in named_params}
-    layout = placement.bucket_storage_layout(
-        named_params,
-        placements,
-        mesh,
-    )
-    return [
-        ParamInfo(
-            fqn=fqn,
-            global_shape=param.shape,
-            global_stride=tuple(param.stride()),
-            dtype=param.dtype,
-            requires_grad=param.requires_grad,
-            placements=(placement,),
-            local_shape=layout.param_layouts[fqn].local_shape,
-            local_numel=layout.param_layouts[fqn].local_numel,
-            byte_offset=layout.param_layouts[fqn].byte_offset,
-            storage_nbytes=layout.param_layouts[fqn].storage_nbytes,
-            global_numel=param.numel(),
-            bucket_layout=layout.param_layouts[fqn].bucket_layout,
-        )
-        for fqn, param in named_params
-    ]
+    return make_param_infos([(fqn, param)], placement, mesh)[0]
 
 
 def _packed_rank_views(
     packed: torch.Tensor,
     rank: int,
-    metadata: Fp8BucketedBlockShard._Fp8BucketMetadata,
+    metadata: Fp8BucketedBlockShard._QuantBucketMetadata,
     fp8_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    fp8_nbytes = metadata.rank_fp8_numels[rank]
+    fp8_nbytes = metadata.rank_qdata_numels[rank]
     scale_start = metadata.rank_scale_byte_offsets[rank]
     scale_end = scale_start + metadata.rank_scale_numels[rank] * torch.float32.itemsize
     return (
@@ -211,7 +167,7 @@ def _cpu_reference_quantize_local_weight(
     return _reference_blockwise_quant_weight(
         tensor,
         placement.block_size,
-        placement.fp8_dtype,
+        placement.qdata_dtype,
     )
 
 
@@ -239,8 +195,8 @@ def _prepare_unshard_on_each_rank(
 ) -> list:
     prepared_by_rank = []
     for rank in range(world_size):
-        mesh = _FakeMesh(world_size, rank)
-        infos = _make_fp8_param_infos(named_params, placement, mesh)
+        mesh = FakeMesh(world_size, rank)
+        infos = make_param_infos(named_params, placement, mesh)
         local_tensors = [
             _local_rows(param, info)
             for (_, param), info in zip(named_params, infos, strict=True)
@@ -284,13 +240,13 @@ class TestFp8AllGatherLayout(TestCase):
             placement.bucket_storage_layout(
                 [("w", nn.Parameter(torch.zeros(16)))],
                 {"w": (placement,)},
-                _FakeMesh(2),
+                FakeMesh(2),
             )
         with self.assertRaisesRegex(ValueError, "non-empty"):
             placement.bucket_storage_layout(
                 [("w", nn.Parameter(torch.zeros(0, 8)))],
                 {"w": (placement,)},
-                _FakeMesh(2),
+                FakeMesh(2),
             )
         with self.assertRaisesRegex(ValueError, "one-byte"):
             Fp8BucketedBlockShard(
@@ -309,7 +265,7 @@ class TestFp8AllGatherLayout(TestCase):
             placement.bucket_storage_layout(
                 named,
                 placements,
-                _FakeMesh(2, rank=rank),
+                FakeMesh(2, rank=rank),
             )
             for rank in range(2)
         ]
@@ -353,7 +309,7 @@ class TestFp8AllGatherLayout(TestCase):
                 partial_placement.bucket_storage_layout(
                     partial,
                     partial_placements,
-                    _FakeMesh(2, rank=0),
+                    FakeMesh(2, rank=0),
                 )
                 .param_layouts["w"]
                 .local_shape
@@ -365,7 +321,7 @@ class TestFp8AllGatherLayout(TestCase):
                 partial_placement.bucket_storage_layout(
                     partial,
                     partial_placements,
-                    _FakeMesh(2, rank=1),
+                    FakeMesh(2, rank=1),
                 )
                 .param_layouts["w"]
                 .local_shape
@@ -382,7 +338,7 @@ class TestFp8AllGatherLayout(TestCase):
         empty_rank_layout = empty_rank_placement.bucket_storage_layout(
             empty_rank_named,
             {"w": (empty_rank_placement,)},
-            _FakeMesh(4, rank=3),
+            FakeMesh(4, rank=3),
         )
         self.assertEqual(empty_rank_layout.total_bytes, 0)
         self.assertEqual(empty_rank_layout.param_layouts["w"].local_numel, 0)
@@ -391,7 +347,7 @@ class TestFp8AllGatherLayout(TestCase):
     def test_fp8_unshard_quantizes_param_dtype(self) -> None:
         """FP32 master shards are cast to the BF16 compute dtype before quantization."""
         block = 4
-        mesh = _FakeMesh(1)
+        mesh = FakeMesh(1)
         placement = Fp8BucketedBlockShard(
             world_size=1,
             weight_factory=_return_fp8_data,
@@ -418,7 +374,7 @@ class TestFp8AllGatherLayout(TestCase):
             prepared.buffers[0],
             0,
             prepared.placement_state.metadata,
-            placement.fp8_dtype,
+            placement.qdata_dtype,
         )
         reference_fp8, reference_scale = _reference_blockwise_quant_weight(
             full_weight.to(torch.bfloat16),
@@ -444,7 +400,7 @@ class TestFp8AllGatherLayout(TestCase):
         ):
             weight_factory = _RecordingWeightFactory()
             mixed = MixedBucketPlacement({})
-            fp8 = mixed.fp8_bucketed_block_shard(
+            fp8 = mixed.blockwise_quant_bucketed_block_shard(
                 Fp8BucketedBlockShard(
                     world_size=1,
                     weight_factory=weight_factory,
@@ -487,7 +443,7 @@ class TestFp8AllGatherLayout(TestCase):
     def test_fp8_cache_phase_detects_checkpoint_recompute(self) -> None:
         from torch.utils.checkpoint import checkpoint
 
-        mesh = _FakeMesh(1)
+        mesh = FakeMesh(1)
         placement = Fp8BucketedBlockShard(
             world_size=1,
             weight_factory=_return_fp8_data,
@@ -501,7 +457,7 @@ class TestFp8AllGatherLayout(TestCase):
         payloads = []
 
         def function(tensor: torch.Tensor) -> torch.Tensor:
-            phases.append(fp8_bucketed_block_shard_module._is_backward_graph_task())
+            phases.append(blockwise_quant_module._is_backward_graph_task())
             prepared = placement.prepare_unshard_bucket(
                 [param.detach()],
                 [info],
@@ -524,7 +480,7 @@ class TestFp8AllGatherLayout(TestCase):
         self.assertIs(payloads[0], payloads[1])
 
     def test_fp8_local_packed_cache_rebuilds_every_forward(self) -> None:
-        mesh = _FakeMesh(1)
+        mesh = FakeMesh(1)
         placement = Fp8BucketedBlockShard(
             world_size=1,
             weight_factory=_return_fp8_data,
@@ -537,7 +493,7 @@ class TestFp8AllGatherLayout(TestCase):
 
         with (
             patch.object(
-                fp8_bucketed_block_shard_module,
+                blockwise_quant_module,
                 "_is_backward_graph_task",
                 return_value=False,
             ),
@@ -573,7 +529,7 @@ class TestFp8AllGatherLayout(TestCase):
             second.buffers[0],
             0,
             second.placement_state.metadata,
-            placement.fp8_dtype,
+            placement.qdata_dtype,
         )
         reference_fp8, reference_scale = _reference_blockwise_quant_weight(
             param.detach(),
@@ -585,7 +541,7 @@ class TestFp8AllGatherLayout(TestCase):
         )
 
     def test_fp8_local_packed_cache_is_bypassed_while_compiling(self) -> None:
-        mesh = _FakeMesh(1)
+        mesh = FakeMesh(1)
         placement = Fp8BucketedBlockShard(
             world_size=1,
             weight_factory=_return_fp8_data,
@@ -617,7 +573,7 @@ class TestFp8AllGatherLayout(TestCase):
             )
 
         with patch.object(
-            fp8_bucketed_block_shard_module,
+            blockwise_quant_module,
             "_is_backward_graph_task",
             return_value=True,
         ):
@@ -633,7 +589,7 @@ class TestFp8AllGatherLayout(TestCase):
 
     def test_fp8_unshard_uses_single_packed_all_gather(self) -> None:
         """The FP8 placement launches one collective over packed bytes."""
-        mesh = _FakeMesh(2)
+        mesh = FakeMesh(2)
         placement = Fp8BucketedBlockShard(
             world_size=2,
             weight_factory=_return_fp8_data,
@@ -710,7 +666,7 @@ class TestFp8AllGatherLayout(TestCase):
         self.assertEqual(rank_rows.storage_offset() % torch.float32.itemsize, 1)
         for rank, rank_prepared in enumerate(prepared_by_rank):
             local_packed = rank_prepared.buffers[0]
-            fp8_end = metadata.rank_fp8_numels[rank]
+            fp8_end = metadata.rank_qdata_numels[rank]
             scale_start = metadata.rank_scale_byte_offsets[rank]
             payload_end = metadata.rank_packed_nbytes[rank]
             rank_rows[rank, :fp8_end].copy_(local_packed[:fp8_end])
@@ -724,7 +680,7 @@ class TestFp8AllGatherLayout(TestCase):
         compact = result.persistent_buffers[0]
         expected_fp8_nbytes = sum(param.numel() for _, param in named_params)
         self.assertNotEqual(expected_fp8_nbytes % torch.float32.itemsize, 0)
-        self.assertIn(0, metadata.rank_fp8_numels)
+        self.assertIn(0, metadata.rank_qdata_numels)
         expected_scale_numel = sum(
             ((param.shape[0] + block - 1) // block)
             * ((param.shape[1] + block - 1) // block)
@@ -787,7 +743,7 @@ class TestFp8AllGatherLayout(TestCase):
         )
         param = nn.Parameter(torch.arange(96, dtype=torch.float32).reshape(2, 6, 8))
         infos = [
-            _make_fp8_param_info("w13", param, placement, _FakeMesh(world_size, rank))
+            _make_fp8_param_info("w13", param, placement, FakeMesh(world_size, rank))
             for rank in range(world_size)
         ]
         self.assertEqual(
@@ -860,6 +816,416 @@ class TestFp8AllGatherLayout(TestCase):
             )
         )
         self.assertTrue(torch.equal(factory_call.recip_scale, reference_scale))
+
+
+class TestFp8FusedCopyOut(TestCase):
+    """The one-kernel rank-row copy-out matches the cat fallback bitwise."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        if device_type.type != "cuda":
+            self.skipTest("The fused copy-out runs on CUDA.")
+
+    def _metadata(
+        self,
+        shapes: list[tuple[int, int]],
+        placement_cls: type[Fp8BucketedBlockShard] = Fp8BucketedBlockShard,
+        world_size: int = 8,
+    ) -> tuple[Fp8BucketedBlockShard, Fp8BucketedBlockShard._QuantBucketMetadata]:
+        placement = placement_cls(
+            world_size=world_size,
+            weight_factory=_return_fp8_data,
+            block_size=4,
+        )
+        named_params = [
+            (f"w{index}", nn.Parameter(torch.empty(shape, device="meta")))
+            for index, shape in enumerate(shapes)
+        ]
+        infos = make_param_infos(
+            named_params,
+            placement,
+            FakeMesh(world_size),
+        )
+        return placement, placement._quant_metadata_from_infos(infos)
+
+    def test_copy_out_matches_cat_fallback(self) -> None:
+        # Shapes, and the copy unit for 4-byte aligned rows: whole 4-byte units
+        # when every region is aligned, bytes for odd FP8 byte counts.
+        cases = {
+            "aligned regions": ([(16, 8), (8, 8), (2, 4)], 4),
+            "odd regions": ([(16, 8), (8, 8), (1, 3)], 1),
+        }
+        # Row start offset and padding between rows: contiguous rows, rows
+        # spaced apart as in a mixed bucket, and rows at an odd byte offset.
+        row_layouts = {
+            "contiguous": (0, 0),
+            "spaced": (0, 16),
+            "odd offset": (1, 3),
+        }
+        for case, (shapes, aligned_unit) in cases.items():
+            placement, metadata = self._metadata(shapes)
+            self.assertIn(0, metadata.rank_qdata_numels)
+            world_size = len(metadata.rank_qdata_numels)
+            row_nbytes = metadata.packed_send_nbytes_per_rank
+            qdata_nbytes = sum(metadata.rank_qdata_numels)
+            scale_byte_offset = (
+                (qdata_nbytes + _VEC_ALIGN_BYTES - 1)
+                // _VEC_ALIGN_BYTES
+                * _VEC_ALIGN_BYTES
+            )
+            compact_nbytes = (
+                scale_byte_offset
+                + sum(metadata.rank_scale_numels) * torch.float32.itemsize
+            )
+            for layout, (offset, padding) in row_layouts.items():
+                with self.subTest(case=case, layout=layout):
+                    parent = torch.randint(
+                        0,
+                        256,
+                        (world_size, offset + row_nbytes + padding),
+                        dtype=torch.uint8,
+                        device=device_type,
+                    )
+                    rank_rows = parent[:, offset : offset + row_nbytes]
+                    fused = torch.full(
+                        (compact_nbytes,),
+                        0xAB,
+                        dtype=torch.uint8,
+                        device=device_type,
+                    )
+                    expected = fused.clone()
+                    self.assertTrue(
+                        placement._copy_out_rank_rows_triton(
+                            metadata,
+                            rank_rows,
+                            fused,
+                        )
+                    )
+                    placement._copy_out_rank_rows_cat(
+                        metadata,
+                        rank_rows,
+                        expected,
+                        qdata_nbytes=qdata_nbytes,
+                        scale_byte_offset=scale_byte_offset,
+                    )
+                    self.assertTrue(torch.equal(fused, expected))
+                    plan = placement._copy_out_plan(
+                        metadata,
+                        data_elem_nbytes=1,
+                        with_scales=True,
+                    )
+                    unit_nbytes = aligned_unit if offset == 0 else 1
+                    self.assertIn(
+                        (rank_rows.device, rank_rows.stride(0), unit_nbytes),
+                        plan.descriptors,
+                    )
+
+    def test_copy_plan_is_built_once_per_row_stride(self) -> None:
+        placement, metadata = self._metadata([(16, 8), (8, 8), (6, 4)])
+        world_size = len(metadata.rank_qdata_numels)
+        row_nbytes = metadata.packed_send_nbytes_per_rank
+        compact = torch.empty(
+            row_nbytes * world_size,
+            dtype=torch.uint8,
+            device=device_type,
+        )
+        rank_rows = torch.zeros(
+            (world_size, row_nbytes),
+            dtype=torch.uint8,
+            device=device_type,
+        )
+        placement._copy_out_rank_rows_triton(metadata, rank_rows, compact)
+        plan = placement._copy_out_plan(metadata, data_elem_nbytes=1, with_scales=True)
+        (descriptor,) = plan.descriptors.values()
+        placement._copy_out_rank_rows_triton(metadata, rank_rows, compact)
+        self.assertIs(
+            placement._copy_out_plan(metadata, data_elem_nbytes=1, with_scales=True),
+            plan,
+        )
+        self.assertEqual(list(plan.descriptors.values()), [descriptor])
+
+        spaced_rows = torch.zeros(
+            (world_size, row_nbytes + 16),
+            dtype=torch.uint8,
+            device=device_type,
+        )[:, :row_nbytes]
+        placement._copy_out_rank_rows_triton(metadata, spaced_rows, compact)
+        self.assertEqual(len(plan.descriptors), 2)
+
+    def test_copy_out_falls_back_while_compiling(self) -> None:
+        placement, metadata = self._metadata([(16, 8)])
+        rank_rows = torch.zeros(
+            (len(metadata.rank_qdata_numels), metadata.packed_send_nbytes_per_rank),
+            dtype=torch.uint8,
+            device=device_type,
+        )
+        compact = torch.empty(rank_rows.numel(), dtype=torch.uint8, device=device_type)
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            self.assertFalse(
+                placement._copy_out_rank_rows_triton(metadata, rank_rows, compact)
+            )
+        self.assertFalse(
+            placement._copy_out_rank_rows_triton(metadata, rank_rows.cpu(), compact)
+        )
+
+    def test_dense_reference_joins_rank_rows(self) -> None:
+        placement, metadata = self._metadata(
+            [(16, 8), (8, 8), (1, 3)],
+            placement_cls=DenseAllGatherReferencePlacement,
+        )
+        world_size = len(metadata.rank_qdata_numels)
+        for row_numel in (max(metadata.rank_qdata_numels) + 5, 64):
+            with self.subTest(row_numel=row_numel):
+                rank_rows = torch.randn(
+                    (world_size, row_numel),
+                    dtype=torch.bfloat16,
+                    device=device_type,
+                )
+                joined = rank_rows.new_empty(sum(metadata.rank_qdata_numels))
+                self.assertTrue(
+                    placement._copy_out_rank_rows_triton(
+                        metadata,
+                        rank_rows.view(torch.uint8),
+                        joined.view(torch.uint8),
+                        data_elem_nbytes=rank_rows.element_size(),
+                        with_scales=False,
+                    )
+                )
+                expected = torch.cat(
+                    [
+                        rank_rows[rank, :numel]
+                        for rank, numel in enumerate(metadata.rank_qdata_numels)
+                    ]
+                )
+                self.assertTrue(
+                    torch.equal(joined.view(torch.int16), expected.view(torch.int16))
+                )
+
+    def test_segment_copy_splits_long_segments(self) -> None:
+        from ..custom_placements._copy_kernels import (
+            copy_segments_triton,
+            SegmentCopyDescriptor,
+        )
+
+        source = torch.randint(
+            -(2**31),
+            2**31 - 1,
+            (4096,),
+            dtype=torch.int32,
+            device=device_type,
+        )
+        # Lengths from empty to 30 blocks, so long segments split into
+        # several grid rows next to short ones.
+        segments = [(5, 0, 0), (100, 1, 0), (300, 240, 1), (1000, 37, 241)]
+        segments.append((2000, 960, 278))
+        descriptor = SegmentCopyDescriptor.create(
+            src_offsets=[src for src, _, _ in segments],
+            numels=[numel for _, numel, _ in segments],
+            dst_offsets=[dst for _, _, dst in segments],
+            device=device_type,
+            block_size=32,
+            max_chunks_per_segment=2,
+        )
+        self.assertGreater(descriptor.nsegments, len(segments))
+        self.assertEqual(descriptor.max_segment_numel, 64)
+        output = torch.zeros(1238, dtype=torch.int32, device=device_type)
+        copy_segments_triton(source, output, descriptor)
+        expected = torch.zeros_like(output)
+        for src, numel, dst in segments:
+            expected[dst : dst + numel] = source[src : src + numel]
+        self.assertTrue(torch.equal(output, expected))
+
+
+def _reference_reduce_scatter_input(
+    placement: BucketedBlockShard,
+    grads: list[torch.Tensor],
+    infos: list[ParamInfo],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """The reduce-scatter input as the copies through a zeroed gradient bucket
+    build it: each rank's range of the bucket, zero-padded to the longest."""
+    bucket_layout = placement._bucket_layout(infos[0])
+    bucket = torch.zeros(
+        bucket_layout.global_numel, dtype=dtype, device=grads[0].device
+    )
+    for grad, info in zip(grads, infos, strict=True):
+        offset = placement._param_layout(info).param_offset
+        bucket[offset : offset + info.global_numel] = grad.reshape(-1)
+    rows = torch.zeros(
+        len(bucket_layout.rank_numels),
+        max(bucket_layout.rank_numels),
+        dtype=dtype,
+        device=grads[0].device,
+    )
+    for rank, (offset, numel) in enumerate(
+        zip(bucket_layout.rank_offsets, bucket_layout.rank_numels, strict=True)
+    ):
+        rows[rank, :numel] = bucket[offset : offset + numel]
+    return rows
+
+
+class TestReduceScatterCopyIn(TestCase):
+    """The one-pass reduce-scatter copy-in matches the copies through a
+    zeroed gradient bucket bitwise."""
+
+    def _bucket(
+        self,
+        shapes: list[tuple[int, int]],
+        world_size: int,
+        param_dtype: torch.dtype,
+    ) -> tuple[Fp8BucketedBlockShard, list[ParamInfo]]:
+        placement = Fp8BucketedBlockShard(
+            world_size=world_size,
+            weight_factory=_return_fp8_data,
+            block_size=4,
+        )
+        named_params = [
+            (
+                f"w{index}",
+                nn.Parameter(torch.empty(shape, device="meta", dtype=param_dtype)),
+            )
+            for index, shape in enumerate(shapes)
+        ]
+        infos = make_param_infos(named_params, placement, FakeMesh(world_size))
+        return placement, infos
+
+    def _grads(self, infos: list[ParamInfo], dtype: torch.dtype) -> list[torch.Tensor]:
+        torch.manual_seed(0)
+        return [
+            torch.randn(info.global_shape, dtype=dtype, device=device_type)
+            for info in infos
+        ]
+
+    def test_matches_reference(self) -> None:
+        # Shapes and world sizes: ranks with no rows and padded ranges, param
+        # widths whose alignment leaves gaps between params, and odd lengths
+        # that leave single-element copy units.
+        cases = {
+            "padded ranges": ([(16, 8), (8, 8), (12, 4)], 8),
+            "gaps between params": ([(8, 12), (8, 8), (4, 12)], 3),
+            "odd lengths": ([(16, 8), (5, 3)], 4),
+        }
+        for case, (shapes, world_size) in cases.items():
+            for dtype in (torch.bfloat16, torch.float32):
+                with self.subTest(case=case, dtype=dtype):
+                    placement, infos = self._bucket(shapes, world_size, dtype)
+                    grads = self._grads(infos, dtype)
+                    prepared = placement.prepare_reduce_grad(
+                        grads, infos, FakeMesh(world_size), None
+                    )
+                    expected = _reference_reduce_scatter_input(
+                        placement, grads, infos, dtype
+                    )
+                    self.assertTrue(
+                        torch.equal(prepared.buffers[0].view(expected.shape), expected)
+                    )
+
+    def test_matches_reference_with_gaps_between_params(self) -> None:
+        # BucketedBlockShard aligns each param to the lcm of the row widths,
+        # leaving zero gaps between params, and a rank may own no blocks.
+        world_size = 4
+        placement = BucketedBlockShard(dims=(0,), blocks_per_rank=(2, 1, 0, 3))
+        named_params = [
+            (
+                f"w{index}",
+                nn.Parameter(torch.empty(shape, device="meta", dtype=torch.bfloat16)),
+            )
+            for index, shape in enumerate([(7, 3), (5, 4), (9, 3)])
+        ]
+        infos = make_param_infos(named_params, placement, FakeMesh(world_size))
+        grads = self._grads(infos, torch.bfloat16)
+        prepared = placement.prepare_reduce_grad(
+            grads, infos, FakeMesh(world_size), None
+        )
+        expected = _reference_reduce_scatter_input(
+            placement, grads, infos, torch.bfloat16
+        )
+        self.assertTrue(torch.equal(prepared.buffers[0].view(expected.shape), expected))
+        if device_type.type == "cuda":
+            (plan,) = placement._reduce_copy_in_plans.values()
+            self.assertGreater(len(plan.zero_segments), world_size)
+
+    def test_packs_into_wider_rows(self) -> None:
+        # A mixed bucket's send buffer: the group's columns start past other
+        # groups' columns, and the rows are wider than the group.
+        if device_type.type != "cuda":
+            self.skipTest("The one-pass copy-in runs on CUDA.")
+        world_size = 8
+        placement, infos = self._bucket(
+            [(16, 8), (8, 8), (12, 4)], world_size, torch.bfloat16
+        )
+        grads = self._grads(infos, torch.bfloat16)
+        expected = _reference_reduce_scatter_input(
+            placement, grads, infos, torch.bfloat16
+        )
+        group_numel = expected.size(1)
+        for start, extra in ((0, 0), (4, 12), (3, 5)):
+            with self.subTest(start=start, extra=extra):
+                rows = torch.full(
+                    (world_size, start + group_numel + extra),
+                    7.0,
+                    dtype=torch.bfloat16,
+                    device=device_type,
+                )
+                send_rows = rows[:, start : start + group_numel]
+                placement._pack_reduce_scatter_grad(grads, infos, world_size, send_rows)
+                self.assertTrue(torch.equal(send_rows, expected))
+                self.assertTrue(torch.all(rows[:, :start] == 7.0))
+                self.assertTrue(torch.all(rows[:, start + group_numel :] == 7.0))
+
+    def test_plan_is_built_once_per_row_stride(self) -> None:
+        if device_type.type != "cuda":
+            self.skipTest("The one-pass copy-in runs on CUDA.")
+        world_size = 8
+        placement, infos = self._bucket(
+            [(16, 8), (8, 8), (12, 4)], world_size, torch.bfloat16
+        )
+        grads = self._grads(infos, torch.bfloat16)
+        mesh = FakeMesh(world_size)
+        placement.prepare_reduce_grad(grads, infos, mesh, None)
+        (plan,) = placement._reduce_copy_in_plans.values()
+        (descriptors,) = plan.descriptors.values()
+        placement.prepare_reduce_grad(grads, infos, mesh, None)
+        self.assertEqual(len(placement._reduce_copy_in_plans), 1)
+        self.assertIs(next(iter(plan.descriptors.values())), descriptors)
+        group_numel = max(placement._bucket_layout(infos[0]).rank_numels)
+        rows = torch.empty(
+            (world_size, group_numel + 4), dtype=torch.bfloat16, device=device_type
+        )
+        placement._pack_reduce_scatter_grad(
+            grads, infos, world_size, rows[:, :group_numel]
+        )
+        self.assertEqual(len(placement._reduce_copy_in_plans), 2)
+
+    def test_copies_through_a_bucket_while_compiling_or_casting(self) -> None:
+        world_size = 8
+        placement, infos = self._bucket(
+            [(16, 8), (8, 8), (12, 4)], world_size, torch.bfloat16
+        )
+        mesh = FakeMesh(world_size)
+        bf16_grads = self._grads(infos, torch.bfloat16)
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            self.assertFalse(
+                placement._packs_reduce_scatter_grad_in_one_pass(
+                    bf16_grads, torch.bfloat16
+                )
+            )
+            prepared = placement.prepare_reduce_grad(bf16_grads, infos, mesh, None)
+        expected = _reference_reduce_scatter_input(
+            placement, bf16_grads, infos, torch.bfloat16
+        )
+        self.assertTrue(torch.equal(prepared.buffers[0].view(expected.shape), expected))
+        # Grads in another dtype than the reduce dtype are cast on the copy.
+        fp32_grads = self._grads(infos, torch.float32)
+        self.assertFalse(
+            placement._packs_reduce_scatter_grad_in_one_pass(fp32_grads, torch.bfloat16)
+        )
+        prepared = placement.prepare_reduce_grad(fp32_grads, infos, mesh, None)
+        expected = _reference_reduce_scatter_input(
+            placement, fp32_grads, infos, torch.bfloat16
+        )
+        self.assertTrue(torch.equal(prepared.buffers[0].view(expected.shape), expected))
+        self.assertEqual(placement._reduce_copy_in_plans, {})
 
 
 class TestFp8BlockwiseWeightQuantization(TestCase):
@@ -938,7 +1304,7 @@ class TestFp8AllGather(FSDPTest):
             block_size=block,
         )
         mixed = MixedBucketPlacement({})
-        weight_placement = mixed.fp8_bucketed_block_shard(raw_placement)
+        weight_placement = mixed.blockwise_quant_bucketed_block_shard(raw_placement)
         placements = {
             "norm": (mixed.shard0,),
             "weight": (weight_placement,),
@@ -991,12 +1357,19 @@ class TestFp8AllGather(FSDPTest):
         )
         self.assertTrue(torch.equal(factory_call.recip_scale, reference_scale))
 
-        prepared_reduce = mixed.prepare_reduce_grad(
-            [originals[info.fqn] for info in infos],
-            infos,
-            mesh,
-            None,
-        )
+        # The FP8 group's grads go straight into the bucket's send buffer, not
+        # through a send buffer of the group's own.
+        with patch.object(
+            Fp8BucketedBlockShard,
+            "prepare_reduce_grad",
+            side_effect=AssertionError("expected the one-pass copy-in"),
+        ):
+            prepared_reduce = mixed.prepare_reduce_grad(
+                [originals[info.fqn] for info in infos],
+                infos,
+                mesh,
+                None,
+            )
         with patch.object(
             dist,
             "reduce_scatter_tensor",

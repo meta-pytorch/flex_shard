@@ -11,9 +11,9 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from torch.utils._python_dispatch import return_and_correct_aliasing
 
-from ..custom_placements.fp8_bucketed_block_shard import (
+from ..blockwise_quant.weight import BlockwiseQuantWeight
+from ..custom_placements.blockwise_quant_bucketed_block_shard import (
     _matrix_shape,
     _pad_2d_to_block_shape,
     _scale_shape,
@@ -54,7 +54,7 @@ def blockwise_dequant_weight(
     return deq[:m, :n]
 
 
-class BlockwiseFp8Weight(torch.Tensor):
+class BlockwiseFp8Weight(BlockwiseQuantWeight):
     """Blockwise FP8 weight returned by the FlexShard all-gather.
 
     Stacked weights keep the parameter shape, e.g. ``[num_linears, out, in]``.
@@ -62,6 +62,7 @@ class BlockwiseFp8Weight(torch.Tensor):
     """
 
     __slots__ = ["_data", "_recip_scale", "_block_size", "_orig_dtype"]
+    _inner_tensor_names = ("_data", "_recip_scale")
 
     @staticmethod
     def __new__(
@@ -72,16 +73,7 @@ class BlockwiseFp8Weight(torch.Tensor):
         orig_dtype: torch.dtype = torch.bfloat16,
         requires_grad: bool = False,
     ):
-        return torch.Tensor._make_wrapper_subclass(
-            cls,
-            data.size(),
-            strides=data.stride(),
-            storage_offset=data.storage_offset(),
-            dtype=orig_dtype,
-            layout=data.layout,
-            device=data.device,
-            requires_grad=requires_grad,
-        )
+        return cls._make_wrapper(data, orig_dtype, requires_grad)
 
     def __init__(
         self,
@@ -126,10 +118,6 @@ class BlockwiseFp8Weight(torch.Tensor):
     def block_size(self) -> int:
         return self._block_size
 
-    @property
-    def orig_dtype(self) -> torch.dtype:
-        return self._orig_dtype
-
     def dequantize(self, dtype: torch.dtype | None = None) -> torch.Tensor:
         result = blockwise_dequant_weight(
             self._data.flatten(0, -2),
@@ -138,59 +126,23 @@ class BlockwiseFp8Weight(torch.Tensor):
         )
         return result.reshape(self._data.shape).to(dtype or self._orig_dtype)
 
-    def __tensor_flatten__(self) -> tuple[list[str], dict[str, Any]]:
-        return ["_data", "_recip_scale"], {
-            "block_size": self._block_size,
-            "orig_dtype": self._orig_dtype,
-            "requires_grad": self.requires_grad,
-        }
+    def _metadata(self) -> dict[str, Any]:
+        return {"block_size": self._block_size, "orig_dtype": self._orig_dtype}
 
-    @staticmethod
-    def __tensor_unflatten__(
+    @classmethod
+    def _from_inner(
+        cls,
         inner_tensors: dict[str, torch.Tensor],
         metadata: dict[str, Any],
-        outer_size: torch.Size,
-        outer_stride: tuple[int, ...],
-    ) -> "BlockwiseFp8Weight":
-        _ = outer_size, outer_stride
-        return BlockwiseFp8Weight(
+        requires_grad: bool,
+    ) -> BlockwiseFp8Weight:
+        return cls(
             inner_tensors["_data"],
             inner_tensors["_recip_scale"],
             metadata["block_size"],
             metadata["orig_dtype"],
-            requires_grad=metadata["requires_grad"],
+            requires_grad=requires_grad,
         )
-
-    @classmethod
-    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        if func == torch.ops.aten.alias.default:
-            tensor = args[0]
-            # Autograd attaches differentiable-view metadata after dispatch returns.
-            result = BlockwiseFp8Weight(
-                func(tensor._data),
-                func(tensor._recip_scale),
-                tensor._block_size,
-                tensor._orig_dtype,
-                requires_grad=False,
-            )
-            return return_and_correct_aliasing(func, args, kwargs or {}, result)
-
-        if func == torch.ops.aten.detach.default:
-            tensor = args[0]
-            return BlockwiseFp8Weight(
-                tensor._data.detach(),
-                tensor._recip_scale.detach(),
-                tensor._block_size,
-                tensor._orig_dtype,
-                requires_grad=False,
-            )
-
-        raise NotImplementedError(
-            f"{cls.__name__} does not support {func}. "
-            "Call dequantize() explicitly before applying this operation."
-        )
-
-    __torch_function__ = torch._C._disabled_torch_function_impl
 
 
 __all__ = [
