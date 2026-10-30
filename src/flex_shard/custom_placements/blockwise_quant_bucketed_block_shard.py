@@ -261,6 +261,19 @@ class BlockwiseQuantBucketedBlockShard(BucketedBlockShard):
         metadata: BlockwiseQuantBucketedBlockShard._QuantBucketMetadata
 
     @dataclass(frozen=True)
+    class _CopyOutPlan:
+        """Rank-row payload regions of one bucket, with device copy descriptors.
+
+        ``regions`` holds ``(rank, row byte offset, nbytes, out byte offset)``.
+        ``descriptors`` is keyed by device, row stride and copy unit, in bytes.
+        """
+
+        metadata: BlockwiseQuantBucketedBlockShard._QuantBucketMetadata
+        regions: tuple[tuple[int, int, int, int], ...]
+        vec_aligned: bool
+        descriptors: dict[tuple[torch.device, int, int], Any]
+
+    @dataclass(frozen=True)
     class _LocalPackedSourceState:
         """Source identity and view state for one cached local shard."""
 
@@ -318,6 +331,10 @@ class BlockwiseQuantBucketedBlockShard(BucketedBlockShard):
         self._local_packed_cache: dict[
             tuple[int, int, torch.device, Any],
             BlockwiseQuantBucketedBlockShard._LocalPackedCacheEntry,
+        ] = {}
+        self._copy_out_plans: dict[
+            tuple[int, int, bool],
+            BlockwiseQuantBucketedBlockShard._CopyOutPlan,
         ] = {}
 
     @property
@@ -1245,67 +1262,19 @@ class BlockwiseQuantBucketedBlockShard(BucketedBlockShard):
         )
         qdata_bytes = compact[:qdata_nbytes]
         scale_bytes = compact[scale_byte_offset:]
-        row_stride_bytes = rank_rows.stride(0)
-        qdata_storage_regions = tuple(
-            (rank * row_stride_bytes, rank_qdata_numel)
-            for rank, rank_qdata_numel in enumerate(metadata.rank_qdata_numels)
-        )
-        # Gather grouped by scale tensor index so each group compacts to one
-        # contiguous, parameter-ordered region; the format orders each group's
-        # regions.
-        scale_storage_regions = tuple(
-            (region.rank * row_stride_bytes + region.offset, region.nbytes)
-            for regions in metadata.scale_regions_by_index
-            for region in regions
-        )
 
         with _record_copy_out_if_eager():
             # Rank cuts partition one globally ordered block-row stream. Joining
             # each rank's valid regions therefore restores parameter order without
-            # scattering every chunk separately. View the physical row storage once,
-            # including any mixed-bucket padding between rows, so cat inputs do not
-            # need intermediate per-rank views. Retain byte cats for unaligned or
-            # odd inputs.
-            use_vec_copies = _is_vec_copy_viewable(rank_rows) and _is_vec_copy_viewable(
-                compact
-            )
-            regions_and_outs = (
-                (qdata_storage_regions, qdata_bytes),
-                (scale_storage_regions, scale_bytes),
-            )
-            if use_vec_copies:
-                rank_storage_bytes = rank_rows.as_strided(
-                    ((rank_rows.size(0) - 1) * row_stride_bytes + rank_rows.size(1),),
-                    (1,),
+            # scattering every chunk separately.
+            if not self._copy_out_rank_rows_triton(metadata, rank_rows, compact):
+                self._copy_out_rank_rows_cat(
+                    metadata,
+                    rank_rows,
+                    compact,
+                    qdata_nbytes=qdata_nbytes,
+                    scale_byte_offset=scale_byte_offset,
                 )
-                rank_storage_copy_units = rank_storage_bytes.view(_VEC_COPY_DTYPE)
-                for regions, out in regions_and_outs:
-                    if all(
-                        offset % _VEC_COPY_NBYTES == 0
-                        and length % _VEC_COPY_NBYTES == 0
-                        for offset, length in regions
-                    ):
-                        _cat_byte_regions_from_flat_storage(
-                            regions,
-                            rank_storage_copy_units,
-                            out.view(_VEC_COPY_DTYPE),
-                            copy_unit_nbytes=_VEC_COPY_NBYTES,
-                        )
-                    else:
-                        _cat_byte_regions_from_flat_storage(
-                            regions,
-                            rank_storage_bytes,
-                            out,
-                        )
-            else:
-                rank_byte_rows = rank_rows.unbind(0)
-                for regions, out in regions_and_outs:
-                    _cat_byte_regions_from_rank_rows(
-                        regions,
-                        rank_byte_rows,
-                        out,
-                        row_stride_bytes=row_stride_bytes,
-                    )
 
         qdata_flat = qdata_bytes.view(self.qdata_dtype)
         flat_scales_by_index = [
@@ -1347,6 +1316,178 @@ class BlockwiseQuantBucketedBlockShard(BucketedBlockShard):
             full_params=full_params,
             persistent_buffers=[compact] if prepared.persistent else [],
         )
+
+    def _copy_out_plan(
+        self,
+        metadata: _QuantBucketMetadata,
+        *,
+        data_elem_nbytes: int,
+        with_scales: bool,
+    ) -> _CopyOutPlan:
+        key = (id(metadata), data_elem_nbytes, with_scales)
+        plan = self._copy_out_plans.get(key)
+        if plan is not None and plan.metadata is metadata:
+            return plan
+
+        regions: list[tuple[int, int, int, int]] = []
+        out_offset = 0
+        for rank, qdata_numel in enumerate(metadata.rank_qdata_numels):
+            nbytes = qdata_numel * data_elem_nbytes
+            regions.append((rank, 0, nbytes, out_offset))
+            out_offset += nbytes
+        if with_scales:
+            out_offset = _align_up(out_offset, _VEC_ALIGN_BYTES)
+            for scale_regions in metadata.scale_regions_by_index:
+                for region in scale_regions:
+                    regions.append(
+                        (region.rank, region.offset, region.nbytes, out_offset)
+                    )
+                    out_offset += region.nbytes
+        nonempty_regions = tuple(region for region in regions if region[2] > 0)
+        plan = BlockwiseQuantBucketedBlockShard._CopyOutPlan(
+            metadata=metadata,
+            regions=nonempty_regions,
+            vec_aligned=all(
+                value % _VEC_COPY_NBYTES == 0
+                for region in nonempty_regions
+                for value in region[1:]
+            ),
+            descriptors={},
+        )
+        self._copy_out_plans[key] = plan
+        return plan
+
+    def _copy_out_rank_rows_triton(
+        self,
+        metadata: _QuantBucketMetadata,
+        rank_rows: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        data_elem_nbytes: int = 1,
+        with_scales: bool = True,
+    ) -> bool:
+        """Join every rank's payload regions into ``out`` with one kernel.
+
+        ``rank_rows`` and ``out`` are uint8. Data regions land in rank order at
+        the start of ``out``. With ``with_scales``, the scale regions follow
+        from the 16-byte aligned offset after the data, grouped by scale tensor
+        index (see ``_scale_regions``). The copy plan is built once per bucket
+        layout and row stride, so a gather costs one launch instead of a view
+        per rank and region. Returns False when the caller should fall back to
+        cat: while compiling or off CUDA.
+        """
+        if torch.compiler.is_compiling() or rank_rows.device.type != "cuda":
+            return False
+        plan = self._copy_out_plan(
+            metadata,
+            data_elem_nbytes=data_elem_nbytes,
+            with_scales=with_scales,
+        )
+        row_stride_bytes = rank_rows.stride(0)
+        # The physical row storage, including any mixed-bucket padding between
+        # rows: offsets in the plan are relative to the first row's start.
+        source = rank_rows.as_strided(
+            ((rank_rows.size(0) - 1) * row_stride_bytes + rank_rows.size(1),),
+            (1,),
+        )
+        if (
+            plan.vec_aligned
+            and _is_vec_copy_viewable(rank_rows)
+            and _is_vec_copy_viewable(out)
+        ):
+            source = source.view(_VEC_COPY_DTYPE)
+            out = out.view(_VEC_COPY_DTYPE)
+        unit_nbytes = source.element_size()
+        descriptor_key = (rank_rows.device, row_stride_bytes, unit_nbytes)
+        descriptor = plan.descriptors.get(descriptor_key)
+        if descriptor is None:
+            from ._copy_kernels import SegmentCopyDescriptor
+
+            descriptor = SegmentCopyDescriptor.create(
+                src_offsets=[
+                    (rank * row_stride_bytes + row_offset) // unit_nbytes
+                    for rank, row_offset, _, _ in plan.regions
+                ],
+                numels=[nbytes // unit_nbytes for _, _, nbytes, _ in plan.regions],
+                dst_offsets=[
+                    out_offset // unit_nbytes for _, _, _, out_offset in plan.regions
+                ],
+                device=rank_rows.device,
+            )
+            plan.descriptors[descriptor_key] = descriptor
+
+        from ._copy_kernels import copy_segments_triton
+
+        copy_segments_triton(source, out, descriptor)
+        return True
+
+    def _copy_out_rank_rows_cat(
+        self,
+        metadata: _QuantBucketMetadata,
+        rank_rows: torch.Tensor,
+        compact: torch.Tensor,
+        *,
+        qdata_nbytes: int,
+        scale_byte_offset: int,
+    ) -> None:
+        """Cat fallback of ``_copy_out_rank_rows_triton`` for compile and CPU."""
+        qdata_bytes = compact[:qdata_nbytes]
+        scale_bytes = compact[scale_byte_offset:]
+        row_stride_bytes = rank_rows.stride(0)
+        qdata_storage_regions = tuple(
+            (rank * row_stride_bytes, rank_qdata_numel)
+            for rank, rank_qdata_numel in enumerate(metadata.rank_qdata_numels)
+        )
+        # Gather grouped by scale tensor index so each group compacts to one
+        # contiguous, parameter-ordered region; the format orders each group's
+        # regions.
+        scale_storage_regions = tuple(
+            (region.rank * row_stride_bytes + region.offset, region.nbytes)
+            for regions in metadata.scale_regions_by_index
+            for region in regions
+        )
+        # View the physical row storage once, including any mixed-bucket padding
+        # between rows, so cat inputs do not need intermediate per-rank views.
+        # Retain byte cats for unaligned or odd inputs.
+        use_vec_copies = _is_vec_copy_viewable(rank_rows) and _is_vec_copy_viewable(
+            compact
+        )
+        regions_and_outs = (
+            (qdata_storage_regions, qdata_bytes),
+            (scale_storage_regions, scale_bytes),
+        )
+        if use_vec_copies:
+            rank_storage_bytes = rank_rows.as_strided(
+                ((rank_rows.size(0) - 1) * row_stride_bytes + rank_rows.size(1),),
+                (1,),
+            )
+            rank_storage_copy_units = rank_storage_bytes.view(_VEC_COPY_DTYPE)
+            for regions, out in regions_and_outs:
+                if all(
+                    offset % _VEC_COPY_NBYTES == 0 and length % _VEC_COPY_NBYTES == 0
+                    for offset, length in regions
+                ):
+                    _cat_byte_regions_from_flat_storage(
+                        regions,
+                        rank_storage_copy_units,
+                        out.view(_VEC_COPY_DTYPE),
+                        copy_unit_nbytes=_VEC_COPY_NBYTES,
+                    )
+                else:
+                    _cat_byte_regions_from_flat_storage(
+                        regions,
+                        rank_storage_bytes,
+                        out,
+                    )
+        else:
+            rank_byte_rows = rank_rows.unbind(0)
+            for regions, out in regions_and_outs:
+                _cat_byte_regions_from_rank_rows(
+                    regions,
+                    rank_byte_rows,
+                    out,
+                    row_stride_bytes=row_stride_bytes,
+                )
 
     def _make_quantized_weight_checked(
         self,

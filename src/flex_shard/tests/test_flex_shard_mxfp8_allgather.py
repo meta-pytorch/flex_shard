@@ -22,6 +22,10 @@ from torchao.prototype.mx_formats.utils import from_blocked
 
 from .. import BucketSpec, flex_shard
 from ..custom_placements import mxfp8_bucketed_block_shard as mxfp8_module
+from ..custom_placements.blockwise_quant_bucketed_block_shard import (
+    _align_up,
+    _VEC_ALIGN_BYTES,
+)
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..custom_placements.mxfp8_bucketed_block_shard import Mxfp8BucketedBlockShard
 from ..flex_shard.placement_contract import (
@@ -143,6 +147,63 @@ class TestMxfp8AllGatherLayout(TestCase):
             self.assertEqual(fwd_numel, dgrad_numel)
             self.assertEqual(metadata.rank_scale_numels[rank], fwd_numel * 2)
             self.assertEqual(fwd_numel % 512, 0)
+
+
+class TestMxfp8FusedCopyOut(TestCase):
+    """The one-kernel rank-row copy-out matches the cat fallback bitwise."""
+
+    def test_copy_out_matches_cat_fallback(self) -> None:
+        if device_type.type != "cuda":
+            self.skipTest("The fused copy-out runs on CUDA.")
+        world_size = 4
+        placement = Mxfp8BucketedBlockShard(
+            world_size=world_size,
+            weight_factory=_RecordingMxWeightFactory(),
+        )
+        named_params = [
+            (f"w{index}", nn.Parameter(torch.empty(shape, device="meta")))
+            for index, shape in enumerate([(512, 256), (200, 320), (72, 100)])
+        ]
+        infos = make_param_infos(named_params, placement, FakeMesh(world_size))
+        metadata = placement._quant_metadata_from_infos(infos)
+        row_nbytes = metadata.packed_send_nbytes_per_rank
+        qdata_nbytes = sum(metadata.rank_qdata_numels)
+        scale_byte_offset = _align_up(qdata_nbytes, _VEC_ALIGN_BYTES)
+        compact_nbytes = scale_byte_offset + sum(
+            region.nbytes
+            for regions in metadata.scale_regions_by_index
+            for region in regions
+        )
+        # Row start offset and padding between rows: contiguous rows, rows
+        # spaced apart as in a mixed bucket, and rows at an odd byte offset.
+        for offset, padding in ((0, 0), (0, 16), (1, 3)):
+            with self.subTest(offset=offset, padding=padding):
+                parent = torch.randint(
+                    0,
+                    256,
+                    (world_size, offset + row_nbytes + padding),
+                    dtype=torch.uint8,
+                    device=device_type,
+                )
+                rank_rows = parent[:, offset : offset + row_nbytes]
+                fused = torch.full(
+                    (compact_nbytes,),
+                    0xAB,
+                    dtype=torch.uint8,
+                    device=device_type,
+                )
+                expected = fused.clone()
+                self.assertTrue(
+                    placement._copy_out_rank_rows_triton(metadata, rank_rows, fused)
+                )
+                placement._copy_out_rank_rows_cat(
+                    metadata,
+                    rank_rows,
+                    expected,
+                    qdata_nbytes=qdata_nbytes,
+                    scale_byte_offset=scale_byte_offset,
+                )
+                self.assertTrue(torch.equal(fused, expected))
 
 
 class TestMxfp8WeightQuantization(TestCase):
