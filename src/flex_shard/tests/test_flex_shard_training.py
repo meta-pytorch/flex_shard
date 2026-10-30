@@ -1445,6 +1445,36 @@ class TestFlexShardTraining(FSDPTest):
         self.assertIn("_c10d_functional.wait_tensor", subgraph_targets)
 
     @skip_if_lt_x_gpu(2)
+    def test_torch_compile_traces_gradient_divide_factor_one(self):
+        # torchtitan disables gradient division with a divide factor of 1, which
+        # the eager path reduces with NCCL's premul sum. Graph capture traces the
+        # same reduction as a plain sum, with the same grads.
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        torch.manual_seed(0)
+        args, eager_model = flex_shard_transformer_model(mesh)
+        torch.manual_seed(0)
+        _, compiled_model = flex_shard_transformer_model(mesh)
+        for model in (eager_model, compiled_model):
+            model.set_gradient_divide_factor(1.0)
+        graphs = []
+
+        def capture_backend(gm, example_inputs):
+            graphs.append(gm)
+            return gm.forward
+
+        inputs = transformer_inputs(args, device=device_type)
+        eager_model(inputs).sum().backward()
+        compiled = torch.compile(
+            compiled_model, backend=capture_backend, fullgraph=True
+        )
+        compiled(inputs).sum().backward()
+        self.assertEqual(1, len(graphs))
+        for (fqn, eager_param), (_, compiled_param) in zip(
+            eager_model.named_parameters(), compiled_model.named_parameters()
+        ):
+            self.assertTrue(torch.equal(eager_param.grad, compiled_param.grad), fqn)
+
+    @skip_if_lt_x_gpu(2)
     def test_unshard_leaves_no_memory_on_flex_shard_stream(self):
         # A pipeline schedule unshards each stage with async_op=True. As in
         # FSDP2, the all-gather buffers belong to the current stream, so after
