@@ -130,6 +130,11 @@ def _gradient_reduce_scatter_op(
     if factor == group_size:
         return dist.ReduceOp.AVG, None, None
     if dtype in (torch.float32, torch.bfloat16):
+        if torch.compiler.is_compiling():
+            # Graph capture can't trace NCCL's premul sum: divide before a plain
+            # sum instead. With a factor of 1, as torchtitan sets to disable FSDP's
+            # gradient division, that is exactly the eager reduction.
+            return dist.ReduceOp.SUM, None if factor == 1 else factor, None
         # One NCCL call, which multiplies each input by 1/factor before summing.
         return dist._make_nccl_premul_sum(1.0 / factor), None, None
     # fp16 has a narrow range: divide by about sqrt(factor) before the sum and by
