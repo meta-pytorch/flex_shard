@@ -64,6 +64,11 @@ def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+# Integer dtypes by size: a copy viewed as the widest unit its offsets allow
+# moves the same bytes in fewer loads.
+_COPY_UNIT_DTYPES = {8: torch.int64, 4: torch.int32, 2: torch.int16, 1: torch.uint8}
+
+
 def _rank_range_views(
     bucket: torch.Tensor,
     padded_segments: torch.Tensor,
@@ -561,6 +566,20 @@ class BucketedBlockShard(Placement):
         debug_fqn: str | None
         padded_segment_numel: int
 
+    @dataclass(frozen=True)
+    class _ReduceCopyInPlan:
+        """Where a bucket's grads land in its reduce-scatter input rows, for
+        one row stride, in elements from the first row's start: each param's
+        segments as (offset in the grad, length, destination offset), and the
+        segments to zero as (destination offset, length)."""
+
+        bucket_layout: BucketLayout
+        param_segments: tuple[tuple[tuple[int, int, int], ...], ...]
+        zero_segments: tuple[tuple[int, int], ...]
+        # The gcd of every offset and length above.
+        alignment: int
+        descriptors: dict[tuple[torch.device, int], Any]
+
     def __init__(
         self,
         dims: tuple[int, ...] = (0,),
@@ -583,6 +602,9 @@ class BucketedBlockShard(Placement):
             )
         self.dims = dims
         self.blocks_per_rank = blocks_per_rank
+        self._reduce_copy_in_plans: dict[
+            tuple[int, tuple[str, ...], int], BucketedBlockShard._ReduceCopyInPlan
+        ] = {}
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, BucketedBlockShard):
@@ -1057,6 +1079,171 @@ class BucketedBlockShard(Placement):
                 return None
         return bucket
 
+    def _reduce_copy_in_plan(
+        self,
+        infos: list[ParamInfo],
+        row_stride: int,
+    ) -> BucketedBlockShard._ReduceCopyInPlan:
+        bucket_layout = self._bucket_layout(infos[0])
+        key = (id(bucket_layout), tuple(info.fqn for info in infos), row_stride)
+        plan = self._reduce_copy_in_plans.get(key)
+        if plan is not None and plan.bucket_layout is bucket_layout:
+            return plan
+
+        padded_segment_numel = max(bucket_layout.rank_numels)
+        param_ranges = [
+            (self._param_layout(info).param_offset, info.global_numel) for info in infos
+        ]
+        param_segments: list[list[tuple[int, int, int]]] = [[] for _ in infos]
+        zero_segments: list[tuple[int, int]] = []
+        for rank, (rank_offset, rank_numel) in enumerate(
+            zip(bucket_layout.rank_offsets, bucket_layout.rank_numels, strict=True)
+        ):
+            row_start = rank * row_stride
+            covered: list[tuple[int, int]] = []
+            for segments, (param_offset, param_numel) in zip(
+                param_segments, param_ranges, strict=True
+            ):
+                start = max(param_offset, rank_offset)
+                end = min(param_offset + param_numel, rank_offset + rank_numel)
+                if start < end:
+                    segments.append(
+                        (
+                            start - param_offset,
+                            end - start,
+                            row_start + start - rank_offset,
+                        )
+                    )
+                    covered.append((start - rank_offset, end - rank_offset))
+            # The rest of the row is zeros: gaps between params, the bucket's
+            # tail padding, and the padding up to the longest rank range.
+            column = 0
+            for start, end in sorted(covered):
+                if start > column:
+                    zero_segments.append((row_start + column, start - column))
+                column = max(column, end)
+            if column < padded_segment_numel:
+                zero_segments.append(
+                    (row_start + column, padded_segment_numel - column)
+                )
+        values = [
+            value
+            for segments in param_segments
+            for segment in segments
+            for value in segment
+        ]
+        values.extend(value for segment in zero_segments for value in segment)
+        plan = BucketedBlockShard._ReduceCopyInPlan(
+            bucket_layout=bucket_layout,
+            param_segments=tuple(tuple(segments) for segments in param_segments),
+            zero_segments=tuple(zero_segments),
+            alignment=math.gcd(*values) or 1,
+            descriptors={},
+        )
+        self._reduce_copy_in_plans[key] = plan
+        return plan
+
+    def _packs_reduce_scatter_grad_in_one_pass(
+        self,
+        tensors: list[torch.Tensor],
+        dtype: torch.dtype,
+    ) -> bool:
+        """Whether ``_pack_reduce_scatter_grad`` can write these grads: in
+        eager mode, contiguous CUDA grads already in the reduce dtype."""
+        return not torch.compiler.is_compiling() and all(
+            tensor.device.type == "cuda"
+            and tensor.dtype == dtype
+            and tensor.is_contiguous()
+            for tensor in tensors
+        )
+
+    def _pack_reduce_scatter_grad(
+        self,
+        tensors: list[torch.Tensor],
+        infos: list[ParamInfo],
+        world_size: int,
+        send_rows: torch.Tensor,
+    ) -> None:
+        """Write the reduce-scatter input into ``send_rows`` (world size x the
+        longest rank range, possibly a view of wider rows): each rank's range
+        of the param-major grads, then zeros. One copy kernel per grad and one
+        zero kernel write every element once, from a plan built once per
+        bucket layout and row stride. Requires
+        ``_packs_reduce_scatter_grad_in_one_pass``."""
+        if send_rows.shape != (
+            world_size,
+            max(self._bucket_layout(infos[0]).rank_numels),
+        ):
+            raise AssertionError(
+                "BucketedBlockShard send rows must be world size by the longest "
+                f"rank range, got {tuple(send_rows.shape)}."
+            )
+        if send_rows.stride(1) != 1 or not self._packs_reduce_scatter_grad_in_one_pass(
+            tensors, send_rows.dtype
+        ):
+            raise AssertionError(
+                "BucketedBlockShard can't pack these grads in one pass."
+            )
+        row_stride = send_rows.stride(0)
+        plan = self._reduce_copy_in_plan(infos, row_stride)
+        # The physical rows, including any other groups' columns between them:
+        # the plan's offsets count from the first row's start.
+        out = send_rows.as_strided(
+            ((send_rows.size(0) - 1) * row_stride + send_rows.size(1),), (1,)
+        )
+        sources = [tensor.view(-1) for tensor in tensors]
+        itemsize = out.element_size()
+        unit_nbytes = next(
+            nbytes
+            for nbytes in _COPY_UNIT_DTYPES
+            if nbytes % itemsize == 0
+            and plan.alignment * itemsize % nbytes == 0
+            and all(
+                tensor.data_ptr() % nbytes == 0
+                and tensor.storage_offset() * itemsize % nbytes == 0
+                and tensor.numel() * itemsize % nbytes == 0
+                for tensor in (out, *sources)
+            )
+        )
+        if unit_nbytes != itemsize:
+            out = out.view(_COPY_UNIT_DTYPES[unit_nbytes])
+            sources = [
+                source.view(_COPY_UNIT_DTYPES[unit_nbytes]) for source in sources
+            ]
+        unit = unit_nbytes // itemsize
+
+        from ._copy_kernels import (
+            copy_segments_triton,
+            SegmentCopyDescriptor,
+            zero_segments_triton,
+        )
+
+        descriptor_key = (out.device, unit_nbytes)
+        descriptors = plan.descriptors.get(descriptor_key)
+        if descriptors is None:
+            param_descriptors = [
+                SegmentCopyDescriptor.create(
+                    src_offsets=[offset // unit for offset, _, _ in segments],
+                    numels=[numel // unit for _, numel, _ in segments],
+                    dst_offsets=[offset // unit for _, _, offset in segments],
+                    device=out.device,
+                )
+                for segments in plan.param_segments
+            ]
+            zero_offsets = [offset // unit for offset, _ in plan.zero_segments]
+            zero_descriptor = SegmentCopyDescriptor.create(
+                src_offsets=zero_offsets,
+                numels=[numel // unit for _, numel in plan.zero_segments],
+                dst_offsets=zero_offsets,
+                device=out.device,
+            )
+            descriptors = (param_descriptors, zero_descriptor)
+            plan.descriptors[descriptor_key] = descriptors
+        param_descriptors, zero_descriptor = descriptors
+        for source, descriptor in zip(sources, param_descriptors, strict=True):
+            copy_segments_triton(source, out, descriptor)
+        zero_segments_triton(out, zero_descriptor)
+
     @override
     def prepare_reduce_grad(
         self,
@@ -1070,6 +1257,13 @@ class BucketedBlockShard(Placement):
         device = tensors[0].device
         bucket_layout = self._bucket_layout(infos[0])
         padded_segment_numel = max(bucket_layout.rank_numels)
+        reduce_state = BucketedBlockShard._ReduceGradState(
+            infos=infos,
+            rank=mesh.get_local_rank(),
+            pg=mesh.get_group(),
+            debug_fqn=debug_fqn,
+            padded_segment_numel=padded_segment_numel,
+        )
         if world_size * padded_segment_numel == bucket_layout.global_numel:
             grad_bucket = self._gradient_bucket_of(
                 tensors, infos, bucket_layout.global_numel, dtype
@@ -1080,14 +1274,30 @@ class BucketedBlockShard(Placement):
                 return PlacementPreparedReduceGrad(
                     placement=self,
                     buffers=[grad_bucket],
-                    placement_state=BucketedBlockShard._ReduceGradState(
-                        infos=infos,
-                        rank=mesh.get_local_rank(),
-                        pg=mesh.get_group(),
-                        debug_fqn=debug_fqn,
-                        padded_segment_numel=padded_segment_numel,
-                    ),
+                    placement_state=reduce_state,
                 )
+        if self._packs_reduce_scatter_grad_in_one_pass(tensors, dtype):
+            with _record_function_if_eager(
+                "FlexShard::reduce_scatter_copy_in", debug_fqn
+            ):
+                send_buf = torch.empty(
+                    world_size * padded_segment_numel,
+                    dtype=dtype,
+                    device=device,
+                )
+                self._pack_reduce_scatter_grad(
+                    tensors,
+                    infos,
+                    world_size,
+                    send_buf.view(world_size, padded_segment_numel),
+                )
+            return PlacementPreparedReduceGrad(
+                placement=self,
+                buffers=[send_buf],
+                placement_state=reduce_state,
+            )
+        # While compiling, off CUDA, or with grads to cast: copy through a
+        # zeroed gradient bucket.
         with _record_function_if_eager("FlexShard::reduce_scatter_copy_in", debug_fqn):
             global_grad_bucket = torch.zeros(
                 bucket_layout.global_numel,
@@ -1127,13 +1337,7 @@ class BucketedBlockShard(Placement):
         return PlacementPreparedReduceGrad(
             placement=self,
             buffers=[send_buf],
-            placement_state=BucketedBlockShard._ReduceGradState(
-                infos=infos,
-                rank=mesh.get_local_rank(),
-                pg=mesh.get_group(),
-                debug_fqn=debug_fqn,
-                padded_segment_numel=padded_segment_numel,
-            ),
+            placement_state=reduce_state,
         )
 
     @override

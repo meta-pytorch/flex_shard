@@ -20,7 +20,7 @@ from torchao.prototype.moe_training.kernels.mxfp8.quant import (
 )
 from torchao.prototype.mx_formats.utils import from_blocked
 
-from .. import BucketSpec, flex_shard
+from .. import BucketSpec, flex_shard, GradientReduction
 from ..custom_placements import mxfp8_bucketed_block_shard as mxfp8_module
 from ..custom_placements.blockwise_quant_bucketed_block_shard import (
     _align_up,
@@ -470,6 +470,29 @@ class TestMxfp8AllGather(FSDPTest):
         self.assertTrue(
             torch.equal(call.dgrad_scale.view(torch.uint8), ref_dgrad.view(torch.uint8))
         )
+
+        # The MXFP8 group's grads go straight into the bucket's send buffer,
+        # not through a send buffer of the group's own.
+        with patch.object(
+            Mxfp8BucketedBlockShard,
+            "prepare_reduce_grad",
+            side_effect=AssertionError("expected the one-pass copy-in"),
+        ):
+            prepared_reduce = mixed.prepare_reduce_grad(
+                [originals[info.fqn] for info in infos],
+                infos,
+                mesh,
+                None,
+            )
+        with patch.object(
+            dist,
+            "reduce_scatter_tensor",
+            wraps=dist.reduce_scatter_tensor,
+        ) as reduce_scatter:
+            reduced = mixed.reduce_prepared_grad(prepared_reduce, GradientReduction())
+        self.assertEqual(reduce_scatter.call_count, 1)
+        for grad, info in zip(reduced.sharded_grads, infos, strict=True):
+            self.assertEqual(grad, storage.get_local_view(info.fqn))
 
 
 if __name__ == "__main__":
