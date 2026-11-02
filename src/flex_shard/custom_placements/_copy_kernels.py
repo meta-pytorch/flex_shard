@@ -142,6 +142,25 @@ def _copy_segments_kernel(
     tl.store(output + dst_offset + offsets, values, mask=mask)
 
 
+@triton.jit
+def _zero_segments_kernel(
+    numels,
+    dst_offsets,
+    output,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    chunk_id = tl.program_id(0)
+    segment_id = tl.program_id(1)
+    offsets = chunk_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    numel = tl.load(numels + segment_id)
+    dst_offset = tl.load(dst_offsets + segment_id)
+    mask = offsets < numel
+
+    zeros = tl.zeros([BLOCK_SIZE], dtype=output.dtype.element_ty)
+    tl.store(output + dst_offset + offsets, zeros, mask=mask)
+
+
 def _staged_cuda_i64_tensor(
     values: Sequence[int],
     device: torch.device,
@@ -442,9 +461,33 @@ def copy_segments_triton(
     )
 
 
+def zero_segments_triton(
+    output: torch.Tensor,
+    descriptor: SegmentCopyDescriptor,
+    *,
+    num_warps: int = 4,
+) -> None:
+    """Zero ``descriptor``'s destination segments of ``output``, in one launch.
+
+    Reads only the descriptor's lengths and destination offsets.
+    """
+    if descriptor.nsegments == 0 or descriptor.max_segment_numel == 0:
+        return
+    block_size = descriptor.block_size
+    grid = (triton.cdiv(descriptor.max_segment_numel, block_size), descriptor.nsegments)
+    _zero_segments_kernel[grid](
+        descriptor.numels,
+        descriptor.dst_offsets,
+        output,
+        BLOCK_SIZE=block_size,
+        num_warps=num_warps,
+    )
+
+
 __all__ = [
     "SegmentCopyDescriptor",
     "SegmentPackDescriptor",
     "copy_segments_triton",
     "pack_segments_into_flat_buffer_triton",
+    "zero_segments_triton",
 ]
