@@ -34,8 +34,14 @@ from expert_parallel import AllToAllDispatcher, apply_expert_parallel  # noqa: E
 from model import DeepSeekV3, DeepSeekV3Config, GateUpLinear, param_init_fns  # noqa: E402
 from muon import kimi_matrices  # noqa: E402
 
-from .. import get_flex_shard_global_layouts, init_from_full  # noqa: E402
-from ..dist_muon import BlockShard, BucketConfig, ComputeLayout, DistMuon, Owned  # noqa: E402
+from flex_shard import get_flex_shard_global_layouts, init_from_full  # noqa: E402
+from flex_shard.dist_muon import (
+    BlockShard,
+    BucketConfig,
+    ComputeLayout,
+    DistMuon,
+    Owned,
+)  # noqa: E402
 
 
 def _config(**kwargs) -> DeepSeekV3Config:
