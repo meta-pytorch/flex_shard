@@ -15,10 +15,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.functional import ScalingType, SwizzleType
-from torchao.prototype.moe_training.kernels.mxfp8.quant import (
-    mxfp8_quantize_2d_1x32_cutedsl as _torchao_mxfp8_quantize_1x32,
-    mxfp8_quantize_2d_32x1_cutedsl as _torchao_mxfp8_quantize_32x1,
-)
 
 from ..blockwise_quant.linear import (
     convert_to_flex_shard_prequantized_linear,
@@ -29,8 +25,7 @@ from ..custom_placements.blockwise_quant_bucketed_block_shard import (
 )
 from .blockwise_mxfp8_weight import BlockwiseMxfp8Weight
 
-# torchao's 2D MXFP8 quantizers require both dims to be multiples of 128; the
-# gathered weight's blocked scales already cover 128-padded dims.
+# Keep GEMM operands padded to the gathered weight's 128-element scale tiles.
 _TILE = 128
 
 
@@ -68,13 +63,19 @@ class Mxfp8BlockwiseGemms:
         x_2d: torch.Tensor,
         weight: BlockwiseMxfp8Weight,
     ) -> torch.Tensor:
+        if self.scaling_mode.lower() != "rceil":
+            raise NotImplementedError("F.quantize_tensor only supports MXFP8 rceil scaling")
         tokens = x_2d.shape[0]
         weight_matrix = weight.fp8_data.flatten(0, -2)
         out_dim, _ = weight_matrix.shape
         weight_fp8 = _pad_2d_to_block_shape(weight_matrix, _TILE)
-        x_fp8, x_scale = _torchao_mxfp8_quantize_1x32(
+        x_fp8, x_scale = F.quantize_tensor(
             _pad_2d_to_block_shape(x_2d, _TILE),
-            scaling_mode=self.scaling_mode,
+            dim=(0, 1),
+            scaling_type=ScalingType.BlockWise1x32,
+            qdata_dtype=torch.float8_e4m3fn,
+            scaling_algorithm=F.ScalingAlgorithm.MXFP_E8M0_RU,
+            swizzle_type=SwizzleType.SWIZZLE_32_4_4,
         )
         out = _mx_scaled_mm(
             x_fp8,
@@ -93,17 +94,36 @@ class Mxfp8BlockwiseGemms:
         needs_x_grad: bool,
         needs_weight_grad: bool,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if (needs_x_grad or needs_weight_grad) and self.scaling_mode.lower() != "rceil":
+            raise NotImplementedError("F.quantize_tensor only supports MXFP8 rceil scaling")
         tokens = grad_output_2d.shape[0]
         weight_matrix = weight.fp8_data.flatten(0, -2)
         out_dim, in_dim = weight_matrix.shape
         grad_output_padded = _pad_2d_to_block_shape(grad_output_2d, _TILE)
 
         grad_x = grad_weight = None
-        if needs_x_grad:
-            grad_output_fp8, grad_output_scale = _torchao_mxfp8_quantize_1x32(
-                grad_output_padded,
-                scaling_mode=self.scaling_mode,
+        if needs_x_grad and needs_weight_grad:
+            # DGRAD and WGRAD need opposite casts of the same gradient.
+            grad_output_fp8, grad_output_scale, grad_output_t_fp8, grad_output_t_scale = (
+                F.quantize_tensor_dual(
+                    grad_output_padded,
+                    dim=(0, 1),
+                    scaling_type=ScalingType.BlockWise1x32,
+                    qdata_dtype=torch.float8_e4m3fn,
+                    scaling_algorithm=F.ScalingAlgorithm.MXFP_E8M0_RU,
+                    swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+                )
             )
+        if needs_x_grad:
+            if not needs_weight_grad:
+                grad_output_fp8, grad_output_scale = F.quantize_tensor(
+                    grad_output_padded,
+                    dim=(0, 1),
+                    scaling_type=ScalingType.BlockWise1x32,
+                    qdata_dtype=torch.float8_e4m3fn,
+                    scaling_algorithm=F.ScalingAlgorithm.MXFP_E8M0_RU,
+                    swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+                )
             # Blackwell scaled_mm accepts the row-major weight directly; square
             # tiles make the same fp8_data valid for DGRAD.
             grad_x = _mx_scaled_mm(
@@ -115,13 +135,22 @@ class Mxfp8BlockwiseGemms:
             )[:tokens, :in_dim]
         if needs_weight_grad:
             # 32x1 casts scale along tokens and return column-major data.
-            grad_output_t_fp8, grad_output_t_scale = _torchao_mxfp8_quantize_32x1(
-                grad_output_padded,
-                scaling_mode=self.scaling_mode,
-            )
-            x_fp8, x_t_scale = _torchao_mxfp8_quantize_32x1(
+            if not needs_x_grad:
+                grad_output_t_fp8, grad_output_t_scale = F.quantize_tensor(
+                    grad_output_padded,
+                    dim=(1, 0),
+                    scaling_type=ScalingType.BlockWise1x32,
+                    qdata_dtype=torch.float8_e4m3fn,
+                    scaling_algorithm=F.ScalingAlgorithm.MXFP_E8M0_RU,
+                    swizzle_type=SwizzleType.SWIZZLE_32_4_4,
+                )
+            x_fp8, x_t_scale = F.quantize_tensor(
                 _pad_2d_to_block_shape(x_2d, _TILE),
-                scaling_mode=self.scaling_mode,
+                dim=(1, 0),
+                scaling_type=ScalingType.BlockWise1x32,
+                qdata_dtype=torch.float8_e4m3fn,
+                scaling_algorithm=F.ScalingAlgorithm.MXFP_E8M0_RU,
+                swizzle_type=SwizzleType.SWIZZLE_32_4_4,
             )
             grad_weight = _mx_scaled_mm(
                 grad_output_t_fp8.t(),

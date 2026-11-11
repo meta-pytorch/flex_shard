@@ -36,6 +36,7 @@ from typing import NamedTuple, Protocol, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .blockwise_quant_bucketed_block_shard import (
     _callable_name,
@@ -148,31 +149,28 @@ def _quantize_dense_weight_to_mxfp8_32x32(
     scale for ``(out_dim, in_dim)`` data, and the blocked input-gradient scale
     for the transposed ``(in_dim, out_dim)`` data.
     """
-    # Imported on use: importing it initializes CUDA.
-    from torchao.prototype.moe_training.kernels.mxfp8.quant import (
-        mxfp8_quantize_cuda_3d,
-    )
-
     out_dim, in_dim = _validate_2d_non_empty(
         weight.shape,
         "dense mxfp8 weight",
     )
+    if scaling_mode.lower() != "rceil":
+        raise NotImplementedError("F.quantize_tensor only supports MXFP8 rceil scaling")
     # Pad to whole 128x128 scale tiles: the kernel allocates blocked scales
     # uninitialized, so any padding tile left for it would hold arbitrary bytes
     # (possibly e8m0 NaN) that the GEMM multiplies with zero-padded data.
     padded_weight = _pad_2d_to_block_shape(weight, _SCALE_TILE_ROWS)
     padded_out, padded_in = padded_weight.shape
-    # The transposed expert view makes the kernel's column-major output the
-    # row-major weight and its blocked scale the forward orientation.
-    data_t, fwd_scale = mxfp8_quantize_cuda_3d(
-        padded_weight.t().unsqueeze(0),
-        block_size=MX_BLOCK_SIZE,
-        scale_block_dim1=MX_BLOCK_SIZE,
-        scale_block_dim2=MX_BLOCK_SIZE,
-        scaling_mode=scaling_mode,
-        blocked_scale_output=True,
+    data, fwd_scale = F.quantize_tensor(
+        padded_weight,
+        dim=(0, 1),
+        scaling_type=F.ScalingType.BlockWise1x32,
+        qdata_dtype=torch.float8_e4m3fn,
+        scaling_algorithm=F.ScalingAlgorithm.MXFP_E8M0_RU,
+        swizzle_type=F.SwizzleType.SWIZZLE_32_4_4,
+        scaling_type_use_square_block_size=True,
     )
-    fp8_data = data_t[0].t()[:out_dim, :in_dim].contiguous()
+    fp8_data = data[:out_dim, :in_dim].contiguous()
+    # The frontend's packed [1, L] scale has the same bytes as our blocked grid.
     fwd_scale = fwd_scale.view(_blocked_scale_shape(padded_out, padded_in))
     dgrad_scale = _transpose_32x32_blocked_scale(fwd_scale, padded_out, padded_in)
     return fp8_data, fwd_scale, dgrad_scale
