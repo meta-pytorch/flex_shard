@@ -26,6 +26,7 @@ from ..flex_shard.placement_contract import (
     PlacementUnshardResult,
 )
 from ..flex_shard.utils import (
+    is_graph_tracing,
     _record_comm_if_eager,
     _record_copy_in_if_eager,
     _record_copy_out_if_eager,
@@ -1150,7 +1151,7 @@ class BucketedBlockShard(Placement):
     ) -> bool:
         """Whether ``_pack_reduce_scatter_grad`` can write these grads: in
         eager mode, contiguous CUDA grads already in the reduce dtype."""
-        return not torch.compiler.is_compiling() and all(
+        return not is_graph_tracing() and all(
             tensor.device.type == "cuda"
             and tensor.dtype == dtype
             and tensor.is_contiguous()

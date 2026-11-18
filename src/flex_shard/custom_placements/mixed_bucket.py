@@ -24,6 +24,7 @@ from ..flex_shard.placement_contract import (
     PlacementUnshardResult,
 )
 from ..flex_shard.utils import (
+    is_graph_tracing,
     _record_comm_if_eager,
     _record_copy_in_if_eager,
     _record_copy_out_if_eager,
@@ -1056,7 +1057,7 @@ class MixedBucketPlacement(Placement):
             # The grads fill their rows but for the padding torch.compile adds
             # (see _gathered_row_numels), and the transport's tail padding up
             # to whole chunks, which no row holds.
-            alloc = torch.zeros if torch.compiler.is_compiling() else torch.empty
+            alloc = torch.zeros if is_graph_tracing() else torch.empty
             send = alloc(
                 sum(row_numels) if transport is None else transport.plan.gathered_numel,
                 dtype=dtype,
@@ -1397,7 +1398,7 @@ def _zero_padding(
     ranges: tuple[tuple[int, int], ...],
 ) -> None:
     slices = [tensor.narrow(0, offset, numel) for offset, numel in ranges]
-    if torch.compiler.is_compiling():
+    if is_graph_tracing():
         for slice_ in slices:
             slice_.zero_()
     elif slices:
@@ -1579,7 +1580,7 @@ def _owner_row_view(
     ``dtype``, and the storage holds the whole row, as
     MixedBucketPlacement._owner_rows_storage_layout lays them out. Eager only."""
     if (
-        torch.compiler.is_compiling()
+        is_graph_tracing()
         or not owned
         or any(
             tensor.dtype != dtype or not tensor.is_contiguous() for tensor, _ in owned
@@ -1680,7 +1681,7 @@ def _gathered_row_numels(row_numels: list[int]) -> tuple[int, ...]:
     a bucket holds no padding and uneven rows take one broadcast and one reduce
     per owner. Under torch.compile every row takes the longest's length, so
     one all-gather and one reduce-scatter trace as before."""
-    if torch.compiler.is_compiling():
+    if is_graph_tracing():
         return (max(row_numels),) * len(row_numels)
     return tuple(row_numels)
 

@@ -13,6 +13,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ..flex_shard.utils import is_graph_tracing
+
 
 @triton.jit
 def _pack_segments_fp32_to_bf16_kernel(
@@ -263,7 +265,7 @@ def pack_segments_into_flat_buffer_triton(
     ``inputs`` are flat contiguous views. Segment metadata is in elements:
     input tensor index, source offset, length, and destination offset.
     """
-    if torch.compiler.is_compiling() or block_size <= 0:
+    if is_graph_tracing() or block_size <= 0:
         return None
     if output.dim() != 1 or output.device.type != "cuda" or not output.is_contiguous():
         return None

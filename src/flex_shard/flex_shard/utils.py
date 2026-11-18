@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.tensor import DTensor
+from torch.fx.experimental.proxy_tensor import get_proxy_mode
 from torch.utils._python_dispatch import (
     _get_current_dispatch_mode_stack,
     _pop_mode,
@@ -32,6 +33,11 @@ if TYPE_CHECKING:
     from .placement_contract import Placement
 
 
+def is_graph_tracing() -> bool:
+    """Whether Dynamo or make_fx is capturing FlexShard tensor operations."""
+    return torch.compiler.is_compiling() or get_proxy_mode() is not None
+
+
 def _with_fqn(label: str, fqn: str | None) -> str:
     """Append a module/bucket FQN to profiler labels, matching FSDP style."""
     if fqn:
@@ -44,28 +50,28 @@ def _record_function_if_eager(
     fqn: str | None,
 ) -> AbstractContextManager[Any]:
     """Return a profiler range in eager and a no-op context during compile."""
-    if torch.compiler.is_compiling():
+    if is_graph_tracing():
         return nullcontext()
     return torch.profiler.record_function(_with_fqn(label, fqn))
 
 
 def _record_copy_in_if_eager() -> AbstractContextManager[Any]:
     """Return an eager profiler range for unshard copy-in."""
-    if torch.compiler.is_compiling():
+    if is_graph_tracing():
         return nullcontext()
     return torch.profiler.record_function("FlexShard::copy_in")
 
 
 def _record_copy_out_if_eager() -> AbstractContextManager[Any]:
     """Return an eager profiler range for unshard copy-out."""
-    if torch.compiler.is_compiling():
+    if is_graph_tracing():
         return nullcontext()
     return torch.profiler.record_function("FlexShard::copy_out")
 
 
 def _record_view_out_if_eager() -> AbstractContextManager[Any]:
     """Return an eager profiler range for unshard view-out."""
-    if torch.compiler.is_compiling():
+    if is_graph_tracing():
         return nullcontext()
     return torch.profiler.record_function("FlexShard::view_out")
 
@@ -95,7 +101,7 @@ def _outside_selective_checkpoint(fn: Callable[..., _R]) -> Callable[..., _R]:
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> _R:
-        if torch.compiler.is_compiling():
+        if is_graph_tracing():
             return fn(*args, **kwargs)
         stack = _get_current_dispatch_mode_stack()
         first_sac = next(

@@ -17,6 +17,9 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointWrapper,
 )
 from torch.distributed.device_mesh import init_device_mesh
+from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.traceback import preserve_node_meta
+from torch.nn.utils.stateless import _reparametrize_module
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import FSDPTest, get_devtype
 from torch.testing._internal.common_utils import run_tests
@@ -27,7 +30,15 @@ from torch.utils.checkpoint import (
     create_selective_checkpoint_contexts,
 )
 
-from .. import BucketSpec, flex_shard, MixedPrecisionPolicy
+from .. import (
+    BucketSpec,
+    FLEX_SHARD_META_ACTION,
+    FLEX_SHARD_META_MESH_AXIS_NAMES,
+    FLEX_SHARD_META_PARAM_FQNS,
+    FLEX_SHARD_META_PHASE,
+    flex_shard,
+    MixedPrecisionPolicy,
+)
 from ..custom_placements.block_shard import (
     BlockShard,
     BucketedBlockShard,
@@ -1498,15 +1509,96 @@ class TestFlexShardTraining(FSDPTest):
         # Collectives live in the fwd_body_*/bwd_body_* subgraphs that
         # autograd_function_apply dispatches to, not at the top level.
         subgraph_targets = set()
+        bucket_param_fqns = {
+            tuple(storage.param_infos) for storage in model.sharded_bucket_storages
+        }
+        collective_actions = {
+            "_c10d_functional.all_gather_into_tensor": "unshard",
+            "_c10d_functional.reduce_scatter_tensor": "reduce_grad",
+        }
+        phases = {action: set() for action in collective_actions.values()}
         for _, submodule in graphs[0].named_modules():
             if isinstance(submodule, torch.fx.GraphModule):
-                subgraph_targets.update(
-                    str(node.target) for node in submodule.graph.nodes
-                )
+                for node in submodule.graph.nodes:
+                    target = str(node.target)
+                    subgraph_targets.add(target)
+                    custom = node.meta.get("custom", {})
+                    action = custom.get(FLEX_SHARD_META_ACTION)
+                    if action in phases and node.op != "placeholder":
+                        phases[action].add(custom[FLEX_SHARD_META_PHASE])
+                    if target not in collective_actions and target != (
+                        "_c10d_functional.wait_tensor"
+                    ):
+                        continue
+                    if target in collective_actions:
+                        self.assertEqual(action, collective_actions[target])
+                    else:
+                        self.assertIn(action, collective_actions.values())
+                    self.assertIn(custom[FLEX_SHARD_META_PARAM_FQNS], bucket_param_fqns)
+                    self.assertEqual(custom[FLEX_SHARD_META_PHASE], "execute")
+                    self.assertEqual(
+                        custom[FLEX_SHARD_META_MESH_AXIS_NAMES], mesh.mesh_dim_names
+                    )
         # Functional collectives keep the comm reorderable by graph passes.
         self.assertIn("_c10d_functional.all_gather_into_tensor", subgraph_targets)
         self.assertIn("_c10d_functional.reduce_scatter_tensor", subgraph_targets)
         self.assertIn("_c10d_functional.wait_tensor", subgraph_targets)
+        self.assertEqual(phases["unshard"], {"prepare", "execute", "finish"})
+        self.assertEqual(phases["reduce_grad"], {"prepare", "execute"})
+
+    @skip_if_lt_x_gpu(2)
+    def test_make_fx_traces_reparameterized_bucket_collectives(self):
+        mesh = init_device_mesh(device_type.type, (self.world_size,))
+        model = self._two_bucket_mlp(mesh)
+        params = dict(model.named_parameters())
+        buckets = [storage._runtime()[1] for storage in model.sharded_bucket_storages]
+        cached_params = [bucket.bucket_params for bucket in buckets]
+        x = torch.randn(4, 8, device=device_type)
+
+        def forward_backward(params, x):
+            with _reparametrize_module(model, params):
+                loss = model(x).sum()
+                grads = torch.autograd.grad(loss, tuple(params.values()))
+            return loss, grads
+
+        with (
+            torch.compiler.config.patch(compile_on_one_rank=True),
+            preserve_node_meta(),
+        ):
+            gm = make_fx(forward_backward, tracing_mode="fake")(params, x)
+        for bucket, cached in zip(buckets, cached_params, strict=True):
+            self.assertIs(bucket.bucket_params, cached)
+            self.assertEqual(bucket._tracing_sharded_params, [])
+        for fqn, param in model.named_parameters():
+            self.assertIs(param, params[fqn])
+        for action, collective in (
+            ("unshard", torch.ops._c10d_functional.all_gather_into_tensor.default),
+            ("reduce_grad", torch.ops._c10d_functional.reduce_scatter_tensor.default),
+        ):
+            launches = [node for node in gm.graph.nodes if node.target == collective]
+            self.assertEqual(len(launches), len(buckets))
+            for launch in launches:
+                self.assertEqual(launch.meta["custom"][FLEX_SHARD_META_ACTION], action)
+
+        # Changed graph inputs must supply the parameters, rather than the
+        # runtime's cached live tensors becoming constants in the graph.
+        changed_params = {}
+        for storage in model.sharded_bucket_storages:
+            changed_storage = storage.byte_storage.clone().view(torch.float32) * 0.5
+            for fqn in storage.param_infos:
+                param = params[fqn]
+                changed_params[fqn] = changed_storage.as_strided(
+                    param.shape, param.stride(), param.storage_offset()
+                )
+        with torch.no_grad():
+            actual_loss, actual_grads = gm(changed_params, x)
+            for fqn, param in params.items():
+                param.copy_(changed_params[fqn])
+        expected_loss = model(x).sum()
+        expected_loss.backward()
+        self.assertEqual(actual_loss, expected_loss, atol=0, rtol=0)
+        for actual_grad, param in zip(actual_grads, params.values(), strict=True):
+            self.assertEqual(actual_grad, param.grad, atol=0, rtol=0)
 
     @skip_if_lt_x_gpu(2)
     def test_unshard_leaves_no_memory_on_flex_shard_stream(self):
