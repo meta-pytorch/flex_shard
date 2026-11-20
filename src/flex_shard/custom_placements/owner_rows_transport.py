@@ -35,7 +35,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import DeviceMesh
 
-from ..flex_shard.utils import mesh_rank_hosts
+from ..flex_shard.utils import is_graph_tracing, mesh_rank_hosts
 from .utils import foreach_copy_, reduce_scatter_grads
 
 # Chunk sizes, rail splits and relayed slices round up to this many elements,
@@ -289,7 +289,7 @@ def owner_rows_transport_plan(
         )
     if (
         choice == "grouped"
-        or torch.compiler.is_compiling()
+        or is_graph_tracing()
         or len(set(row_numels)) == 1
         or device.type != "cuda"
         or mesh.ndim != 1

@@ -17,6 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import _get_device_handle
+from torch.fx.traceback import annotate
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 from torch.utils._pytree import tree_leaves, tree_map_only
 from torch.utils.hooks import RemovableHandle
@@ -25,6 +26,7 @@ from .bucket_comm import (
     begin_explicit_bucket_unshard,
     begin_bucket_unshard,
     begin_reduce_grad,
+    FLEX_SHARD_META_PHASE,
     ReduceGradHandle,
     UnshardHandle,
 )
@@ -35,11 +37,17 @@ from .utils import (
     _outside_selective_checkpoint,
     _record_function_if_eager,
     alloc_grads_in_param_layout,
+    is_graph_tracing,
 )
 
 
 _EAGER_COMM_CONTEXTS_ATTR = "_flex_shard_eager_comm_contexts"
 _MAX_PENDING_REDUCE_GRADS_ATTR = "_flex_shard_max_pending_reduce_grads"
+
+FLEX_SHARD_META_ACTION = "flex_shard_action"
+FLEX_SHARD_META_PARAM_FQNS = "flex_shard_param_fqns"
+FLEX_SHARD_META_MESH_AXIS_NAMES = "flex_shard_mesh_axis_names"
+FLEX_SHARD_META_BACKWARD = "autograd_backward_custom"
 
 
 @dataclass
@@ -610,6 +618,9 @@ class BucketRuntime:
     input_triggers: int = 0
     input_triggers_run: int = 0
     call_has_trigger: list[bool] = field(default_factory=list)
+    _tracing_sharded_params: list[list[torch.Tensor]] = field(
+        default_factory=list, repr=False
+    )
     # A bucket hooking several modules (BucketSpec.patterns): the modules, the
     # ones whose forward the current pass still awaits, and its open forward
     # call, if any (see GroupForwardPass).
@@ -769,7 +780,7 @@ class BucketRuntime:
         if local_shards is None:
             local_shards = self._local_shards(use_autograd=False)
         persistent_buffers = None
-        if self.unsharded_params is not None and not torch.compiler.is_compiling():
+        if self.unsharded_params is not None and not is_graph_tracing():
             if not self.infos[0].placement.refills_persistent_buffers_in_finish:
                 self._alloc_persistent_storage()
             persistent_buffers = self.persistent_buffers
@@ -1269,7 +1280,7 @@ class BucketRuntime:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
-        if torch.compiler.is_compiling():
+        if is_graph_tracing():
             self._pre_forward_compile()
             return None
         # As FSDP2's pre-forward, the unshard runs outside spmd_types' type
@@ -1302,7 +1313,7 @@ class BucketRuntime:
         unshards, and the call that opens a forward pass of the group, by its
         first module or by one module on its own, gets the post-backward
         trigger."""
-        if torch.compiler.is_compiling():
+        if is_graph_tracing():
             self._pre_forward_compile()
             return None
         with dist._spmd_no_typecheck():
@@ -1431,8 +1442,9 @@ class BucketRuntime:
 
     @_outside_selective_checkpoint
     def post_forward_hook(self, mod: nn.Module, args: Any, output: Any) -> None:
-        if torch.compiler.is_compiling():
-            self._swap_in_params(self.sharded_params)
+        if is_graph_tracing():
+            if self._tracing_sharded_params:
+                self._swap_in_params(self._tracing_sharded_params.pop())
             return
         has_trigger = self.call_has_trigger.pop() if self.call_has_trigger else False
         if _in_backward():
@@ -1448,8 +1460,9 @@ class BucketRuntime:
         group's post-forward runs once the last module of the pass finishes. A
         module called on its own leaves the pass open, without post-forward,
         as in FSDP2's partial group forward."""
-        if torch.compiler.is_compiling():
-            self._swap_in_params(self.sharded_params)
+        if is_graph_tracing():
+            if self._tracing_sharded_params:
+                self._swap_in_params(self._tracing_sharded_params.pop())
             return
         if _in_backward() or mod not in self.modules_to_run:
             return
@@ -1542,7 +1555,14 @@ class BucketRuntime:
             raise NotImplementedError(
                 "FlexShard buckets of patterns naming several modules are eager-only."
             )
-        full_params = _BucketUnshard.apply(self, *self._local_shards(use_autograd=True))
+        # functional_call and make_fx replace module slots without updating the
+        # runtime's cached Parameters. Restore exactly the slots this call saw.
+        local_shards = [
+            param.param_owner.module._parameters[param.param_owner.param_name]
+            for param in self.bucket_params
+        ]
+        self._tracing_sharded_params.append(local_shards)
+        full_params = _BucketUnshard.apply(self, *local_shards)
         self._swap_in_params(list(full_params))
 
 
@@ -1588,11 +1608,26 @@ class _BucketUnshard(torch.autograd.Function):
         *local_shards: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         ctx.bucket = bucket
-        full_params = (
-            bucket.begin_unshard([shard.detach() for shard in local_shards])
-            .finish()
-            .full_params
-        )
+        with annotate(
+            {
+                FLEX_SHARD_META_ACTION: "unshard",
+                FLEX_SHARD_META_PHASE: "prepare",
+                FLEX_SHARD_META_PARAM_FQNS: tuple(
+                    param.param_info.fqn for param in bucket.bucket_params
+                ),
+                FLEX_SHARD_META_MESH_AXIS_NAMES: bucket.bucket_storage._mesh.mesh_dim_names,
+                # Include the dtype casts autograd inserts after backward returns.
+                FLEX_SHARD_META_BACKWARD: {
+                    FLEX_SHARD_META_ACTION: "reduce_grad",
+                    FLEX_SHARD_META_PHASE: "finish",
+                },
+            }
+        ):
+            full_params = (
+                bucket.begin_unshard([shard.detach() for shard in local_shards])
+                .finish()
+                .full_params
+            )
         frozen_params = [
             full_param
             for full_param, shard in zip(full_params, local_shards, strict=True)
@@ -1627,14 +1662,24 @@ class _BucketUnshard(torch.autograd.Function):
             # Compile does not declare output grad dtypes, so grads arrive in
             # each output's dtype; the reduce-scatter copy-in casts them to the
             # bucket's reduce dtype as it copies.
-            sharded_grads = begin_reduce_grad(
-                grads,
-                infos,
-                bucket.bucket_storage.reduce_mesh,
-                bucket.bucket_storage.gradient_reduction,
-                bucket.context.reduce_grad_stream,
-                debug_fqn=bucket.debug_fqn,
-            ).finish()
+            with annotate(
+                {
+                    FLEX_SHARD_META_ACTION: "reduce_grad",
+                    FLEX_SHARD_META_PHASE: "prepare",
+                    FLEX_SHARD_META_PARAM_FQNS: tuple(
+                        param.param_info.fqn for param in bucket.bucket_params
+                    ),
+                    FLEX_SHARD_META_MESH_AXIS_NAMES: bucket.bucket_storage.reduce_mesh.mesh_dim_names,
+                }
+            ):
+                sharded_grads = begin_reduce_grad(
+                    grads,
+                    infos,
+                    bucket.bucket_storage.reduce_mesh,
+                    bucket.bucket_storage.gradient_reduction,
+                    bucket.context.reduce_grad_stream,
+                    debug_fqn=bucket.debug_fqn,
+                ).finish()
             # Inputs are the sharded params, so autograd casts each grad to
             # that leaf's grad_dtype before accumulating it.
             for idx, sharded_grad in zip(indices, sharded_grads, strict=True):
@@ -1788,7 +1833,7 @@ def _complete_group_passes(
     several modules that the forward ran only some of, e.g. a norm without the
     output projection it shares a bucket with, as FSDP2's root post-forward
     completes such groups."""
-    if torch.compiler.is_compiling() or _in_backward():
+    if is_graph_tracing() or _in_backward():
         return
     with dist._spmd_no_typecheck():
         for bucket in buckets:

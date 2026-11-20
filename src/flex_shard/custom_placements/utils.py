@@ -12,6 +12,9 @@ from typing import Any, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+import torch.distributed.functional_collectives as funcol
+
+from ..flex_shard.utils import is_graph_tracing
 
 if TYPE_CHECKING:
     from ..flex_shard.placement_contract import GradientReduceOp, GradientReduction
@@ -29,7 +32,7 @@ def foreach_copy_(
         )
     if not dst_tensors:
         return
-    if torch.compiler.is_compiling():
+    if is_graph_tracing():
         for dst, src in zip(dst_tensors, src_tensors, strict=True):
             dst.copy_(src)
     else:
@@ -167,7 +170,20 @@ def reduce_scatter_grads(
     )
     if pre_factor is not None:
         input = input / pre_factor
-    dist.reduce_scatter_tensor(output=output, input=input, op=reduce_op, group=group)
+    if is_graph_tracing():
+        if reduce_op not in (dist.ReduceOp.SUM, dist.ReduceOp.AVG):
+            raise NotImplementedError(
+                "FlexShard graph tracing does not support pre-multiplied gradient reductions."
+            )
+        output.copy_(
+            funcol.reduce_scatter_single(
+                input, "sum" if reduce_op == dist.ReduceOp.SUM else "avg", 0, group
+            )
+        )
+    else:
+        dist.reduce_scatter_tensor(
+            output=output, input=input, op=reduce_op, group=group
+        )
     if post_factor is not None:
         output.div_(post_factor)
 
@@ -204,7 +220,7 @@ def pack_segments_into_flat_buffer_triton_if_supported(
     Triton is required for this backend. The function returns ``None`` only when
     the current inputs should use the deterministic foreach copy fallback.
     """
-    if torch.compiler.is_compiling():
+    if is_graph_tracing():
         return None
     if importlib.util.find_spec("triton") is None:
         raise AssertionError(
@@ -233,7 +249,7 @@ def make_segment_pack_descriptor_if_supported(
     dst_offsets: Sequence[int],
     device: torch.device,
 ) -> Any | None:
-    if torch.compiler.is_compiling():
+    if is_graph_tracing():
         return None
     if importlib.util.find_spec("triton") is None:
         raise AssertionError(

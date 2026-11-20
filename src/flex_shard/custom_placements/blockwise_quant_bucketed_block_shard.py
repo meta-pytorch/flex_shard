@@ -48,6 +48,7 @@ from ..flex_shard.placement_contract import (
     PlacementUnshardResult,
 )
 from ..flex_shard.utils import (
+    is_graph_tracing,
     _record_comm_if_eager,
     _record_copy_in_if_eager,
     _record_copy_out_if_eager,
@@ -909,7 +910,7 @@ class BlockwiseQuantBucketedBlockShard(BucketedBlockShard):
         entry once when every secondary source and execution-context check agrees.
         """
         metadata = self._quant_metadata_from_infos(infos)
-        if torch.compiler.is_compiling():
+        if is_graph_tracing():
             return (
                 self._pack_local_quantized_chunks(tensors, infos, rank, metadata),
                 metadata,
@@ -1376,7 +1377,7 @@ class BlockwiseQuantBucketedBlockShard(BucketedBlockShard):
         per rank and region. Returns False when the caller should fall back to
         cat: while compiling or off CUDA.
         """
-        if torch.compiler.is_compiling() or rank_rows.device.type != "cuda":
+        if is_graph_tracing() or rank_rows.device.type != "cuda":
             return False
         plan = self._copy_out_plan(
             metadata,
@@ -1572,7 +1573,7 @@ def _cat_byte_regions_from_rank_rows(
 
 def _is_vec_copy_viewable(tensor: torch.Tensor) -> bool:
     """Return whether a uint8 tensor satisfies PyTorch's dtype-view contract."""
-    if torch.compiler.is_compiling():
+    if is_graph_tracing():
         return False
     return (
         tensor.dtype == torch.uint8

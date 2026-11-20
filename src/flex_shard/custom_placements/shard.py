@@ -12,6 +12,7 @@ from typing import Any, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+import torch.distributed.functional_collectives as funcol
 import torch.nn as nn
 from typing_extensions import override
 
@@ -31,6 +32,7 @@ from ..flex_shard.utils import (
     _record_copy_in_if_eager,
     _record_copy_out_if_eager,
     _record_function_if_eager,
+    is_graph_tracing,
 )
 from .utils import foreach_copy_, reduce_grads_on_one_rank, reduce_scatter_grads
 
@@ -393,6 +395,11 @@ class Shard(Placement):
             "FlexShard::all_gather",
             prepared.placement_state.debug_fqn,
         ):
+            if is_graph_tracing():
+                prepared.buffers[1].copy_(
+                    funcol.all_gather_single(send_buf, 0, prepared.placement_state.pg)
+                )
+                return None
             return dist.all_gather_single(
                 prepared.buffers[1],
                 send_buf,
